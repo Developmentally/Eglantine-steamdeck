@@ -41,6 +41,9 @@
 #include "core/hle/service/filesystem/filesystem.h"
 #include "core/loader/loader.h"
 #include "frontend_common/config.h"
+#include "hid_core/frontend/emulated_controller.h"
+#include "hid_core/hid_core.h"
+#include "hid_core/hid_types.h"
 #include "input_common/drivers/keyboard.h"
 #include "input_common/main.h"
 #include "network/network.h"
@@ -241,7 +244,45 @@ struct SdlState {
     // Must outlive emu_window, which keeps a pointer to it.
     InputCommon::InputSubsystem input_subsystem{};
     std::unique_ptr<EmuWindow_SDL3> emu_window;
+    bool gamepad_mapped{};
+    Uint64 last_gamepad_probe{};
 };
+
+// Without a configuration UI, player 1 stays on the keyboard defaults. If a gamepad is present
+// and nothing else was configured, give it the SDL driver's standard mapping (what the Qt
+// frontend's auto-map button does). SDL enumerates devices after startup, so this is retried
+// from SDL_AppIterate until a gamepad shows up.
+static bool TryAutoMapGamepad(SdlState& state) {
+    if (std::getenv("EDEN_NX2_KEY_SCRIPT") != nullptr) {
+        return true; // scripted runs drive the keyboard mapping
+    }
+    auto* const controller =
+        state.system.HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
+    if (controller->GetButtonParam(Settings::NativeButton::A).Get("engine", "") != "keyboard") {
+        return true;
+    }
+    for (const auto& device : state.input_subsystem.GetInputDevices()) {
+        if (device.Get("engine", "") != "sdl") {
+            continue;
+        }
+        const auto buttons = state.input_subsystem.GetButtonMappingForDevice(device);
+        if (buttons.empty()) {
+            continue;
+        }
+        for (const auto& [index, param] : buttons) {
+            controller->SetButtonParam(index, param);
+        }
+        for (const auto& [index, param] : state.input_subsystem.GetAnalogMappingForDevice(device)) {
+            controller->SetStickParam(index, param);
+        }
+        for (const auto& [index, param] : state.input_subsystem.GetMotionMappingForDevice(device)) {
+            controller->SetMotionParam(index, param);
+        }
+        LOG_INFO(Frontend, "Player 1 mapped to gamepad {}", device.Get("display", "sdl"));
+        return true;
+    }
+    return false;
+}
 
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
@@ -472,6 +513,13 @@ extern "C" SDL_AppResult SDL_AppIterate(void *appstate) {
     RunKeyScript(state->input_subsystem);
     if (!state->emu_window) {
         return SDL_APP_SUCCESS;
+    }
+    if (!state->gamepad_mapped) {
+        const auto now = SDL_GetTicks();
+        if (now - state->last_gamepad_probe >= 1000) {
+            state->last_gamepad_probe = now;
+            state->gamepad_mapped = TryAutoMapGamepad(*state);
+        }
     }
     state->emu_window->UpdateTitle();
     return state->emu_window->IsOpen() ? SDL_APP_CONTINUE : SDL_APP_SUCCESS;
