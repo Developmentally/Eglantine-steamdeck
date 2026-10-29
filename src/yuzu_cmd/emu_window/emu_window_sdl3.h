@@ -50,6 +50,9 @@ public:
     // Sets the window icon from yuzu.bmp
     void SetWindowIcon();
 
+    /// Refreshes the FPS title bar at most every 2 s; call from the main thread.
+    void UpdateTitle();
+
 protected:
     /// Called by WaitEvent when a key is pressed or released.
     void OnKeyEvent(int key, u8 state);
@@ -90,8 +93,8 @@ protected:
     /// Called when a configuration change affects the minimal size of the window
     void OnMinimalClientAreaChangeRequest(std::pair<u32, u32> minimal_size) override;
 
-    /// Periodic changer of titlebar (independent of event loop)
-    SDL_TimerID titlebar_timer;
+    /// Last titlebar refresh, in SDL ticks
+    Uint64 last_titlebar_update{};
 
     // Mouse resetter once it
     SDL_TimerID mouse_timer;

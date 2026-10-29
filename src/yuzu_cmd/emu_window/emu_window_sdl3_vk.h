@@ -26,4 +26,7 @@ public:
     ~EmuWindow_SDL3_VK() override;
 
     std::unique_ptr<Core::Frontend::GraphicsContext> CreateSharedContext() const override;
+
+private:
+    SDL_MetalView metal_view{};
 };

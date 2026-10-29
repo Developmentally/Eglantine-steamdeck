@@ -73,7 +73,13 @@ EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsyste
     } else if (SDL_GetPointerProperty(window_props, SDL_PROP_WINDOW_COCOA_WINDOW_POINTER,
                                       nullptr) != nullptr) {
         window_info.type = Core::Frontend::WindowSystemType::Cocoa;
-        window_info.render_surface = SDL_Metal_CreateView(render_window);
+        // The renderer expects the CAMetalLayer, not the NSView SDL wraps it in.
+        metal_view = SDL_Metal_CreateView(render_window);
+        window_info.render_surface = SDL_Metal_GetLayer(metal_view);
+        if (window_info.render_surface == nullptr) {
+            LOG_CRITICAL(Frontend, "Metal layer is unavailable: {}", SDL_GetError());
+            std::exit(EXIT_FAILURE);
+        }
     } else if (void* android_window =
                    SDL_GetPointerProperty(window_props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER,
                                           nullptr);
@@ -92,7 +98,11 @@ EmuWindow_SDL3_VK::EmuWindow_SDL3_VK(InputCommon::InputSubsystem* input_subsyste
              Common::g_scm_branch, Common::g_scm_desc);
 }
 
-EmuWindow_SDL3_VK::~EmuWindow_SDL3_VK() = default;
+EmuWindow_SDL3_VK::~EmuWindow_SDL3_VK() {
+    if (metal_view != nullptr) {
+        SDL_Metal_DestroyView(metal_view);
+    }
+}
 
 std::unique_ptr<Core::Frontend::GraphicsContext> EmuWindow_SDL3_VK::CreateSharedContext() const {
     return std::make_unique<DummyContext>();
