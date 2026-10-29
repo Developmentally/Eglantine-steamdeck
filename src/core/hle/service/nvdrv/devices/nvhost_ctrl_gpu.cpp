@@ -113,6 +113,9 @@ NvResult nvhost_ctrl_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8>
             return WrapFixedInlOut(this, &nvhost_ctrl_gpu::GetTPCMasks3, input, output,
                                    inline_output);
         case 0x13:
+            if (nx2_caller) {
+                return Nx2GetVsmsMapping(output, inline_output);
+            }
             LOG_DEBUG(Service_NVDRV, "(STUBBED) called.");
 
             // TODO (jarrodnorwell)
@@ -140,6 +143,21 @@ NvResult nvhost_ctrl_gpu::Ioctl3(DeviceFD fd, Ioctl command, std::span<const u8>
     UNIMPLEMENTED_MSG("Unimplemented ioctl={:08X}, group={:01X}, command={:01X}", command.raw,
                       command.group, command.cmd);
     return NvResult::NotImplemented;
+}
+
+// nvgpu VSMS_MAPPING: one {u8 gpc_index, u8 tpc_index} per virtual SM into the inline buffer.
+// The Switch 1 path answers NotImplemented, which the Switch 2 NvRm treats as a failed device
+// open (Welcome Tour then aborts in NVN's cleanup). The caller sizes the buffer from the
+// characteristics it was given; fill it as one GPC with two SMs per TPC.
+NvResult nvhost_ctrl_gpu::Nx2GetVsmsMapping(std::span<u8> output, std::span<u8> inline_output) {
+    std::fill(output.begin(), output.end(), u8{0});
+    const size_t entries = inline_output.size() / 2;
+    for (size_t sm = 0; sm < entries; ++sm) {
+        inline_output[sm * 2] = 0;
+        inline_output[sm * 2 + 1] = static_cast<u8>(sm / 2);
+    }
+    LOG_WARNING(Service_NVDRV, "Switch 2 VSMS_MAPPING: {} SMs reported", entries);
+    return NvResult::Success;
 }
 
 // nvgpu GET_ENGINE_INFO as the Switch 2 NvRm uses it: args {u32 buf_size, u32 reserved,

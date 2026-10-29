@@ -150,6 +150,12 @@ void NPad::ControllerUpdate(Kernel::KernelCore& kernel, Core::HID::ControllerTri
         return;
     }
 
+    // Callbacks are registered in the constructor, before SetNpadExternals runs; a frontend
+    // remapping its controller during service startup can land in that window.
+    if (applet_resource_holder.applet_resource == nullptr) {
+        return;
+    }
+
     for (std::size_t aruid_index = 0; aruid_index < AruidIndexMax; aruid_index++) {
         if (controller_idx >= controller_data[aruid_index].size()) {
             return;

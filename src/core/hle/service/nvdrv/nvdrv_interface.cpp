@@ -13,6 +13,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/service/ipc_helpers.h"
+#include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdata.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
@@ -36,7 +37,8 @@ void NVDRV::Open(HLERequestContext& ctx) {
     const std::string device_name(Common::StringFromBuffer(buffer));
     LOG_DEBUG(Service_NVDRV, "device_name={}", device_name);
 
-    if (device_name == "/dev/nvhost-prof-gpu") {
+    // The Switch 2 NvRm opens nvhost-prof-gpu during device init; let it hit the stub device.
+    if (device_name == "/dev/nvhost-prof-gpu" && !Devices::g_nx2_driver) {
         rb.Push<DeviceFD>(0);
         rb.PushEnum(NvResult::NotSupported);
 
