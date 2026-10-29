@@ -929,12 +929,10 @@ private:
                         image_id, address);
             return;
         }
+        // Present the whole native image; the window layout scales it to fit. (An earlier
+        // hardcoded 2560x1440 crop of 3840x2160 frames clipped the right third of the screen.)
         u32 crop_width = layout.width;
         u32 crop_height = layout.height;
-        if (layout.width == 3840 && layout.height == 2160) {
-            crop_width = 2560;
-            crop_height = 1440;
-        }
         static const u32 env_crop_w = [] {
             const char* v = std::getenv("EDEN_NX2_CROP_WIDTH");
             return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0U;
