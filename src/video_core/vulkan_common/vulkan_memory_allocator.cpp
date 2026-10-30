@@ -210,14 +210,15 @@ MemoryAllocator::~MemoryAllocator() = default;
 bool MemoryAllocator::OverUmaHardLimit(VkDeviceSize size) const {
     using namespace Common::Literals;
     // EDEN_NX2_GPU_HARD_LIMIT=0 disables; EDEN_NX2_GPU_HARD_LIMIT_MIB sets the smallest image it
-    // applies to (64 MiB).
+    // applies to (8 MiB: with 64 MiB, a race load in Mario Kart World still added 2 GB of
+    // smaller textures in seconds).
     static const bool enabled = [] {
         const char* value = std::getenv("EDEN_NX2_GPU_HARD_LIMIT");
         return value == nullptr || std::strtoul(value, nullptr, 10) != 0;
     }();
     static const u64 min_size = [] {
         const char* value = std::getenv("EDEN_NX2_GPU_HARD_LIMIT_MIB");
-        return value != nullptr ? u64{std::strtoul(value, nullptr, 10)} << 20 : u64{64_MiB};
+        return value != nullptr ? u64{std::strtoul(value, nullptr, 10)} << 20 : u64{8_MiB};
     }();
     const u64 budget = device.GetUmaMemoryBudgetCap();
     if (!enabled || budget == 0 || size < min_size || !device.CanReportMemoryUsage()) {

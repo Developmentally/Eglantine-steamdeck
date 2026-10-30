@@ -304,10 +304,15 @@ constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
 // (n MiB as BC3, half that as BC1) keep only the mip tail under it. For machines whose GPU
 // memory is system RAM (Steam Deck): title 1 holds ~1.7 GB of re-compressed ASTC at its title
 // screen. 0 (default) leaves them whole.
-[[nodiscard]] u64 AstcTrimTexels() {
-    static const u64 texels = [] {
-        const char* value = std::getenv("EDEN_NX2_ASTC_TRIM_MIB");
-        return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : 0ULL;
+// GPU-decoded ASTC images with more texels than this (in Mi, EDEN_NX2_ASTC_TRIM_MIB; 0 disables)
+// skip their top levels. 8 Mi on shared-memory GPUs: Mario Kart World's race textures otherwise
+// take the Deck past its GPU memory limits.
+[[nodiscard]] u64 AstcTrimTexels(const Device& device) {
+    static const u64 texels = [&device]() -> u64 {
+        if (const char* value = std::getenv("EDEN_NX2_ASTC_TRIM_MIB")) {
+            return u64{std::strtoull(value, nullptr, 10)} << 20;
+        }
+        return device.GetUmaMemoryBudgetCap() != 0 ? u64{8} << 20 : u64{0};
     }();
     return texels;
 }
@@ -323,7 +328,7 @@ constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
         return astc_decode ? LevelsTexels(info, skip) * 4 : LevelsHostBytes(info, skip);
     };
     if (astc_decode) {
-        const u64 trim_texels = AstcTrimTexels();
+        const u64 trim_texels = AstcTrimTexels(device);
         const auto over_trim = [&](u32 skip) {
             return trim_texels != 0 && LevelsTexels(info, skip) > trim_texels;
         };
