@@ -14,6 +14,7 @@
 #include "core/hle/kernel/k_process.h"
 #include "memory_manager.h"
 #include "video_core/guest_memory.h"
+#include "video_core/nx2.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/invalidation_accumulator.h"
 #include "video_core/memory_manager.h"
@@ -119,12 +120,27 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
     if (entry_type == EntryType::Mapped) {
         page_table.ReserveRange(gpu_addr, size);
     }
+    // The caches hear about each run of pages whose entry changed in one call, not page by page
+    // (a 1.45 GB Switch 2 region made ~370,000 texture cache scans).
+    GPUVAddr modified_start{};
+    u64 modified_size{};
+    const auto flush_modified = [&] {
+        if (modified_size != 0) {
+            rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
+            modified_size = 0;
+        }
+    };
     for (u64 offset{}; offset < size; offset += page_size) {
         const GPUVAddr current_gpu_addr = gpu_addr + offset;
         [[maybe_unused]] const auto current_entry_type = GetEntry(current_gpu_addr, false);
         SetEntry(current_gpu_addr, entry_type, false);
         if (current_entry_type != entry_type) {
-            rasterizer->ModifyGPUMemory(unique_identifier, current_gpu_addr, page_size);
+            if (modified_size == 0) {
+                modified_start = current_gpu_addr;
+            }
+            modified_size += page_size;
+        } else {
+            flush_modified();
         }
         if (entry_type == EntryType::Mapped) {
             const DAddr current_dev_addr = dev_addr + offset;
@@ -134,18 +150,32 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
         }
         remaining_size -= page_size;
     }
+    flush_modified();
     kind_map.Map(gpu_addr, gpu_addr + size, kind);
     return gpu_addr;
 }
 
 GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr dev_addr, size_t size, PTEKind kind, MemoryManager::EntryType entry_type) {
     [[maybe_unused]] u64 remaining_size{size};
+    GPUVAddr modified_start{};
+    u64 modified_size{};
+    const auto flush_modified = [&] {
+        if (modified_size != 0) {
+            rasterizer->ModifyGPUMemory(unique_identifier, modified_start, modified_size);
+            modified_size = 0;
+        }
+    };
     for (u64 offset{}; offset < size; offset += big_page_size) {
         const GPUVAddr current_gpu_addr = gpu_addr + offset;
         [[maybe_unused]] const auto current_entry_type = GetEntry(current_gpu_addr, true);
         SetEntry(current_gpu_addr, entry_type, true);
         if (current_entry_type != entry_type) {
-            rasterizer->ModifyGPUMemory(unique_identifier, current_gpu_addr, big_page_size);
+            if (modified_size == 0) {
+                modified_start = current_gpu_addr;
+            }
+            modified_size += big_page_size;
+        } else {
+            flush_modified();
         }
         if (entry_type == EntryType::Mapped) {
             const DAddr current_dev_addr = dev_addr + offset;
@@ -172,6 +202,7 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
         }
         remaining_size -= big_page_size;
     }
+    flush_modified();
     {
         std::unique_lock<std::mutex> lock(guard);
         kind_map.Map(gpu_addr, gpu_addr + size, kind);
@@ -267,6 +298,12 @@ template <typename T>
 void MemoryManager::Write(GPUVAddr addr, T data) {
     if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         // NOTE: Avoid adding any extra logic to this fast-path block
+        std::memcpy(page_pointer, &data, sizeof(T));
+        return;
+    }
+    // A Switch 2 sparse block nobody wrote yet gets its memory now.
+    Tegra::Nx2BackSparseWrite(addr, sizeof(T));
+    if (auto page_pointer{GetPointer(addr)}; page_pointer) {
         std::memcpy(page_pointer, &data, sizeof(T));
         return;
     }
@@ -384,8 +421,12 @@ void MemoryManager::ReadBlockImpl(GPUVAddr gpu_src_addr, void* dest_buffer, std:
         if (!unsafe) {
             rasterizer->FlushRegion(dev_addr_base, copy_amount, which);
         }
-        u8* physical = memory.GetPointer<u8>(dev_addr_base);
-        std::memcpy(dest_buffer, physical, copy_amount);
+        // A device page without memory (a sparse block nobody wrote yet) reads zero.
+        if (const u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
+            std::memcpy(dest_buffer, physical, copy_amount);
+        } else {
+            std::memset(dest_buffer, 0, copy_amount);
+        }
         dest_buffer = static_cast<u8*>(dest_buffer) + copy_amount;
     };
     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
@@ -427,6 +468,8 @@ void MemoryManager::ReadBlockUnsafe(GPUVAddr gpu_src_addr, void* dest_buffer, co
 }
 
 void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffer, std::size_t size, [[maybe_unused]] VideoCommon::CacheType which, bool unsafe) {
+    // Give Switch 2 sparse pages the write lands on their memory first (otherwise it is dropped).
+    Tegra::Nx2BackSparseWrite(gpu_dest_addr, size);
     auto just_advance = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset, std::size_t copy_amount) {
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
@@ -435,8 +478,9 @@ void MemoryManager::WriteBlockImpl(GPUVAddr gpu_dest_addr, const void* src_buffe
         if (!unsafe) {
             rasterizer->InvalidateRegion(dev_addr_base, copy_amount, which);
         }
-        u8* physical = memory.GetPointer<u8>(dev_addr_base);
-        std::memcpy(physical, src_buffer, copy_amount);
+        if (u8* physical = memory.GetPointer<u8>(dev_addr_base)) [[likely]] {
+            std::memcpy(physical, src_buffer, copy_amount);
+        }
         src_buffer = static_cast<const u8*>(src_buffer) + copy_amount;
     };
     auto mapped_big = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
