@@ -7,16 +7,6 @@
 
 namespace Shader::Ampere {
 
-inline u64 NativeProgramKey(std::span<const Instruction> source) {
-    u64 hash = 14695981039346656037ULL;
-    for (const auto& instruction : source) {
-        for (u32 word : instruction.words) {
-            for (u32 byte = 0; byte < 4; ++byte) hash = (hash ^ ((word >> (byte * 8)) & 255)) * 1099511628211ULL;
-        }
-    }
-    return hash;
-}
-
 // Private iteration format: version, lengths, texture bank, exact original
 // instructions, then the newly generated canonical instructions. Source bytes
 // are compared directly; the filename hash is only an index.

@@ -40,11 +40,83 @@ struct LoweredProgram {
     explicit operator bool() const { return error.empty(); }
 };
 
+inline u64 NativeProgramKey(std::span<const Instruction> source) {
+    u64 hash = 14695981039346656037ULL;
+    for (const auto& instruction : source) {
+        for (u32 word : instruction.words) {
+            for (u32 byte = 0; byte < 4; ++byte) hash = (hash ^ ((word >> (byte * 8)) & 255)) * 1099511628211ULL;
+        }
+    }
+    return hash;
+}
+
+// EDEN_NX2_PS_DEBUG=<program key hex prefix>[,<prefix>...]:<what> overwrites R0-R3 (fragment
+// colour 0) before every unconditional EXIT of a matching program with:
+//   white           1.0
+//   gen0            float(a[0x80 + 4i]) / 16 (flat), i.e. integer varyings in Generic0.xyz
+//   rec<bank>x<stride>  c[bank][a[0x80] * stride + 4i] / 16 for i < 3, both hex
+// Off unless set. Programs that are not fragment shaders simply get the extra writes.
+struct PsDebugKnob {
+    std::string_view prefix;
+    std::string_view what;
+    u32 bank{};
+    u32 stride{};
+};
+inline const PsDebugKnob& PsDebugKnobFromEnv() {
+    static const PsDebugKnob knob = [] {
+        PsDebugKnob parsed;
+        const char* value = std::getenv("EDEN_NX2_PS_DEBUG");
+        if (value == nullptr) return parsed;
+        const std::string_view text{value};
+        const size_t colon = text.find(':');
+        if (colon == std::string_view::npos || colon == 0) return parsed;
+        parsed.prefix = text.substr(0, colon);
+        parsed.what = text.substr(colon + 1);
+        if (parsed.what.starts_with("rec")) {
+            const auto hex = [](std::string_view digits) {
+                u32 result = 0;
+                for (char c : digits) {
+                    const u32 digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
+                    if (digit == 16) return ~0U;
+                    result = result * 16 + digit;
+                }
+                return result;
+            };
+            const std::string_view spec = parsed.what.substr(3);
+            const size_t x = spec.find('x');
+            if (x == std::string_view::npos) return PsDebugKnob{};
+            parsed.bank = hex(spec.substr(0, x));
+            parsed.stride = hex(spec.substr(x + 1));
+            if (parsed.bank >= 18 || parsed.stride == 0 || parsed.stride > 0xffff) return PsDebugKnob{};
+            parsed.what = "rec";
+        } else if (parsed.what != "white" && parsed.what != "gen0") {
+            return PsDebugKnob{};
+        }
+        return parsed;
+    }();
+    return knob;
+}
+inline bool PsDebugMatches(const PsDebugKnob& knob, u64 key) {
+    if (knob.prefix.empty()) return false;
+    char hex[16];
+    for (u32 i = 0; i < 16; ++i) hex[i] = "0123456789abcdef"[(key >> (60 - i * 4)) & 15];
+    for (std::string_view list = knob.prefix; !list.empty();) {
+        const size_t comma = list.find(',');
+        const std::string_view prefix = list.substr(0, comma);
+        if (!prefix.empty() && prefix.size() <= 16 && std::string_view{hex, prefix.size()} == prefix) return true;
+        if (comma == std::string_view::npos) break;
+        list.remove_prefix(comma + 1);
+    }
+    return false;
+}
+
 // Lower only operations whose semantics are representable by the existing
 // Maxwell frontend. These are new instructions, not reinterpretations of the
 // native bytes. Scheduling/control words are added by the environment adapter.
 inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
     LoweredProgram result;
+    const PsDebugKnob& ps_debug = PsDebugKnobFromEnv();
+    const bool ps_debug_match = PsDebugMatches(ps_debug, NativeProgramKey(code));
     struct Relocation { u32 output_index; s64 target; };
     std::vector<Relocation> relocations;
     std::vector<u32> barrier_tokens;
@@ -2277,6 +2349,33 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
                 }
                 emit(0xe30000000000000fULL | (u64{insn.Bits(87, 4)} << 16));
                 break;
+            }
+            if (ps_debug_match) {
+                // IPA.CONSTANT a[0x80 + 4i] (flat; generic 0 is attribute 32), then either
+                // I2F.F32.U32 or XMAD * stride + LDC c[bank][Ra + 4i]; FMUL32I by 1/16 to display.
+                const auto flat_input = [&](u32 reg, u32 component) {
+                    emit(0xe000000000000000ULL | predicate | reg | (u64{255} << 8) | (u64{255} << 20) |
+                         (u64{32 + component} << 30) | (u64{1} << 55));
+                };
+                for (u32 i = 0; i < 3; ++i) {
+                    if (ps_debug.what == "white") {
+                        mov_imm(i, 0x3f800000);
+                        continue;
+                    }
+                    if (ps_debug.what == "gen0") {
+                        flat_input(i, i);
+                        emit(0x5cb8000000000000ULL | predicate | i | (u64{2} << 8) | (u64{2} << 10) | (u64{i} << 20));
+                    } else {
+                        if (i == 0) {
+                            flat_input(250, 0);
+                            xmad(250, 250, ps_debug.stride, 255, false, false, 0, true);
+                        }
+                        emit(0xef90000000000000ULL | predicate | i | (u64{250} << 8) | (u64{4 * i} << 20) |
+                             (u64{ps_debug.bank} << 36) | (u64{4} << 48));
+                    }
+                    emit(0x1e00000000000000ULL | predicate | i | (u64{i} << 8) | (u64{0x3d800000} << 20));
+                }
+                mov_imm(3, 0x3f800000);
             }
             result.instructions.push_back(0xe30000000000000fULL | predicate);
             if (insn.Bits(12, 4) != 7) break;
