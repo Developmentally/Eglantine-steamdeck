@@ -220,6 +220,13 @@ bool MemoryAllocator::OverUmaHardLimit(VkDeviceSize size) const {
         const char* value = std::getenv("EDEN_NX2_GPU_HARD_LIMIT_MIB");
         return value != nullptr ? u64{std::strtoul(value, nullptr, 10)} << 20 : u64{8_MiB};
     }();
+    // EDEN_NX2_GPU_HARD_LIMIT_SLACK_MIB: how far past the budget cap images may go. A race load in
+    // Mario Kart World adds 1.5 GB in seconds; with 1 GiB the Deck's GTT pool reached 7.2 of 8 GB.
+    // Images refused here are retried by the texture cache once there is room again.
+    static const u64 slack = [] {
+        const char* value = std::getenv("EDEN_NX2_GPU_HARD_LIMIT_SLACK_MIB");
+        return value != nullptr ? u64{std::strtoul(value, nullptr, 10)} << 20 : u64{512_MiB};
+    }();
     const u64 budget = device.GetUmaMemoryBudgetCap();
     if (!enabled || budget == 0 || size < min_size || !device.CanReportMemoryUsage()) {
         return false;
@@ -232,7 +239,7 @@ bool MemoryAllocator::OverUmaHardLimit(VkDeviceSize size) const {
     for (u32 heap = 0; heap < properties.memoryHeapCount; ++heap) {
         usage += budgets[heap].usage;
     }
-    return usage + size > budget + 1_GiB;
+    return usage + size > budget + slack;
 }
 
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated,

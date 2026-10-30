@@ -137,6 +137,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     std::vector<u8> astc_scan_buffer;
     u64 images_deleted{};
     std::map<u64, std::pair<u32, GPUVAddr>> created_shapes;
+    std::vector<ImageId> unbacked_image_ids; ///< Registered images without host memory
+    u64 unbacked_retries{};
 
     static constexpr s64 DEFAULT_EXPECTED_MEMORY = 1_GiB + 125_MiB;
     static constexpr s64 DEFAULT_CRITICAL_MEMORY = 1_GiB + 625_MiB;
@@ -319,6 +321,10 @@ private:
 
     /// Runs the Garbage Collector.
     void RunGarbageCollector();
+
+    /// Drops images the allocator left unbacked once there is room for them again, so their
+    /// next use recreates them with memory.
+    void RetryUnbackedImages();
 
     /// Find or create an image view in the guest descriptor table
     ImageViewId VisitImageView(u32 index, bool compute);

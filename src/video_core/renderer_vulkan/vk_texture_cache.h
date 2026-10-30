@@ -71,6 +71,9 @@ public:
 
     bool CanReportMemoryUsage() const;
 
+    /// True when an image of this size would be left unbacked by the UMA hard limit right now.
+    bool OverUmaHardLimit(u64 size_bytes) const;
+
     void LogMemoryStatistics() const;
 
     /// True when ASTC is re-compressed to BC3 and opaque images may use BC1 instead.
@@ -180,10 +183,12 @@ public:
     /// Temporary decode images, freed once the GPU is past `tick`.
     struct PendingTranscode {
         u64 tick;
+        u64 bytes;
         vk::Image image;
         std::vector<vk::ImageView> views;
     };
     std::deque<PendingTranscode> pending_transcodes;
+    u64 pending_transcode_bytes{};
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;

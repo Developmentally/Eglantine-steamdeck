@@ -183,6 +183,46 @@ void TextureCache<P>::RunGarbageCollector() {
 }
 
 template <class P>
+void TextureCache<P>::RetryUnbackedImages() {
+    // An image the allocator left unbacked under the UMA hard limit reads as black until something
+    // recreates it. Once there is room for it (and a margin for what follows), drop it: its next
+    // use builds it again from guest memory, which an unbacked image never changed. Images too
+    // big to ever back (the allocator's huge rule) stay as they are.
+    if constexpr (requires { runtime.OverUmaHardLimit(u64{}); }) {
+        u32 retried = 0;
+        for (size_t i = 0; i < unbacked_image_ids.size() && retried < 2;) {
+            const ImageId image_id = unbacked_image_ids[i];
+            Image& image = slot_images[image_id];
+            const ImageInfo& info = image.info;
+            const u64 texels = u64{info.size.width} * info.size.height * info.size.depth *
+                               static_cast<u64>(info.resources.layers);
+            if (texels > (u64{1} << 28) || True(image.flags & ImageFlagBits::IsDecoding)) {
+                ++i;
+                continue;
+            }
+            const u64 size = True(image.flags & ImageFlagBits::Converted)
+                                 ? CalculateConvertedSizeBytes(info)
+                                 : CalculateUnswizzledSizeBytes(info);
+            if (runtime.OverUmaHardLimit(size + 256_MiB)) {
+                return;
+            }
+            if (unbacked_retries++ < 32) {
+                LOG_INFO(HW_GPU, "Retrying unbacked image {:#x} {}x{}x{} layers {} format {} ({} MiB)",
+                         image.gpu_addr, info.size.width, info.size.height, info.size.depth,
+                         info.resources.layers, static_cast<u32>(info.format), size >> 20);
+            }
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, image_id);
+            }
+            // UnregisterImage removes the id from unbacked_image_ids, so i stays.
+            UnregisterImage(image_id);
+            DeleteImage(image_id, false);
+            ++retried;
+        }
+    }
+}
+
+template <class P>
 void TextureCache<P>::ApplyThresholdOverrides(bool log) {
     // EDEN_NX2_TC_EXPECTED_MIB / EDEN_NX2_TC_CRITICAL_MIB override the collector's thresholds.
     for (const auto& [name, target] : {std::pair{"EDEN_NX2_TC_EXPECTED_MIB", &expected_memory},
@@ -336,6 +376,7 @@ void TextureCache<P>::TickFrame() {
     if (total_used_memory > minimum_memory) {
         RunGarbageCollector();
     }
+    RetryUnbackedImages();
     sentenced_images.Tick();
     sentenced_framebuffers.Tick();
     sentenced_image_view.Tick();
@@ -2486,6 +2527,9 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(HostImageSizeBytes(image), 1024);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
+    if (True(image.flags & ImageFlagBits::Unbacked)) {
+        unbacked_image_ids.push_back(image_id);
+    }
 
     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
         (*channel_state->gpu_page_table)[page].push_back(image_id);
@@ -2520,6 +2564,9 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
     image.flags &= ~ImageFlagBits::Registered;
     image.flags &= ~ImageFlagBits::BadOverlap;
     lru_cache.Free(image.lru_index);
+    if (True(image.flags & ImageFlagBits::Unbacked)) {
+        std::erase(unbacked_image_ids, image_id);
+    }
     const auto& clear_page_table =
         [image_id](u64 page, ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>& selected_page_table) {
             const auto page_it = selected_page_table.find(page);

@@ -2091,6 +2091,10 @@ u64 TextureCacheRuntime::GetDeviceMemoryBudget() const {
     return device.GetDeviceMemoryBudget();
 }
 
+bool TextureCacheRuntime::OverUmaHardLimit(u64 size_bytes) const {
+    return memory_allocator.OverUmaHardLimit(size_bytes);
+}
+
 bool TextureCacheRuntime::CanDownloadMsaa(const VideoCommon::ImageInfo& info) const {
     const VkImageAspectFlags aspect_mask = ImageAspectMask(info.format);
     if ((aspect_mask & VK_IMAGE_ASPECT_COLOR_BIT) != 0) {
@@ -2169,6 +2173,7 @@ void TextureCacheRuntime::ReleaseMsaaScratchImage(VkImage image) {
 
 void TextureCacheRuntime::TickFrame() {
     while (!pending_transcodes.empty() && scheduler.IsFree(pending_transcodes.front().tick)) {
+        pending_transcode_bytes -= pending_transcodes.front().bytes;
         pending_transcodes.pop_front();
     }
     static constexpr u32 MAX_UNUSED_SCRATCH_FRAMES = 60;
@@ -3603,8 +3608,39 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     const u32 levels = static_cast<u32>(info.resources.levels);
     const u32 layers = static_cast<u32>(info.resources.layers);
     constexpr VkFormat DecodeFormat = VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    u64 scratch_bytes = 0;
+    for (u32 level = 0; level < levels; ++level) {
+        scratch_bytes += u64{(std::max)(width >> level, 1U)} * (std::max)(height >> level, 1U) *
+                         layers * 4;
+    }
+    // The RGBA8 decode target lives until the GPU has encoded it (pending_transcodes). It is
+    // exempt from the UMA hard limit (left unbacked, the encoder reads zeros and the texture stays
+    // black for good: Mario Kart World's tracks on the Deck), so instead the scratch alive at once
+    // is bounded: a load burst queues hundreds of them (3 GB of GTT in seconds).
+    // EDEN_NX2_TRANSCODE_CAP_MIB overrides; 0 is unbounded.
+    static const u64 cap = [this] {
+        if (const char* value = std::getenv("EDEN_NX2_TRANSCODE_CAP_MIB")) {
+            return u64{std::strtoull(value, nullptr, 10)} << 20;
+        }
+        return device.GetUmaMemoryBudgetCap() != 0 ? u64{384} << 20 : u64{0};
+    }();
+    if (cap != 0) {
+        static u32 logged{};
+        bool waited = false;
+        while (!pending_transcodes.empty() && pending_transcode_bytes + scratch_bytes > cap) {
+            scheduler.Wait(pending_transcodes.front().tick);
+            pending_transcode_bytes -= pending_transcodes.front().bytes;
+            pending_transcodes.pop_front();
+            waited = true;
+        }
+        if (waited && logged++ < 16) {
+            LOG_INFO(Render_Vulkan, "Transcode scratch over its cap; waited for the GPU, now {} MiB",
+                     pending_transcode_bytes >> 20);
+        }
+    }
     PendingTranscode pending{
         .tick = 0,
+        .bytes = scratch_bytes,
         .image = memory_allocator.CreateImage(VkImageCreateInfo{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = nullptr,
@@ -3621,7 +3657,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
             .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        }, true),
+        }, true, true),
         .views = {},
     };
     for (u32 level = 0; level < levels; ++level) {
@@ -3685,6 +3721,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
     });
     image.UploadMemory(output.buffer, output.offset, copies);
     pending.tick = scheduler.CurrentTick();
+    pending_transcode_bytes += pending.bytes;
     pending_transcodes.push_back(std::move(pending));
 }
 
