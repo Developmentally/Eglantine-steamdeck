@@ -105,7 +105,10 @@ namespace Vulkan {
 
         /// `dedicated`: own device memory, returned to the driver on destruction (short-lived
         /// images would otherwise leave holes in the shared blocks).
-        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
+        /// exempt_from_hard_limit: an image already sized to the budget (a trimmed virtual
+        /// texture) skips the UMA hard limit and takes its memory.
+        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
+                              bool exempt_from_hard_limit = false) const;
 
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage) const;
 

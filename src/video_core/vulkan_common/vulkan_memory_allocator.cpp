@@ -235,7 +235,8 @@ bool MemoryAllocator::OverUmaHardLimit(VkDeviceSize size) const {
     return usage + size > budget + 1_GiB;
 }
 
-vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
+vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated,
+                                       bool exempt_from_hard_limit) const
 {
     const VmaAllocationCreateInfo alloc_ci = {
             .flags = static_cast<VmaAllocationCreateFlags>(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) |
@@ -262,7 +263,7 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     // their size is read from a throwaway VkImage, which costs nothing compared to the upload.
     bool over_limit = false;
     const bool maybe_large = texels >= (u64{1} << 18); // 1 MiB at 4 bytes a texel
-    if (!huge && maybe_large && device.GetUmaMemoryBudgetCap() != 0) {
+    if (!huge && maybe_large && !exempt_from_hard_limit && device.GetUmaMemoryBudgetCap() != 0) {
         const auto& dld = device.GetDispatchLoader();
         VkImage probe{};
         if (dld.vkCreateImage(*device.GetLogical(), &ci, nullptr, &probe) == VK_SUCCESS) {

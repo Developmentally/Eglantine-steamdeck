@@ -317,6 +317,18 @@ constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
     return texels;
 }
 
+// Images the UMA hard limit must not leave unbacked: layered material arrays up to 640 MiB on
+// the host (the trimmed virtual texture, Mario Kart World's 46-layer terrain array; unbacked,
+// the whole ground reads black). Everything else that arrives late takes the hit.
+[[nodiscard]] bool ExemptFromHardLimit(const ImageInfo& host_info) {
+    if (host_info.type != ImageType::e2D || host_info.resources.layers < 8) {
+        return false;
+    }
+    const u64 bytes = u64{host_info.size.width} * host_info.size.height * 4 * 4 / 3 *
+                      host_info.resources.layers;
+    return bytes <= (u64{640} << 20);
+}
+
 [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
     level_offset = 0;
     if (info.type != ImageType::e2D) {
@@ -449,7 +461,7 @@ constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
             image_ci.pNext = &image_format_list;
         }
     }
-    return allocator.CreateImage(image_ci);
+    return allocator.CreateImage(image_ci, false, ExemptFromHardLimit(info));
 }
 
 [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
