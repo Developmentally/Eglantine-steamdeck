@@ -253,8 +253,12 @@ struct SdlState {
 // frontend's auto-map button does). SDL enumerates devices after startup, so this is retried
 // from SDL_AppIterate until a gamepad shows up.
 static bool TryAutoMapGamepad(SdlState& state) {
+    // Scripted runs (key script, or a harness typing into the window) drive the keyboard mapping.
     if (std::getenv("EDEN_NX2_KEY_SCRIPT") != nullptr) {
-        return true; // scripted runs drive the keyboard mapping
+        return true;
+    }
+    if (const char* automap = std::getenv("EDEN_NX2_AUTOMAP"); automap != nullptr && automap[0] == '0') {
+        return true;
     }
     auto* const controller =
         state.system.HIDCore().GetEmulatedController(Core::HID::NpadIdType::Player1);
