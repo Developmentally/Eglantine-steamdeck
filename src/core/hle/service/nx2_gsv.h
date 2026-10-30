@@ -17,6 +17,7 @@
 #include <optional>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #include "common/alignment.h"
@@ -493,7 +494,13 @@ private:
         const u32 slot = w[11];
         LOG_INFO(Service, "nx2:gpu 214 words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
                  w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12]);
-        if (last > start && ((last + 1 - start) % Core::Memory::YUZU_PAGESIZE) == 0) {
+        // Word 7 bits 8-11 = 6: an address-space reservation the game maps memory into later
+        // (title 5 asks for six of 1.4-5.8 GB, 17 GB in all); backing those drained the pool.
+        const bool reservation_only = (w[7] & 0xf00) == 0x600;
+        if (reservation_only) {
+            LOG_INFO(Service, "nx2:gpu 214 reservation [{:#x}, {:#x}] ({} MB) left unbacked",
+                     start, last, (last + 1 - start) >> 20);
+        } else if (last > start && ((last + 1 - start) % Core::Memory::YUZU_PAGESIZE) == 0) {
             const u64 size = last + 1 - start;
             FreeReleasedRegions();
             if (const auto address = BackGpuOnlyRegion(start, size)) {
@@ -788,7 +795,15 @@ private:
             WaitForFrame(~w[22], w[24]);
         }
         const auto waited = std::chrono::steady_clock::now();
-        Composite(w[5], ~w[22], w[24]);
+        // Word 7 packs the presented size as (width-1) | (height-1) << 16, the image's own size
+        // when the whole image is shown; title 5 renders 2560x1440 into 3840x2160 images.
+        const u32 crop_width = (w[7] & 0xffff) + 1;
+        const u32 crop_height = (w[7] >> 16) + 1;
+        if (m_presents <= 4) {
+            LOG_INFO(Service, "nx2:vi2 229 present words 4-12: {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                     w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12]);
+        }
+        Composite(w[5], ~w[22], w[24], crop_width, crop_height);
         const auto composited = std::chrono::steady_clock::now();
         PaceToVblank();
         const auto paced = std::chrono::steady_clock::now();
@@ -907,7 +922,8 @@ private:
     // Shows a presented native image: word 5 is the image id, ~word 22 / word 24 the GPU fence
     // (syncpoint, value) to wait for (layout from changes.patch). The image is a block-linear
     // RGBA8 surface in the console's native GOB layout at GPU address == CPU address.
-    void Composite(u32 image_id, u32 fence_id, u32 fence_value) {
+    void Composite(u32 image_id, u32 fence_id, u32 fence_value, u32 presented_width,
+                   u32 presented_height) {
         u64 address{};
         Nx2ImageLayout layout{};
         {
@@ -929,10 +945,15 @@ private:
                         image_id, address);
             return;
         }
-        // Present the whole native image; the window layout scales it to fit. (An earlier
-        // hardcoded 2560x1440 crop of 3840x2160 frames clipped the right third of the screen.)
+        // Show the presented part of the image (the game may render a smaller frame into the
+        // top-left of a larger allocation); the window layout scales it to fit.
         u32 crop_width = layout.width;
         u32 crop_height = layout.height;
+        if (presented_width >= 16 && presented_width <= layout.width && presented_height >= 16 &&
+            presented_height <= layout.height) {
+            crop_width = presented_width;
+            crop_height = presented_height;
+        }
         static const u32 env_crop_w = [] {
             const char* v = std::getenv("EDEN_NX2_CROP_WIDTH");
             return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 0U;
@@ -1164,6 +1185,7 @@ public:
             {109, &INx2VideoSession::SubmitInput, "SubmitInputBuffer"},
             {115, &INx2VideoSession::Succeed, "Finalize"},
             {200, &INx2VideoSession::Succeed, "Initialize"},
+            {201, &INx2VideoSession::AttachObject, "AttachObject (guessed)"},
             {207, &INx2VideoSession::Succeed, "Stop"},
             {212, &INx2VideoSession::UnregisterBuffer, "UnregisterBuffer"},
             {213, &INx2VideoSession::GetOutputInfo, "GetOutputInfo"},
@@ -1184,6 +1206,9 @@ public:
         if (m_event != nullptr) {
             m_context.CloseEvent(m_event);
         }
+        if (m_client_event != nullptr) {
+            m_client_event->Close(system.Kernel());
+        }
     }
 
 private:
@@ -1194,7 +1219,7 @@ private:
     };
 
     void Log(HLERequestContext& ctx, std::string_view what) {
-        if (m_logged++ < 64) {
+        if (m_logged++ < 64 || m_logged % 256 == 0) {
             const auto* w = ctx.CommandBuffer();
             LOG_INFO(Service, "{} TIPC {} {}: [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x} [7]={:#x}",
                      GetServiceName(), ctx.GetCommand(), what, w[2], w[3], w[4], w[5], w[6], w[7]);
@@ -1210,6 +1235,38 @@ private:
     void Succeed(HLERequestContext& ctx) {
         Log(ctx, "");
         TipcReplyWords(ctx, {});
+    }
+
+    // 201(copy handle, u64, u32...): title 5 sends this once before its first submit, with a
+    // 135 MB figure and the words 1, 3, 3, 1 behind it, then after submitting its whole movie
+    // never asks for output again (auto-stubbed, the handle was dropped). Record what object
+    // the handle is; an event here is kept and signalled whenever a frame completes.
+    void AttachObject(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const u32 desc = (w[1] & 0x80000000) ? w[2] : 0;
+        const size_t data = (w[1] & 0x80000000)
+                                ? 3 + ((desc & 1) ? 2 : 0) + ((desc >> 1) & 0xF) + ((desc >> 5) & 0xF)
+                                : 2;
+        const Handle handle = ctx.GetCopyHandle(0);
+        auto object = ctx.GetObjectFromHandle<Kernel::KAutoObject>(handle);
+        const char* type = object.IsNull() ? "none" : object->GetTypeName();
+        LOG_WARNING(Service, "{} TIPC 201 handle {:#x} ({}) words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+                    GetServiceName(), handle, type, w[data], w[data + 1], w[data + 2],
+                    w[data + 3], w[data + 4], w[data + 5]);
+        if (auto event = ctx.GetObjectFromHandle<Kernel::KReadableEvent>(handle);
+            event.IsNotNull()) {
+            m_client_event = event.ReleasePointerUnsafe(); // keeps the reference
+        }
+        TipcReplyWords(ctx, {});
+    }
+
+    void SignalCompletion() {
+        if (m_event != nullptr) {
+            m_event->Signal(system.Kernel());
+        }
+        if (m_client_event != nullptr) {
+            m_client_event->Signal(system.Kernel());
+        }
     }
 
     void Configure(HLERequestContext& ctx) {
@@ -1292,9 +1349,7 @@ private:
             m_waiting.push_back({0, pts, end});
         }
         const u64 id = ++m_submitted;
-        if (m_event != nullptr) {
-            m_event->Signal(system.Kernel());
-        }
+        SignalCompletion();
         TipcReplyWords(ctx, {static_cast<u32>(id), static_cast<u32>(id >> 32)});
     }
 
@@ -1308,9 +1363,41 @@ private:
         }
         const Output output = m_outputs.front();
         m_outputs.pop_front();
+        Paint(output.image);
         TipcReplyWords(ctx, {output.image, m_width, m_height, m_width, m_height, 0,
                              static_cast<u32>(output.pts), static_cast<u32>(output.pts >> 32),
                              output.end ? 1U : 0U, 0, 0, 0, 0, 0, 0, 0});
+    }
+
+    // Frames are not decoded: fill the output image with 0x80 once (Y = U = V = 0x80 is mid-grey
+    // in any planar layout) so a playing movie shows as grey, not as a black screen that looks
+    // like a hang. Output images are pool entries from 429 (handle = pool id + index) bound by 114.
+    void Paint(u32 image) {
+        if (!m_painted.insert(image).second) {
+            return;
+        }
+        u64 address{};
+        u64 size{};
+        {
+            std::scoped_lock lk{m_objects->mutex};
+            auto it = m_objects->images.upper_bound(image);
+            if (it == m_objects->images.begin()) {
+                return;
+            }
+            --it;
+            const auto& pool = it->second;
+            const auto memory = m_objects->memories.find(pool.memory);
+            if (image >= it->first + pool.count || memory == m_objects->memories.end() ||
+                memory->second.address == 0 || memory->second.size == 0) {
+                return;
+            }
+            size = memory->second.size / pool.count;
+            address = memory->second.address + u64{image - it->first} * size;
+        }
+        const std::vector<u8> grey(static_cast<size_t>(size), 0x80);
+        system.Host1x().MemoryManager().WriteBlock(address, grey.data(), grey.size());
+        LOG_INFO(Service, "{} painted output image {} ({:#x} bytes at {:#x}) grey", GetServiceName(),
+                 image, size, address);
     }
 
     struct ReadyState {
@@ -1320,7 +1407,9 @@ private:
 
     KernelHelpers::ServiceContext m_context;
     std::shared_ptr<Nx2NativeObjects> m_objects;
+    std::set<u32> m_painted;
     Kernel::KEvent* m_event{};
+    Kernel::KReadableEvent* m_client_event{};
     std::shared_ptr<ReadyState> m_ready = std::make_shared<ReadyState>();
     std::shared_ptr<Core::Timing::EventType> m_ready_timer;
     u32 m_width{};
@@ -1364,6 +1453,10 @@ public:
              "CalculateDecoderImagePoolBuffer"},
             {901, &INx2GraphicsSystemSession::Stub, "VideoInitialize (guessed)"},
             {902, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSession (guessed)"},
+            // Title 5's SDK sends 906(u32 0, u32 0x20000, u32 3) after 901 instead of 902;
+            // auto-stubbed without a handle, it aborted with InvalidHandle when its attract
+            // movie started.
+            {906, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSession3 (guessed)"},
             {1001, &INx2GraphicsSystemSession::Stub, "VideoInitialize2 (guessed)"},
             {1002, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSession2 (guessed)"},
             {601, &INx2GraphicsSystemSession::Stub, "CameraInitialize (guessed)"},
