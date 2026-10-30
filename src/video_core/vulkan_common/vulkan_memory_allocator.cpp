@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <type_traits>
@@ -206,6 +207,33 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
 
 MemoryAllocator::~MemoryAllocator() = default;
 
+bool MemoryAllocator::OverUmaHardLimit(VkDeviceSize size) const {
+    using namespace Common::Literals;
+    // EDEN_NX2_GPU_HARD_LIMIT=0 disables; EDEN_NX2_GPU_HARD_LIMIT_MIB sets the smallest image it
+    // applies to (64 MiB).
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_GPU_HARD_LIMIT");
+        return value == nullptr || std::strtoul(value, nullptr, 10) != 0;
+    }();
+    static const u64 min_size = [] {
+        const char* value = std::getenv("EDEN_NX2_GPU_HARD_LIMIT_MIB");
+        return value != nullptr ? u64{std::strtoul(value, nullptr, 10)} << 20 : u64{64_MiB};
+    }();
+    const u64 budget = device.GetUmaMemoryBudgetCap();
+    if (!enabled || budget == 0 || size < min_size || !device.CanReportMemoryUsage()) {
+        return false;
+    }
+    // The driver's own figure over every heap: on UMA all of them are system RAM, and the space
+    // VMA holds in partly used blocks is paged like everything else.
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(allocator, budgets.data());
+    u64 usage{};
+    for (u32 heap = 0; heap < properties.memoryHeapCount; ++heap) {
+        usage += budgets[heap].usage;
+    }
+    return usage + size > budget + 1_GiB;
+}
+
 vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
 {
     const VmaAllocationCreateInfo alloc_ci = {
@@ -229,9 +257,34 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
     // unbacked sparse fallback below.
     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
     const bool huge = texels > (u64{1} << 28);
-    VkResult result = huge ? VK_ERROR_OUT_OF_DEVICE_MEMORY
-                           : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
+    // On a UMA device near its budget, images from 64 MiB up stay unbacked (OverUmaHardLimit):
+    // their size is read from a throwaway VkImage, which costs nothing compared to the upload.
+    bool over_limit = false;
+    const bool maybe_large = texels >= (u64{1} << 18); // 1 MiB at 4 bytes a texel
+    if (!huge && maybe_large && device.GetUmaMemoryBudgetCap() != 0) {
+        const auto& dld = device.GetDispatchLoader();
+        VkImage probe{};
+        if (dld.vkCreateImage(*device.GetLogical(), &ci, nullptr, &probe) == VK_SUCCESS) {
+            VkMemoryRequirements requirements{};
+            dld.vkGetImageMemoryRequirements(*device.GetLogical(), probe, &requirements);
+            dld.vkDestroyImage(*device.GetLogical(), probe, nullptr);
+            over_limit = OverUmaHardLimit(requirements.size);
+            if (over_limit) {
+                static u32 logged{};
+                if (logged++ < 32) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Image {}x{}x{} ({} levels, {} layers, format {}, {} MiB) would take "
+                                "the UMA budget past its hard limit; leaving it unbacked",
+                                ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
+                                ci.arrayLayers, static_cast<u32>(ci.format), requirements.size >> 20);
+                }
+            }
+        }
+    }
+    VkResult result = (huge || over_limit)
+                          ? VK_ERROR_OUT_OF_DEVICE_MEMORY
+                          : vmaCreateImage(allocator, &ci, &alloc_ci, &handle, &allocation, &alloc_info);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge && !over_limit) {
         // Over the device memory budget (Switch 2 titles fill 8 GB cards): let the driver page
         // it out rather than failing the draw and aborting.
         static u32 logged{};

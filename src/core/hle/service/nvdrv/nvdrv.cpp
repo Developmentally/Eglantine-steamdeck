@@ -23,6 +23,7 @@
 #include "core/hle/service/nvdrv/devices/nvhost_nvjpg.h"
 #include "core/hle/service/nvdrv/devices/nvhost_vic.h"
 #include "core/hle/service/nvdrv/devices/nvmap.h"
+#include "core/hle/service/nvdrv/devices/nx2_gpu_memory.h"
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
@@ -308,6 +309,11 @@ NvResult Module::QueryEvent(DeviceFD fd, u32 event_id, Kernel::KEvent*& event) {
         return NvResult::BadParameter;
     }
     return NvResult::Success;
+}
+
+
+bool Devices::IsNx2GpuOnlyAddress(u64 gpu_address) {
+    return Devices::Nx2GpuMemoryRegistry::Get().IsGpuOnly(gpu_address);
 }
 
 } // namespace Service::Nvidia

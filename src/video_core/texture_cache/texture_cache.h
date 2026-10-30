@@ -19,6 +19,7 @@
 #include "common/alignment.h"
 #include "common/settings.h"
 #include "common/slot_vector.h"
+#include "core/hle/service/nvdrv/devices/nx2_gpu_memory.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/dirty_flags.h"
 #include "video_core/engines/kepler_compute.h"
@@ -237,47 +238,84 @@ void TextureCache<P>::TickFrame() {
     if (runtime.CanReportMemoryUsage()) {
         total_used_memory = runtime.GetDeviceMemoryUsage();
     }
-    // Every 600 frames: device memory in use against the collector's thresholds, and what the
-    // images themselves account for (VRAM pressure makes the collector thrash).
-    if (static u64 frames{}; ++frames % 600 == 0) {
+    // Every 600 frames (every 200 under EDEN_NX2_GPU_PROFILE): device memory in use against the
+    // collector's thresholds, and what the images themselves account for (VRAM pressure makes the
+    // collector thrash).
+    static const bool profile = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
+    static const u64 stats_interval = profile ? 200 : 600;
+    if (profile) {
+        // Under the profile, every 256 MiB step up or down as well: the Deck's GTT pool fills
+        // in seconds when a title loads, between two regular reports.
+        static u64 last_logged{};
+        if (total_used_memory + (256_MiB) < last_logged || total_used_memory > last_logged + (256_MiB)) {
+            last_logged = total_used_memory;
+            LOG_INFO(HW_GPU, "Texture cache: device memory now {} MiB", total_used_memory >> 20);
+            if constexpr (requires { runtime.LogMemoryStatistics(); }) {
+                runtime.LogMemoryStatistics();
+            }
+        }
+    }
+    if (static u64 frames{}; ++frames % stats_interval == 0) {
         u64 image_bytes{};
+        u64 host_bytes{};
         size_t images{};
         std::vector<std::pair<u64, const Image*>> largest;
-        std::map<u32, std::pair<u64, u32>> by_format;
+        struct FormatTotal {
+            u64 guest_bytes{};
+            u64 host_bytes{};
+            u32 count{};
+        };
+        std::map<u32, FormatTotal> by_format;
+        // Guest bytes are what the collector estimates; the host side (ASTC recompressed to BCn,
+        // converted formats, scaled copies) is what the device actually holds.
+        const auto host_size = [](const Image& image) -> u64 {
+            if constexpr (requires { image.HostMemoryBytes(); }) {
+                return image.HostMemoryBytes();
+            } else {
+                return 0;
+            }
+        };
         for (const auto [image_id, image] : slot_images) {
             const u64 bytes = GetScaledImageSizeBytes(*image);
+            const u64 host = host_size(*image);
             image_bytes += bytes;
+            host_bytes += host;
             ++images;
-            largest.emplace_back(bytes, image);
+            largest.emplace_back((std::max)(bytes, host), image);
             auto& format = by_format[static_cast<u32>(image->info.format)];
-            format.first += bytes;
-            ++format.second;
+            format.guest_bytes += bytes;
+            format.host_bytes += host;
+            ++format.count;
         }
-        LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB",
+        LOG_INFO(HW_GPU, "Texture cache: device memory {} MiB (expected {} MiB, critical {} MiB), {} images {} MiB guest / {} MiB host",
                  total_used_memory >> 20, expected_memory >> 20, critical_memory >> 20, images,
-                 image_bytes >> 20);
+                 image_bytes >> 20, host_bytes >> 20);
         std::partial_sort(largest.begin(), largest.begin() + std::min<size_t>(12, largest.size()),
                           largest.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
         for (size_t i = 0; i < std::min<size_t>(12, largest.size()); ++i) {
             const Image& image = *largest[i].second;
-            LOG_DEBUG(HW_GPU, "  {} MiB: {:#x} {}x{}x{} layers {} levels {} format {} type {} flags {:#x}",
-                     largest[i].first >> 20, image.gpu_addr, image.info.size.width, image.info.size.height,
-                     image.info.size.depth, image.info.resources.layers, image.info.resources.levels,
+            LOG_INFO(HW_GPU, "  {} MiB guest / {} MiB host: {:#x} {}x{}x{} layers {} levels {} format {} type {} flags {:#x}",
+                     GetScaledImageSizeBytes(image) >> 20, host_size(image) >> 20, image.gpu_addr,
+                     image.info.size.width, image.info.size.height, image.info.size.depth,
+                     image.info.resources.layers, image.info.resources.levels,
                      static_cast<u32>(image.info.format), static_cast<u32>(image.info.type),
                      static_cast<u32>(image.flags));
         }
         std::vector<std::pair<u64, u32>> formats;
-        for (const auto& [format, total] : by_format) formats.emplace_back(total.first, format);
+        for (const auto& [format, total] : by_format) {
+            formats.emplace_back((std::max)(total.guest_bytes, total.host_bytes), format);
+        }
         std::sort(formats.rbegin(), formats.rend());
         for (size_t i = 0; i < std::min<size_t>(8, formats.size()); ++i) {
-            LOG_DEBUG(HW_GPU, "  format {}: {} MiB in {} images", formats[i].second, formats[i].first >> 20,
-                     by_format[formats[i].second].second);
+            const FormatTotal& total = by_format[formats[i].second];
+            LOG_INFO(HW_GPU, "  format {}: {} MiB guest / {} MiB host in {} images", formats[i].second,
+                     total.guest_bytes >> 20, total.host_bytes >> 20, total.count);
         }
         if constexpr (requires { runtime.LogMemoryStatistics(); }) {
             runtime.LogMemoryStatistics();
         }
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha",
-                 images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
+        LOG_INFO(HW_GPU, "Texture cache last {} frames: created {} images, deleted {} (collector {}, {} costly, {} downloaded), {} async decodes, ASTC {} opaque / {} alpha",
+                 stats_interval, images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
         astc_opaque_images = astc_alpha_images = 0;
@@ -720,6 +758,11 @@ void TextureCache<P>::WriteMemory(DAddr cpu_addr, size_t size) {
 template <class P>
 bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
     if (!image.IsSafeGpuCopy() || True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::TrimmedLevels))) {
+        return false;
+    }
+    // Switch 2 GPU-only regions (nx2:gpu 214) are never mapped by the client: a write-back would
+    // only commit hundreds of MB of host RAM per render target.
+    if (Service::Nvidia::Devices::IsNx2GpuOnlyAddress(image.gpu_addr)) {
         return false;
     }
     if (image.info.num_samples == 1) {
@@ -2441,13 +2484,7 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
-    u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
-    if ((IsPixelFormatASTC(image.info.format) &&
-         True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
-        True(image.flags & ImageFlagBits::Converted)) {
-        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
-    }
-    total_used_memory += Common::AlignUp(tentative_size, 1024);
+    total_used_memory += Common::AlignUp(HostImageSizeBytes(image), 1024);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
 
     ForEachGPUPage(image.gpu_addr, image.guest_size_bytes, [this, image_id](u64 page) {
@@ -2623,13 +2660,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     if (image.HasScaled()) {
         total_used_memory -= GetScaledImageSizeBytes(image);
     }
-    u64 tentative_size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
-    if ((IsPixelFormatASTC(image.info.format) &&
-         True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
-        True(image.flags & ImageFlagBits::Converted)) {
-        tentative_size = TranscodedAstcSize(tentative_size, image.info.format);
-    }
-    total_used_memory -= Common::AlignUp(tentative_size, 1024);
+    total_used_memory -= Common::AlignUp(HostImageSizeBytes(image), 1024);
     const GPUVAddr gpu_addr = image.gpu_addr;
     const auto alloc_it = image_allocs_table.find(gpu_addr);
     if (alloc_it == image_allocs_table.end()) {

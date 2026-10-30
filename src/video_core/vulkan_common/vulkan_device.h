@@ -964,7 +964,14 @@ FN_MAX_LIMIT_LIST
     u64 GetDeviceMemoryUsage() const;
 
     /// The driver's current memory budget for this process (VK_EXT_memory_budget), 0 without it.
+    /// On integrated GPUs capped by GetUmaMemoryBudgetCap().
     u64 GetDeviceMemoryBudget() const;
+
+    /// Integrated GPUs share system RAM with the emulated console: the budget is held to a share
+    /// of it (or EDEN_NX2_GPU_BUDGET_MIB). 0 when no cap applies.
+    u64 GetUmaMemoryBudgetCap() const {
+        return uma_budget_cap;
+    }
 
     u32 GetSetsPerPool() const {
         return sets_per_pool;
@@ -1245,6 +1252,7 @@ private:
     bool supports_conditional_barriers{};      ///< Allows barriers in conditional control flow.
     mutable std::atomic<size_t> custom_border_color_samplers_used{};
     u64 device_access_memory{};                ///< Total size of device local memory in bytes.
+    u64 uma_budget_cap{};                      ///< Budget cap on integrated GPUs, 0 if none.
     u32 sets_per_pool{};                       ///< Sets per Description Pool
     NvidiaArchitecture nvidia_arch{NvidiaArchitecture::Arch_AmpereOrNewer};
 

@@ -172,6 +172,11 @@ public:
     void TranscodeAstcToBcn(Image& image, const StagingBufferRef& map,
                             std::span<const VideoCommon::SwizzleParameters> swizzles);
 
+    /// Upload of an image trimmed to its mip tail (Image::IsGenericTrimmed): `map` holds each
+    /// layer's swizzled tail; unswizzle it on the CPU and copy the levels in the image's format.
+    void UploadTrimmedLevels(Image& image, const StagingBufferRef& map,
+                             std::span<const VideoCommon::SwizzleParameters> swizzles);
+
     /// Temporary decode images, freed once the GPU is past `tick`.
     struct PendingTranscode {
         u64 tick;
@@ -370,10 +375,19 @@ public:
         return (this->*current_image).UsageFlags();
     }
 
+    /// Device memory behind the image (both the original and the scaled copy), 0 when unbacked.
+    [[nodiscard]] u64 HostMemoryBytes() const noexcept {
+        return original_image.MemorySize() + scaled_image.MemorySize();
+    }
+
     /// Returns true when the image is already initialized and mark it as initialized
     [[nodiscard]] bool ExchangeInitialization() noexcept {
         return std::exchange(initialized, true);
     }
+
+    /// Keeps only its mip tail (TrimmedLevels) and is uploaded in its own format
+    /// (TextureCacheRuntime::UploadTrimmedLevels), unlike a trimmed GPU-decoded ASTC image.
+    [[nodiscard]] bool IsGenericTrimmed() const noexcept;
 
     VkImageView StorageImageView(s32 level) noexcept;
 

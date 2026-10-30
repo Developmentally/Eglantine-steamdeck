@@ -82,6 +82,8 @@ private:
     };
 
     static constexpr size_t NUM_LEVELS = sizeof(size_t) * CHAR_BIT;
+    /// Levels from 64 MiB up are released as soon as the GPU is done with them.
+    static constexpr size_t LARGE_LEVEL = 26;
     using StagingBuffersCache = std::array<StagingBuffers, NUM_LEVELS>;
 
     StagingBufferRef GetStreamBuffer(size_t size);
@@ -94,6 +96,13 @@ private:
                                                          bool deferred);
 
     StagingBufferRef CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred);
+
+    /// Bytes held by every staging buffer, in use or not.
+    u64 TotalBytes() const;
+    /// Whether creating `size` more would take the pool past EDEN_NX2_STAGING_CAP_MIB.
+    bool OverCap(size_t size) const;
+    /// Frees every buffer the GPU is done with, at every level.
+    void SweepFree();
 
     StagingBuffersCache& GetCache(MemoryUsage usage);
 

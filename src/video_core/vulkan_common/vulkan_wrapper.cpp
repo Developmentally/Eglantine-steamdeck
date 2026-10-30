@@ -524,6 +524,15 @@ void Image::Release() const noexcept {
     }
 }
 
+VkDeviceSize Image::MemorySize() const noexcept {
+    if (!handle || !allocation) {
+        return 0;
+    }
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(allocator, allocation, &info);
+    return info.size;
+}
+
 void Buffer::Flush() const {
     if (!is_coherent) {
         vmaFlushAllocation(allocator, allocation, 0, VK_WHOLE_SIZE);

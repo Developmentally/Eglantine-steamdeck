@@ -17,6 +17,7 @@
 #include <bit>
 #include <numeric>
 #include "common/bit_util.h"
+#include "common/div_ceil.h"
 #include "common/settings.h"
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
@@ -219,37 +220,142 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
           info.size.depth == 1;
 }
 
-// The host shape of an image whose decoded copy would not fit in VRAM: a GPU-decoded ASTC array
-// over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual textures are 24 GB each) keeps only
-// its mip levels from `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized
-// coordinates and derivative LOD still address it correctly; explicit LODs sample one level lower.
+// MemoryAllocator::CreateImage never backs images with more texels than this (they become
+// unbacked sparse images that read as zero). Keep in step with vulkan_memory_allocator.cpp.
+constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
+
+// EDEN_NX2_TRIM_HUGE=0 leaves huge images that are not GPU-decoded ASTC unbacked (the state
+// before the generic trim below) instead of keeping their mip tail.
+[[nodiscard]] bool TrimHugeImagesEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("EDEN_NX2_TRIM_HUGE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
+}
+
+// Host bytes a trimmed image may keep: 512 MiB, or EDEN_NX2_TRIM_HUGE_MIB (an 8 GB UMA machine
+// that is already near its budget wants less, e.g. 128).
+[[nodiscard]] u64 TrimmedImageBudget() {
+    static const u64 budget = [] {
+        const char* value = std::getenv("EDEN_NX2_TRIM_HUGE_MIB");
+        const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+        return (mib != 0 ? mib : u64{512}) << 20;
+    }();
+    return budget;
+}
+
+// What MemoryAllocator::CreateImage measures against HUGE_IMAGE_TEXELS: the base level of an
+// image whose host mip 0 is guest level `skip`.
+[[nodiscard]] u64 BaseLevelTexels(const ImageInfo& info, u32 skip) {
+    return u64{(std::max)(info.size.width >> skip, 1U)} * (std::max)(info.size.height >> skip, 1U) *
+           info.size.depth * info.resources.layers;
+}
+
+// Texels of a 2D array's mip levels from `skip` on.
+[[nodiscard]] u64 LevelsTexels(const ImageInfo& info, u32 skip) {
+    u64 texels = 0;
+    for (s32 level = static_cast<s32>(skip); level < info.resources.levels; ++level) {
+        texels += u64{(std::max)(info.size.width >> level, 1U)} *
+                  (std::max)(info.size.height >> level, 1U);
+    }
+    return texels * info.resources.layers;
+}
+
+// Host bytes of a 2D array's mip levels from `skip` on, uploaded in its own (block) format.
+[[nodiscard]] u64 LevelsHostBytes(const ImageInfo& info, u32 skip) {
+    const u32 block_width = VideoCore::Surface::DefaultBlockWidth(info.format);
+    const u32 block_height = VideoCore::Surface::DefaultBlockHeight(info.format);
+    u64 bytes = 0;
+    for (s32 level = static_cast<s32>(skip); level < info.resources.levels; ++level) {
+        const u32 width = (std::max)(info.size.width >> level, 1U);
+        const u32 height = (std::max)(info.size.height >> level, 1U);
+        bytes += u64{Common::DivCeil(width, block_width)} * Common::DivCeil(height, block_height) *
+                 BytesPerBlock(info.format);
+    }
+    return bytes * info.resources.layers;
+}
+
+// A huge image the generic trim can keep the mip tail of: uploaded in its guest format (no CPU
+// conversion; GPU-decoded ASTC has its own trim) and too many texels for the allocator to back.
+[[nodiscard]] bool IsGenericTrimCandidate(const Device& device, const ImageInfo& info) {
+    if (!TrimHugeImagesEnabled() || info.type != ImageType::e2D || info.size.depth != 1 ||
+        info.num_samples != 1 || WillUseAcceleratedAstcDecode(device, info)) {
+        return false;
+    }
+    if (IsPixelFormatASTC(info.format) && !device.IsOptimalAstcSupported()) {
+        return false;
+    }
+    if (VideoCore::Surface::IsPixelFormatBCn(info.format) && !device.IsOptimalBcnSupported()) {
+        return false;
+    }
+    return BaseLevelTexels(info, 0) > HUGE_IMAGE_TEXELS;
+}
+
+// The host shape of an image that would not fit in VRAM: it keeps only its mip levels from
+// `level_offset` on, so host mip 0 is guest mip `level_offset`. Normalized coordinates and
+// derivative LOD still address it correctly; explicit LODs sample one level lower.
+//  - a GPU-decoded ASTC array over 1 GiB as RGBA8 (title 1's 8192x8192x68 ASTC 8x8 virtual
+//    textures are 24 GB each) keeps the first level from which the decode fits 512 MiB;
+//  - any other 2D image with more texels than the allocator backs (it would otherwise be an
+//    unbacked sparse image reading as zero) keeps the first level from which it fits both the
+//    allocator's texel cap and 512 MiB. Its upload goes through UploadTrimmedLevels.
+// EDEN_NX2_ASTC_TRIM_MIB=<n>: GPU-decoded ASTC images that would hold more than n Mtexels
+// (n MiB as BC3, half that as BC1) keep only the mip tail under it. For machines whose GPU
+// memory is system RAM (Steam Deck): title 1 holds ~1.7 GB of re-compressed ASTC at its title
+// screen. 0 (default) leaves them whole.
+[[nodiscard]] u64 AstcTrimTexels() {
+    static const u64 texels = [] {
+        const char* value = std::getenv("EDEN_NX2_ASTC_TRIM_MIB");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : 0ULL;
+    }();
+    return texels;
+}
+
 [[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
     level_offset = 0;
-    if (!WillUseAcceleratedAstcDecode(device, info) || info.type != ImageType::e2D) {
+    if (info.type != ImageType::e2D) {
         return info;
     }
-    const auto decoded_bytes = [&](u32 skip) {
-        u64 bytes = 0;
-        for (s32 level = static_cast<s32>(skip); level < info.resources.levels; ++level) {
-            bytes += u64{(std::max)(info.size.width >> level, 1U)} *
-                     (std::max)(info.size.height >> level, 1U) * 4;
-        }
-        return bytes * info.resources.layers;
+    const u32 last_level = static_cast<u32>(info.resources.levels) - 1;
+    const bool astc_decode = WillUseAcceleratedAstcDecode(device, info);
+    const auto host_bytes = [&](u32 skip) {
+        return astc_decode ? LevelsTexels(info, skip) * 4 : LevelsHostBytes(info, skip);
     };
-    if (decoded_bytes(0) <= (u64{1} << 30)) {
+    if (astc_decode) {
+        const u64 trim_texels = AstcTrimTexels();
+        const auto over_trim = [&](u32 skip) {
+            return trim_texels != 0 && LevelsTexels(info, skip) > trim_texels;
+        };
+        if (host_bytes(0) <= (u64{1} << 30) && !over_trim(0)) {
+            return info;
+        }
+        while (level_offset < last_level &&
+               (host_bytes(level_offset) > TrimmedImageBudget() || over_trim(level_offset))) {
+            ++level_offset;
+        }
+        if (level_offset == 0) {
+            return info;
+        }
+    } else if (IsGenericTrimCandidate(device, info)) {
+        while (level_offset < last_level && (BaseLevelTexels(info, level_offset) > HUGE_IMAGE_TEXELS ||
+                                             host_bytes(level_offset) > TrimmedImageBudget())) {
+            ++level_offset;
+        }
+    } else {
         return info;
-    }
-    while (level_offset + 1 < static_cast<u32>(info.resources.levels) &&
-           decoded_bytes(level_offset) > (u64{512} << 20)) {
-        ++level_offset;
     }
     ImageInfo host = info;
     host.size.width = (std::max)(info.size.width >> level_offset, 1U);
     host.size.height = (std::max)(info.size.height >> level_offset, 1U);
     host.resources.levels -= static_cast<s32>(level_offset);
-    LOG_WARNING(Render_Vulkan, "{}x{}x{} ASTC image would be {} MiB decoded; keeping mip levels {}+ ({}x{})",
-                info.size.width, info.size.height, info.resources.layers, decoded_bytes(0) >> 20,
-                level_offset, host.size.width, host.size.height);
+    LOG_WARNING(Render_Vulkan,
+                "{}x{}x{} {} ({} levels, format {}) would be {} MiB on the host; keeping mip levels "
+                "{}+ ({}x{}, {} MiB)",
+                info.size.width, info.size.height, info.resources.layers,
+                astc_decode ? "ASTC decode" : "image", info.resources.levels,
+                static_cast<u32>(info.format), host_bytes(0) >> 20, level_offset, host.size.width,
+                host.size.height, host_bytes(level_offset) >> 20);
     return host;
 }
 
@@ -632,6 +738,44 @@ TransformBufferCopies(std::span<const VideoCommon::BufferCopy> copies, size_t bu
     range.base.level = base;
     range.extent.levels = end - base;
     return range;
+}
+
+// Guest-level buffer copies on a host image that keeps only levels >= host_level_offset: copies
+// of trimmed-away levels are dropped, the rest renumbered.
+[[nodiscard]] boost::container::small_vector<BufferImageCopy, 16> HostLevelCopies(
+    const Image& image, std::span<const BufferImageCopy> copies) {
+    const s32 skip = static_cast<s32>(image.host_level_offset);
+    boost::container::small_vector<BufferImageCopy, 16> result;
+    for (const BufferImageCopy& copy : copies) {
+        if (copy.image_subresource.base_level < skip) {
+            continue;
+        }
+        result.push_back(copy);
+        result.back().image_subresource.base_level -= skip;
+    }
+    return result;
+}
+
+// Image-to-image copies when either side is trimmed: same renumbering, dropping copies that
+// touch a level either image no longer has.
+[[nodiscard]] boost::container::small_vector<VideoCommon::ImageCopy, 16> HostLevelCopies(
+    const Image& dst, const Image& src, std::span<const VideoCommon::ImageCopy> copies) {
+    const s32 dst_skip = static_cast<s32>(dst.host_level_offset);
+    const s32 src_skip = static_cast<s32>(src.host_level_offset);
+    boost::container::small_vector<VideoCommon::ImageCopy, 16> result;
+    for (const VideoCommon::ImageCopy& copy : copies) {
+        if (copy.dst_subresource.base_level < dst_skip || copy.src_subresource.base_level < src_skip) {
+            continue;
+        }
+        result.push_back(copy);
+        result.back().dst_subresource.base_level -= dst_skip;
+        result.back().src_subresource.base_level -= src_skip;
+    }
+    if (result.size() != copies.size()) {
+        LOG_DEBUG(Render_Vulkan, "Dropped {} copies into trimmed-away levels ({:#x} -> {:#x})",
+                  copies.size() - result.size(), src.gpu_addr, dst.gpu_addr);
+    }
+    return result;
 }
 
 [[nodiscard]] VkImageSubresourceRange MakeSubresourceRange(const ImageView* image_view) {
@@ -1243,6 +1387,14 @@ void TextureCacheRuntime::BarrierFeedbackLoop() {
 
 void TextureCacheRuntime::ReinterpretImage(Image& dst, Image& src,
                                            std::span<const VideoCommon::ImageCopy> copies) {
+    boost::container::small_vector<VideoCommon::ImageCopy, 16> host_copies;
+    if (dst.host_level_offset != 0 || src.host_level_offset != 0) {
+        host_copies = HostLevelCopies(dst, src, copies);
+        if (host_copies.empty()) {
+            return;
+        }
+        copies = host_copies;
+    }
     if (ENABLE_MSAA_RESOLVE_CONSUME) {
         InvalidateResolveShadow(dst.Handle());
     }
@@ -1672,6 +1824,14 @@ void TextureCacheRuntime::CopyImage(Image& dst, Image& src,
         };
         return ReinterpretImage(dst, src, std::span{&oneCopy, 1});
     }
+    boost::container::small_vector<VideoCommon::ImageCopy, 16> host_copies;
+    if (dst.host_level_offset != 0 || src.host_level_offset != 0) {
+        host_copies = HostLevelCopies(dst, src, copies);
+        if (host_copies.empty()) {
+            return;
+        }
+        copies = host_copies;
+    }
     boost::container::small_vector<VkImageCopy, 16> vk_copies(copies.size());
     const VkImageAspectFlags aspect_mask = dst.AspectMask();
     ASSERT(aspect_mask == src.AspectMask());
@@ -2025,6 +2185,15 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     }
     if (host_level_offset != 0) {
         flags |= VideoCommon::ImageFlagBits::TrimmedLevels;
+        // A scaled copy would be the full-size image again.
+        info.rescaleable = false;
+        info.downscaleable = false;
+    }
+    if (IsGenericTrimmed()) {
+        // The texture cache then stages each layer's mip tail and calls AccelerateImageUpload,
+        // which unswizzles it (UploadTrimmedLevels); re-uploads read the whole tail again.
+        flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
+        flags |= VideoCommon::ImageFlagBits::CostlyLoad;
     }
     if (IsHugeAstcArray(runtime->device, info)) {
         flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
@@ -2068,6 +2237,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
 }
 
 Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}
+
+bool Image::IsGenericTrimmed() const noexcept {
+    return host_level_offset != 0 && !WillUseAcceleratedAstcDecode(runtime->device, info);
+}
 
 Image::~Image() {
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
@@ -2124,6 +2297,14 @@ void Image::AllocateComputeUnswizzleBuffer(u32 max_slices) {
 
 void Image::UploadMemory(VkBuffer buffer, VkDeviceSize offset,
                          std::span<const VideoCommon::BufferImageCopy> copies) {
+    boost::container::small_vector<BufferImageCopy, 16> host_copies;
+    if (host_level_offset != 0) {
+        host_copies = HostLevelCopies(*this, copies);
+        if (host_copies.empty()) {
+            return;
+        }
+        copies = host_copies;
+    }
     // TODO: Move this to another API
     if (ENABLE_MSAA_RESOLVE_CONSUME && runtime != nullptr) {
         runtime->InvalidateResolveShadow(Handle());
@@ -2242,6 +2423,14 @@ void Image::DownloadMemory(std::span<VkBuffer> buffers_span, std::span<size_t> o
         LOG_CRITICAL(Render_Vulkan, "Missing image at download: gpu={:#x}, cpu={:#x}, type={}, format={}, flags={:#x}, size={}, dimensions={}x{}",
                      gpu_addr, cpu_addr, static_cast<u32>(info.type), static_cast<u32>(info.format),
                      static_cast<u32>(flags), unswizzled_size_bytes, info.size.width, info.size.height);
+    }
+    boost::container::small_vector<BufferImageCopy, 16> host_copies;
+    if (host_level_offset != 0) {
+        host_copies = HostLevelCopies(*this, copies);
+        if (host_copies.empty()) {
+            return;
+        }
+        copies = host_copies;
     }
     const bool is_rescaled = True(flags & ImageFlagBits::Rescaled);
     if (is_rescaled) {
@@ -3304,6 +3493,9 @@ void TextureCacheRuntime::AccelerateImageUpload(
     std::span<const VideoCommon::SwizzleParameters> swizzles,
     u32 z_start, u32 z_count) {
 
+    if (image.IsGenericTrimmed()) {
+        return UploadTrimmedLevels(image, map, swizzles);
+    }
     if (IsPixelFormatASTC(image.info.format)) {
         if (bc_encoder_pass && WillUseGpuBcnTranscode(device, image.info)) {
             return TranscodeAstcToBcn(image, map, swizzles);
@@ -3324,6 +3516,65 @@ void TextureCacheRuntime::AccelerateImageUpload(
     }
 
     ASSERT(false);
+}
+
+void TextureCacheRuntime::UploadTrimmedLevels(
+    Image& image, const StagingBufferRef& map,
+    std::span<const VideoCommon::SwizzleParameters> swizzles) {
+    const ImageInfo& info = image.info;
+    const u32 skip = image.host_level_offset;
+    const u32 bytes_per_block = BytesPerBlock(info.format);
+    const u32 block_width = VideoCore::Surface::DefaultBlockWidth(info.format);
+    const u32 block_height = VideoCore::Surface::DefaultBlockHeight(info.format);
+    const s32 layers = info.resources.layers;
+    // `map` holds, per layer, guest levels skip.. back to back (TextureCache::UploadImageContents);
+    // the swizzle offsets are relative to that tail.
+    const VideoCommon::LevelArray level_sizes = VideoCommon::CalculateMipLevelSizes(info);
+    const size_t tail = info.layer_stride - VideoCommon::FullUploadSwizzles(info)[skip].buffer_offset;
+
+    // Linear output laid out like UnswizzleImage: level by level, all layers of a level together.
+    boost::container::small_vector<BufferImageCopy, 16> copies;
+    size_t output_size = 0;
+    for (const VideoCommon::SwizzleParameters& swizzle : swizzles) {
+        const Extent3D level_size = VideoCommon::MipSize(info.size, swizzle.level);
+        const u32 host_bytes_per_layer = Common::DivCeil(level_size.width, block_width) *
+                                         Common::DivCeil(level_size.height, block_height) *
+                                         bytes_per_block;
+        copies.push_back(BufferImageCopy{
+            .buffer_offset = output_size,
+            .buffer_size = size_t{host_bytes_per_layer} * layers,
+            .buffer_row_length = Common::AlignUp(level_size.width, block_width),
+            .buffer_image_height = Common::AlignUp(level_size.height, block_height),
+            .image_subresource = {.base_level = swizzle.level, .base_layer = 0, .num_layers = layers},
+            .image_offset = {0, 0, 0},
+            .image_extent = level_size,
+        });
+        output_size += copies.back().buffer_size;
+    }
+    const StagingBufferRef output = staging_buffer_pool.Request(output_size, MemoryUsage::Upload);
+    for (size_t index = 0; index < swizzles.size(); ++index) {
+        const VideoCommon::SwizzleParameters& swizzle = swizzles[index];
+        const BufferImageCopy& copy = copies[index];
+        const size_t host_bytes_per_layer = copy.buffer_size / layers;
+        const u32 stride_alignment = VideoCommon::CalculateLevelStrideAlignment(info, swizzle.level);
+        for (s32 layer = 0; layer < layers; ++layer) {
+            const std::span<const u8> src =
+                map.mapped_span.subspan(layer * tail + swizzle.buffer_offset, level_sizes[swizzle.level]);
+            const std::span<u8> dst = output.mapped_span.subspan(
+                copy.buffer_offset + layer * host_bytes_per_layer, host_bytes_per_layer);
+            Tegra::Texture::UnswizzleTexture(dst, src, bytes_per_block, swizzle.num_tiles.width,
+                                             swizzle.num_tiles.height, swizzle.num_tiles.depth,
+                                             swizzle.block.height, swizzle.block.depth,
+                                             stride_alignment, info.native_tiling);
+        }
+    }
+    static u32 logged{};
+    if (logged++ < 16) {
+        LOG_INFO(Render_Vulkan, "Trimmed upload of {:#x}: levels {}+ of {}x{}x{} format {}, {} MiB",
+                 image.gpu_addr, skip, info.size.width, info.size.height, layers,
+                 static_cast<u32>(info.format), output_size >> 20);
+    }
+    image.UploadMemory(output.buffer, output.offset, copies);
 }
 
 void TextureCacheRuntime::TranscodeAstcToBcn(

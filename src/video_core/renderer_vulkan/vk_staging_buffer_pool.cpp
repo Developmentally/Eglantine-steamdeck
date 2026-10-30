@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 #include <vector>
 
@@ -125,6 +126,41 @@ void StagingBufferPool::TickFrame() {
     ReleaseCache(MemoryUsage::DeviceLocal);
     ReleaseCache(MemoryUsage::Upload);
     ReleaseCache(MemoryUsage::Download);
+
+    // Switch 2 titles stream texture pools of hundreds of MB; each round-trip through here is a
+    // power-of-two buffer (341 MB -> 512 MB) that the one-level-per-frame sweep above would keep
+    // for up to 64 frames. Large levels are swept every frame, with no deletion cap.
+    for (auto* cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (size_t log2 = LARGE_LEVEL; log2 < NUM_LEVELS; ++log2) {
+            auto& level = (*cache)[log2];
+            if (std::erase_if(level.entries, [this](const StagingBuffer& entry) {
+                    return scheduler.IsFree(entry.tick);
+                }) != 0) {
+                level.delete_index = 0;
+                level.iterate_index = 0;
+            }
+        }
+    }
+
+    if (static u64 frames{}; ++frames % 600 == 0) {
+        const auto total = [](const StagingBuffersCache& cache) {
+            u64 bytes{};
+            size_t count{};
+            for (size_t log2 = 0; log2 < NUM_LEVELS; ++log2) {
+                bytes += (1ULL << log2) * cache[log2].entries.size();
+                count += cache[log2].entries.size();
+            }
+            return std::pair{count, bytes >> 20};
+        };
+        const auto [dl_count, dl_mib] = total(device_local_cache);
+        const auto [up_count, up_mib] = total(upload_cache);
+        const auto [down_count, down_mib] = total(download_cache);
+        LOG_INFO(Render_Vulkan,
+                 "Staging pool: device-local {} buffers {} MiB, upload {} buffers {} MiB, download "
+                 "{} buffers {} MiB, stream {} MiB",
+                 dl_count, dl_mib, up_count, up_mib, down_count, down_mib,
+                 stream_buffer_size >> 20);
+    }
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
@@ -175,7 +211,65 @@ StagingBufferRef StagingBufferPool::GetStagingBuffer(size_t size, MemoryUsage us
     if (const std::optional<StagingBufferRef> ref = TryGetReservedBuffer(size, usage, deferred)) {
         return *ref;
     }
+    if (OverCap(size)) {
+        // A title streaming a track in queues hundreds of texture uploads a frame; every one
+        // pins a staging buffer until the GPU has copied it, and on the Deck's shared memory
+        // that pool ate 1-3 GB of GTT in seconds. Past the cap, let the GPU catch up with what
+        // was submitted (then with the current batch) and free what it is done with.
+        scheduler.Wait(scheduler.CurrentTick() - 1);
+        SweepFree();
+        if (const auto ref = TryGetReservedBuffer(size, usage, deferred)) {
+            return *ref;
+        }
+        if (OverCap(size)) {
+            scheduler.Finish();
+            SweepFree();
+            if (const auto ref = TryGetReservedBuffer(size, usage, deferred)) {
+                return *ref;
+            }
+        }
+    }
     return CreateStagingBuffer(size, usage, deferred);
+}
+
+u64 StagingBufferPool::TotalBytes() const {
+    u64 bytes{};
+    for (const auto* cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (size_t log2 = 0; log2 < NUM_LEVELS; ++log2) {
+            bytes += (u64{1} << log2) * (*cache)[log2].entries.size();
+        }
+    }
+    return bytes;
+}
+
+bool StagingBufferPool::OverCap(size_t size) const {
+    // EDEN_NX2_STAGING_CAP_MIB; 0 disables. Default 768 MiB on shared-memory GPUs, none otherwise.
+    static const u64 cap = [this] {
+        if (const char* value = std::getenv("EDEN_NX2_STAGING_CAP_MIB")) {
+            return u64{std::strtoull(value, nullptr, 10)} << 20;
+        }
+        return device.GetUmaMemoryBudgetCap() != 0 ? u64{768} << 20 : u64{0};
+    }();
+    return cap != 0 && TotalBytes() + size > cap;
+}
+
+void StagingBufferPool::SweepFree() {
+    for (auto* cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (size_t log2 = 0; log2 < NUM_LEVELS; ++log2) {
+            auto& level = (*cache)[log2];
+            if (std::erase_if(level.entries, [this](const StagingBuffer& entry) {
+                    return !entry.deferred && scheduler.IsFree(entry.tick);
+                }) != 0) {
+                level.delete_index = 0;
+                level.iterate_index = 0;
+            }
+        }
+    }
+    static u32 logged{};
+    if (logged++ < 16) {
+        LOG_INFO(Render_Vulkan, "Staging pool over its cap; after waiting for the GPU: {} MiB",
+                 TotalBytes() >> 20);
+    }
 }
 
 std::optional<StagingBufferRef> StagingBufferPool::TryGetReservedBuffer(size_t size,

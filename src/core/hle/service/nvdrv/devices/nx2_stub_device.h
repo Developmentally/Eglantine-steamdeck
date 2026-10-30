@@ -47,13 +47,20 @@ public:
     }
 
     void Register(u64 address, u64 size) {
+        {
+            std::scoped_lock lk{gpu_only_mutex};
+            client_ranges.push_back({address, size});
+        }
         MapAt(address, address, size);
     }
 
     void MapAt(u64 gpu_address, u64 cpu_address, u64 size) {
         std::scoped_lock lk{mutex};
-        TrimMappings(gpu_address, size);
+        TrimRanges(mappings, gpu_address, size);
         mappings.push_back({gpu_address, cpu_address, size});
+        if (gpu_address != cpu_address) {
+            NoteGpuOnly(gpu_address, cpu_address, size);
+        }
         for (auto& [owner, listener] : listeners) {
             listener.map(gpu_address, cpu_address, size);
         }
@@ -62,10 +69,31 @@ public:
     // NormalUnmapGpuMemory4K, or destroying the memory: the GPU range stops reaching it.
     void Unmap(u64 gpu_address, u64 size) {
         std::scoped_lock lk{mutex};
-        TrimMappings(gpu_address, size);
+        TrimRanges(mappings, gpu_address, size);
+        {
+            std::scoped_lock gl{gpu_only_mutex};
+            TrimRanges(gpu_only, gpu_address, size);
+            gpu_only_count.store(gpu_only.size(), std::memory_order_release);
+        }
         for (auto& [owner, listener] : listeners) {
             listener.unmap(gpu_address, size);
         }
+    }
+
+    // True inside a GPU-only (sub 214) region: the client never maps those, so nothing the GPU
+    // wrote there is ever read back through host memory.
+    bool IsGpuOnly(u64 gpu_address) const {
+        if (gpu_only_count.load(std::memory_order_acquire) == 0) {
+            return false;
+        }
+        std::scoped_lock lk{gpu_only_mutex};
+        auto it = std::upper_bound(gpu_only.begin(), gpu_only.end(), gpu_address,
+                                   [](u64 address, const Mapping& m) { return address < m.gpu_address; });
+        if (it == gpu_only.begin()) {
+            return false;
+        }
+        --it;
+        return gpu_address - it->gpu_address < it->size;
     }
 
     // Backing memory [cpu_address, +size) is about to be freed (its GPU mappings are gone): each
@@ -107,6 +135,10 @@ public:
         }
         std::scoped_lock lk{mutex};
         mappings.clear();
+        std::scoped_lock gl{gpu_only_mutex};
+        client_ranges.clear();
+        gpu_only.clear();
+        gpu_only_count.store(0, std::memory_order_release);
     }
 
     // Device (SMMU) address of a CPU range an address space mapped; used to present images.
@@ -146,12 +178,12 @@ private:
         ReleaseListener release;
     };
 
-    // Drops [gpu_address, +size) from the recorded mappings, keeping the parts outside it.
-    void TrimMappings(u64 gpu_address, u64 size) {
+    // Drops [gpu_address, +size) from `ranges`, keeping the parts outside it (and their order).
+    static void TrimRanges(std::vector<Mapping>& ranges, u64 gpu_address, u64 size) {
         const u64 end = gpu_address + size;
         std::vector<Mapping> kept;
-        kept.reserve(mappings.size() + 1);
-        for (const auto& m : mappings) {
+        kept.reserve(ranges.size() + 1);
+        for (const auto& m : ranges) {
             const u64 m_end = m.gpu_address + m.size;
             if (m_end <= gpu_address || m.gpu_address >= end) {
                 kept.push_back(m);
@@ -164,12 +196,35 @@ private:
                 kept.push_back({end, m.cpu_address + (end - m.gpu_address), m_end - end});
             }
         }
-        mappings = std::move(kept);
+        ranges = std::move(kept);
+    }
+
+    // A mapping at GPU != CPU address is either sub 211 placing the client's own memory (sub 101
+    // registered it) or sub 214 backing a GPU-only region; only the latter is recorded. Called
+    // under `mutex`.
+    void NoteGpuOnly(u64 gpu_address, u64 cpu_address, u64 size) {
+        std::scoped_lock lk{gpu_only_mutex};
+        for (const auto& range : client_ranges) {
+            if (cpu_address - range.gpu_address < range.size) {
+                return;
+            }
+        }
+        TrimRanges(gpu_only, gpu_address, size);
+        const auto it = std::upper_bound(gpu_only.begin(), gpu_only.end(), gpu_address,
+                                         [](u64 address, const Mapping& m) { return address < m.gpu_address; });
+        gpu_only.insert(it, {gpu_address, cpu_address, size});
+        gpu_only_count.store(gpu_only.size(), std::memory_order_release);
     }
 
     std::mutex mutex;
     std::vector<Mapping> mappings;
     std::map<const void*, Listeners> listeners;
+
+    // Read by the texture cache per image; `gpu_only` is sorted by GPU address.
+    mutable std::mutex gpu_only_mutex;
+    std::vector<Mapping> client_ranges; ///< Sub 101 registrations (gpu_address == cpu_address)
+    std::vector<Mapping> gpu_only;
+    std::atomic<size_t> gpu_only_count{};
 };
 
 // Device node that Switch 2 nvgpu drivers open but Switch 1 never had (e.g. /dev/nvhost-tsg-gpu).

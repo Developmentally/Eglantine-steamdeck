@@ -1351,6 +1351,32 @@ u32 MapSizeBytes(const ImageBase& image) {
     }
 }
 
+u64 HostImageSizeBytes(const ImageBase& image) {
+    const ImageInfo& info = image.info;
+    if (True(image.flags & ImageFlagBits::Unbacked)) {
+        return 0;
+    }
+    if (True(image.flags & ImageFlagBits::TrimmedLevels)) {
+        // GPU-decoded ASTC is RGBA8 on the host, anything else its own format.
+        const bool rgba8 =
+            IsPixelFormatASTC(info.format) && True(image.flags & ImageFlagBits::Converted);
+        const Extent2D tile_size = rgba8 ? Extent2D{1, 1} : DefaultBlockSize(info.format);
+        const u32 bytes_per_block = rgba8 ? 4 : BytesPerBlock(info.format);
+        u64 bytes = 0;
+        for (s32 level = static_cast<s32>(image.host_level_offset); level < info.resources.levels;
+             ++level) {
+            bytes += u64{NumBlocks(AdjustMipSize(info.size, level), tile_size)} * bytes_per_block;
+        }
+        return bytes * info.resources.layers;
+    }
+    u64 size = (std::max)(image.guest_size_bytes, image.unswizzled_size_bytes);
+    if ((IsPixelFormatASTC(info.format) && True(image.flags & ImageFlagBits::AcceleratedUpload)) ||
+        True(image.flags & ImageFlagBits::Converted)) {
+        size = VideoCore::Surface::TranscodedAstcSize(size, info.format);
+    }
+    return size;
+}
+
 static_assert(CalculateLevelSize(LevelInfo{{1920, 1080, 1}, {0, 2, 0}, {1, 1}, 2, 0, 1}, 0) ==
               0x7f8000);
 static_assert(CalculateLevelSize(LevelInfo{{32, 32, 1}, {0, 0, 4}, {1, 1}, 4, 0, 1}, 0) == 0x40000);

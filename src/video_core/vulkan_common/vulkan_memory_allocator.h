@@ -126,6 +126,10 @@ namespace Vulkan {
         MemoryCommit Commit(const vk::Buffer &buffer, MemoryUsage usage);
 
     private:
+        /// An image of `size` bytes would take an integrated GPU more than 1 GiB past its budget
+        /// cap (EDEN_NX2_GPU_HARD_LIMIT=0 disables); such images are left unbacked.
+        bool OverUmaHardLimit(VkDeviceSize size) const;
+
         static bool IsAutoUsage(VmaMemoryUsage u) noexcept {
             switch (u) {
                 case VMA_MEMORY_USAGE_AUTO:

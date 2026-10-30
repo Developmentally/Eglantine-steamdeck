@@ -694,6 +694,9 @@ public:
         return handle != VK_NULL_HANDLE && allocation == VK_NULL_HANDLE;
     }
 
+    /// Bytes of device memory backing the image, 0 when unbacked.
+    VkDeviceSize MemorySize() const noexcept;
+
     Image(const Image&) = delete;
     Image& operator=(const Image&) = delete;
 

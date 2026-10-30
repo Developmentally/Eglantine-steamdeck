@@ -128,4 +128,8 @@ void DeduceBlitImages(ImageInfo& dst_info, ImageInfo& src_info, const ImageBase*
 
 [[nodiscard]] u32 MapSizeBytes(const ImageBase& image);
 
+/// Host memory the collector charges for `image`: its guest/unswizzled size (scaled for transcoded
+/// ASTC), only the kept levels of a trimmed image (TrimmedLevels), nothing for an unbacked one.
+[[nodiscard]] u64 HostImageSizeBytes(const ImageBase& image);
+
 } // namespace VideoCommon

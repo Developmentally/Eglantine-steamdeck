@@ -8,6 +8,7 @@
 #include <array>
 #include <bitset>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -37,9 +38,31 @@
 #include <android/api-level.h>
 #endif
 
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace Vulkan {
 using namespace Common::Literals;
 namespace {
+
+/// Installed system RAM in bytes, 0 if unknown.
+u64 TotalPhysicalMemory() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
+#elif defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
+    const long pages = sysconf(_SC_PHYS_PAGES);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page_size > 0 ? static_cast<u64>(pages) * static_cast<u64>(page_size) : 0;
+#else
+    return 0;
+#endif
+}
+
 namespace Alternatives {
 constexpr std::array STENCIL8_UINT{
     VK_FORMAT_D16_UNORM_S8_UINT,
@@ -1629,7 +1652,7 @@ u64 Device::GetDeviceMemoryUsage() const {
 
 u64 Device::GetDeviceMemoryBudget() const {
     if (!extensions.memory_budget) {
-        return 0;
+        return uma_budget_cap;
     }
     VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
     budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
@@ -1637,6 +1660,9 @@ u64 Device::GetDeviceMemoryBudget() const {
     u64 result{};
     for (const size_t heap : valid_heap_memory) {
         result += budget.heapBudget[heap];
+    }
+    if (uma_budget_cap != 0) {
+        result = (std::min)(result, uma_budget_cap);
     }
     return result;
 }
@@ -1652,6 +1678,7 @@ void Device::CollectPhysicalMemoryInfo() {
     device_access_memory = 0;
     u64 device_initial_usage = 0;
     u64 local_memory = 0;
+    u64 driver_budget = 0;
     for (size_t element = 0; element < num_properties; ++element) {
         const bool is_heap_local =
             (mem_properties.memoryHeaps[element].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0;
@@ -1665,14 +1692,21 @@ void Device::CollectPhysicalMemoryInfo() {
         if (extensions.memory_budget) {
             device_initial_usage += budget.heapUsage[element];
             device_access_memory += budget.heapBudget[element];
+            driver_budget += budget.heapBudget[element];
             continue;
         }
         device_access_memory += mem_properties.memoryHeaps[element].size;
     }
+    const u64 total_ram = TotalPhysicalMemory();
     if (is_integrated) {
         const s64 available_memory = static_cast<s64>(device_access_memory - device_initial_usage);
         const u64 memory_size = Settings::values.vram_usage_mode.GetValue() == Settings::VramUsageMode::Aggressive ? 6_GiB : 4_GiB;
         device_access_memory = static_cast<u64>(std::max<s64>(std::min<s64>(available_memory - 8_GiB, memory_size), std::min<s64>(local_memory, memory_size)));
+        // The driver's budget on a UMA system is most of the machine's RAM, which the guest, the
+        // host process and the kernel's GTT eviction all compete for (Steam Deck: an 8 GB budget
+        // on 14.8 GB; filling it swapped the GPU thread out inside amdgpu). Hold the budget the
+        // caches follow to 35% of system RAM, at least 2 GiB.
+        uma_budget_cap = (std::max)(2_GiB, total_ram * 35 / 100);
     } else {
         const u64 reserve_memory = std::min<u64>(device_access_memory / 8, 1_GiB);
         device_access_memory -= reserve_memory;
@@ -1682,6 +1716,16 @@ void Device::CollectPhysicalMemoryInfo() {
             const size_t scaler_memory = 1_GiB * Settings::values.resolution_info.ScaleUp(1);
             device_access_memory = std::min<u64>(device_access_memory, normal_memory + scaler_memory);
         }
+    }
+    // EDEN_NX2_GPU_BUDGET_MIB caps the budget on any GPU (0 removes the cap).
+    if (const char* value = std::getenv("EDEN_NX2_GPU_BUDGET_MIB")) {
+        uma_budget_cap = std::strtoull(value, nullptr, 10) << 20;
+    }
+    if (uma_budget_cap != 0 || is_integrated) {
+        LOG_INFO(Render_Vulkan,
+                 "GPU memory budget: driver {} MiB, system RAM {} MiB, cap {} MiB, device local {} MiB",
+                 driver_budget >> 20, total_ram >> 20, uma_budget_cap >> 20,
+                 device_access_memory >> 20);
     }
 }
 
