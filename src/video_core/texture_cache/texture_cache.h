@@ -189,8 +189,11 @@ void TextureCache<P>::RetryUnbackedImages() {
     // An image the allocator left unbacked under the UMA hard limit reads as black until something
     // recreates it. Once there is room for it (and a margin for what follows), drop it: its next
     // use builds it again from guest memory, which an unbacked image never changed. Images too
-    // big to ever back (the allocator's huge rule) stay as they are.
+    // big to ever back (the allocator's huge rule) and images unbacked on purpose (sparse layers,
+    // unwritten sparse regions) stay as they are.
     if constexpr (requires { runtime.OverUmaHardLimit(u64{}); }) {
+        constexpr auto deliberate = ImageFlagBits::IsDecoding | ImageFlagBits::SparseLayers |
+                                    ImageFlagBits::UnwrittenSparse;
         u32 retried = 0;
         for (size_t i = 0; i < unbacked_image_ids.size() && retried < 2;) {
             const ImageId image_id = unbacked_image_ids[i];
@@ -198,7 +201,7 @@ void TextureCache<P>::RetryUnbackedImages() {
             const ImageInfo& info = image.info;
             const u64 texels = u64{info.size.width} * info.size.height * info.size.depth *
                                static_cast<u64>(info.resources.layers);
-            if (texels > (u64{1} << 28) || True(image.flags & ImageFlagBits::IsDecoding)) {
+            if (texels > (u64{1} << 28) || True(image.flags & deliberate)) {
                 ++i;
                 continue;
             }

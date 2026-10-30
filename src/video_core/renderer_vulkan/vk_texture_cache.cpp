@@ -314,20 +314,44 @@ constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
     return bytes * info.resources.layers;
 }
 
-// A huge image the generic trim can keep the mip tail of: uploaded in its guest format (no CPU
-// conversion; GPU-decoded ASTC has its own trim) and too many texels for the allocator to back.
-[[nodiscard]] bool IsGenericTrimCandidate(const Device& device, const ImageInfo& info) {
-    if (!TrimHugeImagesEnabled() || info.type != ImageType::e2D || info.size.depth != 1 ||
-        info.num_samples != 1 || WillUseAcceleratedAstcDecode(device, info)) {
+// A 2D image whose mip tail can be kept on its own (UploadTrimmedLevels): uploaded in its guest
+// format, no CPU conversion; GPU-decoded ASTC has its own trim.
+[[nodiscard]] bool UploadsTrimmableLevels(const Device& device, const ImageInfo& info) {
+    if (info.type != ImageType::e2D || info.size.depth != 1 || info.num_samples != 1 ||
+        WillUseAcceleratedAstcDecode(device, info)) {
         return false;
     }
     if (IsPixelFormatASTC(info.format) && !device.IsOptimalAstcSupported()) {
         return false;
     }
-    if (VideoCore::Surface::IsPixelFormatBCn(info.format) && !device.IsOptimalBcnSupported()) {
-        return false;
+    return !VideoCore::Surface::IsPixelFormatBCn(info.format) || device.IsOptimalBcnSupported();
+}
+
+// A huge image the generic trim keeps the mip tail of: too many texels for the allocator to back.
+[[nodiscard]] bool IsGenericTrimCandidate(const Device& device, const ImageInfo& info) {
+    return TrimHugeImagesEnabled() && UploadsTrimmableLevels(device, info) &&
+           BaseLevelTexels(info, 0) > HUGE_IMAGE_TEXELS;
+}
+
+// Levels a big mipmapped texture drops at a downscaled render resolution: derivative LOD never
+// reaches its top `down_shift` levels at 0.5x, so they cost memory for nothing. Textures of at
+// least 64 MiB on shared-memory GPUs (Mario Kart World's nine 341 MiB virtual texture pools are
+// what the Deck cannot back, and unbacked they read black); EDEN_NX2_RES_TRIM_MIB=<n> sets the
+// floor, 0 disables. Explicit-LOD samples of a trimmed texture land one level lower.
+[[nodiscard]] u32 ResolutionTrimLevels(const Device& device, const ImageInfo& info) {
+    static const u64 floor = [&device]() -> u64 {
+        if (const char* value = std::getenv("EDEN_NX2_RES_TRIM_MIB")) {
+            return u64{std::strtoull(value, nullptr, 10)} << 20;
+        }
+        return device.GetUmaMemoryBudgetCap() != 0 ? u64{64} << 20 : u64{0};
+    }();
+    const auto& resolution = Settings::values.resolution_info;
+    if (floor == 0 || !resolution.downscale || resolution.down_shift == 0 ||
+        info.resources.levels < 2 || info.rescaleable || !UploadsTrimmableLevels(device, info) ||
+        LevelsHostBytes(info, 0) < floor) {
+        return 0;
     }
-    return BaseLevelTexels(info, 0) > HUGE_IMAGE_TEXELS;
+    return (std::min)(resolution.down_shift, static_cast<u32>(info.resources.levels) - 1);
 }
 
 // The host shape of an image that would not fit in VRAM: it keeps only its mip levels from
@@ -338,7 +362,9 @@ constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
 //    TrimmedAstcArrayLimit (512 MiB, 256 MiB on GPUs under 7 GiB);
 //  - any other 2D image with more texels than the allocator backs (it would otherwise be an
 //    unbacked sparse image reading as zero) keeps the first level from which it fits both the
-//    allocator's texel cap and 512 MiB. Its upload goes through UploadTrimmedLevels.
+//    allocator's texel cap and 512 MiB. Its upload goes through UploadTrimmedLevels;
+//  - at a downscaled render resolution, big mipmapped textures drop the levels the resolution
+//    never reaches (ResolutionTrimLevels), same upload path.
 // EDEN_NX2_ASTC_TRIM_MIB=<n>: GPU-decoded ASTC images that would hold more than n Mtexels
 // (n MiB as BC3, half that as BC1) keep only the mip tail under it. For machines whose GPU
 // memory is system RAM (Steam Deck): title 1 holds ~1.7 GB of re-compressed ASTC at its title
@@ -408,13 +434,18 @@ constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
         if (level_offset == 0) {
             return info;
         }
-    } else if (IsGenericTrimCandidate(device, info)) {
-        while (level_offset < last_level && (BaseLevelTexels(info, level_offset) > HUGE_IMAGE_TEXELS ||
-                                             host_bytes(level_offset) > TrimmedImageBudget())) {
-            ++level_offset;
-        }
     } else {
-        return info;
+        if (IsGenericTrimCandidate(device, info)) {
+            while (level_offset < last_level &&
+                   (BaseLevelTexels(info, level_offset) > HUGE_IMAGE_TEXELS ||
+                    host_bytes(level_offset) > TrimmedImageBudget())) {
+                ++level_offset;
+            }
+        }
+        level_offset = (std::max)(level_offset, ResolutionTrimLevels(device, info));
+        if (level_offset == 0) {
+            return info;
+        }
     }
     ImageInfo host = info;
     host.size.width = (std::max)(info.size.width >> level_offset, 1U);
