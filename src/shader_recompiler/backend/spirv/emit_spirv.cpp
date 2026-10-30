@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <span>
 #include <tuple>
 #include <type_traits>
@@ -338,7 +339,19 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
 void SetupDenormControl(const Profile& profile, const IR::Program& program, EmitContext& ctx,
                         Id main_func) {
     const Info& info{program.info};
-    if (info.uses_fp32_denorms_flush && info.uses_fp32_denorms_preserve) {
+    // EDEN_NX2_FP32_DENORM_PRESERVE=1: never ask for fp32 flush-to-zero, prefer preserve. A/B for
+    // integer data passed through float varyings (material indices as denormal bit patterns)
+    // that a host's interpolation path may flush.
+    static const bool force_preserve = [] {
+        const char* value = std::getenv("EDEN_NX2_FP32_DENORM_PRESERVE");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (force_preserve) {
+        if (profile.support_fp32_denorm_preserve) {
+            ctx.AddCapability(spv::Capability::DenormPreserve);
+            ctx.AddExecutionMode(main_func, spv::ExecutionMode::DenormPreserve, 32U);
+        }
+    } else if (info.uses_fp32_denorms_flush && info.uses_fp32_denorms_preserve) {
         LOG_DEBUG(Shader_SPIRV, "Fp32 denorm flush and preserve on the same shader");
     } else if (info.uses_fp32_denorms_flush) {
         if (profile.support_fp32_denorm_flush && !profile.has_broken_fp32_denorm_flush) {
