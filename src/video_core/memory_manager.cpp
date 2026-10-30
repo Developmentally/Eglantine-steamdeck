@@ -336,7 +336,10 @@ inline void MemoryManager::MemoryOperation(GPUVAddr gpu_src_addr, std::size_t si
     while (remaining_size > 0) {
         const std::size_t copy_amount{
             (std::min)(static_cast<std::size_t>(used_page_size) - page_offset, remaining_size)};
-        auto entry = GetEntry(current_address, is_big_page);
+        // Addresses past the address space have no page table entry; treat them as unmapped.
+        const auto entry = IsWithinGPUAddressRange(current_address)
+                               ? GetEntry(current_address, is_big_page)
+                               : EntryType::Free;
         if (entry == EntryType::Mapped) [[likely]] {
             if constexpr (BOOL_BREAK_MAPPED) {
                 if (func_mapped(page_index, page_offset, copy_amount)) {

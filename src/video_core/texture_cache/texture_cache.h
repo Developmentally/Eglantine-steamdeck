@@ -2177,6 +2177,11 @@ ImageViewId TextureCache<P>::FindColorBuffer(size_t index) {
     if (rt.format == Tegra::RenderTargetFormat::NONE) {
         return ImageViewId{};
     }
+    if (!gpu_memory->IsWithinGPUAddressRange(gpu_addr)) {
+        LOG_WARNING(HW_GPU, "Ignoring color buffer {} outside the GPU address space: {:#x}", index,
+                    gpu_addr);
+        return ImageViewId{};
+    }
     const ImageInfo info(regs.rt[index], regs.anti_alias_samples_mode);
     return FindRenderTargetView(info, gpu_addr);
 }
@@ -2189,6 +2194,10 @@ ImageViewId TextureCache<P>::FindDepthBuffer() {
     }
     const GPUVAddr gpu_addr = regs.zeta.Address();
     if (gpu_addr == 0) {
+        return ImageViewId{};
+    }
+    if (!gpu_memory->IsWithinGPUAddressRange(gpu_addr)) {
+        LOG_WARNING(HW_GPU, "Ignoring depth buffer outside the GPU address space: {:#x}", gpu_addr);
         return ImageViewId{};
     }
     const ImageInfo info(regs.zeta, regs.zeta_size, regs.anti_alias_samples_mode);

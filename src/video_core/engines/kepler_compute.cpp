@@ -501,7 +501,7 @@ bool KeplerCompute::DispatchNativeCompute(const NativeQmdScheduler::Descriptor& 
     return true;
 }
 
-// Logs the images a rejected program's handles (constant bank 0, bytes 0x80-0x11c) point to, so a
+// Logs the images a rejected program's handles (constant bank 0, bytes 0x0-0x11c) point to, so a
 // substitute (e.g. an upscale blit for a tensor-core pass) can find its inputs and output.
 void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor& qmd) {
     static u32 described{};
@@ -512,7 +512,7 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
              cbuf_address, cbuf.size.Value(), qmd[12], qmd[13] & 0xffff, qmd[14] & 0xffff,
              launch_description.block_dim_x.Value(), launch_description.block_dim_y.Value(),
              launch_description.block_dim_z.Value(), regs.tic.Address());
-    for (u32 offset = 0x80; offset < 0x120; offset += 4) {
+    for (u32 offset = 0; offset < 0x120; offset += 4) {
         const u32 handle = memory_manager.Read<u32>(cbuf_address + offset);
         const u32 tic_index = handle & 0xfffff;
         if (handle == 0 || tic_index > regs.tic.limit) continue;
@@ -527,10 +527,10 @@ void KeplerCompute::DescribeNativeResources(const NativeQmdScheduler::Descriptor
 
 std::atomic<u32> g_nx2_trace_draws_after_upscale{};
 
-// Title 4's upscaler reads the tonemapped frame through the texture handle at cbuf0+0x90 and
-// writes the output resolution image through the surface handle at cbuf0+0xa0 (from its
-// TLD/SUST operands). Blit one to the other with bilinear filtering when both are plain 2D images
-// of the same format and the output is larger.
+// An upscaler reads the tonemapped frame through a texture handle and writes the output
+// resolution image through a surface handle, both in constant bank 0 (from its TLD/SUST
+// operands): title 4 at +0x90/+0xa0, Bananza at +0x60/+0x70. Blit one to the other with bilinear
+// filtering when both are plain 2D images of the same format and the output is larger.
 bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
     const auto& cbuf = launch_description.const_buffer_config[0];
     const GPUVAddr cbuf_address = (GPUVAddr{cbuf.address_high} << 32) | cbuf.address_low;
@@ -539,11 +539,50 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
         if (tic_index > regs.tic.limit) return std::nullopt;
         return GetTICEntry(tic_index);
     };
-    const auto input = image(0x90), output = image(0xa0);
-    if (!input || !output || input->format != output->format || input->Address() == 0 ||
-        output->Address() == 0 || output->Width() <= input->Width() || !input->IsBlockLinear() ||
-        !output->IsBlockLinear())
-        return false;
+    const auto usable = [](const std::optional<Texture::TICEntry>& in,
+                           const std::optional<Texture::TICEntry>& out) {
+        return in && out && in->format == out->format && in->Address() != 0 &&
+               out->Address() != 0 && out->Width() > in->Width() && in->IsBlockLinear() &&
+               out->IsBlockLinear();
+    };
+    constexpr std::array<std::pair<u32, u32>, 2> handle_layouts{{{0x90, 0xa0}, {0x60, 0x70}}};
+    std::optional<Texture::TICEntry> input, output;
+    for (const auto [input_offset, output_offset] : handle_layouts) {
+        input = image(input_offset);
+        output = image(output_offset);
+        if (usable(input, output)) break;
+    }
+    // Sparse sampling of the input: a mostly-zero input means the scene passes before the
+    // upscaler produced nothing, a populated one points at the blit or what follows it.
+    const auto sample_words = [&](const Texture::TICEntry& tic) {
+        const u64 size = u64{tic.Width()} * tic.Height() * 4;
+        if (const auto device = memory_manager.GpuToCpuAddress(tic.Address())) {
+            rasterizer->FlushRegion(*device, size, VideoCommon::CacheType::All);
+        }
+        u32 nonzero{}, samples{};
+        for (u64 offset = 0; offset < size; offset += 4096 + 4) {
+            nonzero += memory_manager.Read<u32>(tic.Address() + offset) != 0;
+            ++samples;
+        }
+        return fmt::format("{}/{} non-zero", nonzero, samples);
+    };
+    static u32 requests{};
+    static u64 last_input{};
+    const u64 input_key = input ? (input->Address() ^ (u64{input->Width()} << 48)) : 0;
+    const bool changed = input_key != last_input;
+    last_input = input_key;
+    if (requests++ < 24 || requests % 200 == 0 || changed) {
+        const auto describe = [](const std::optional<Texture::TICEntry>& tic) {
+            return tic ? fmt::format("{:#x} {}x{} fmt {:#x}", tic->Address(), tic->Width(),
+                                     tic->Height(), static_cast<u32>(tic->format.Value()))
+                       : std::string{"none"};
+        };
+        LOG_INFO(HW_GPU, "Upscale fallback request #{}: code {:#x} input {} output {}{}{}",
+                 requests, regs.code_loc.Address(), describe(input), describe(output),
+                 usable(input, output) ? "" : " (declined)",
+                 changed && usable(input, output) ? " input " + sample_words(*input) : "");
+    }
+    if (!usable(input, output)) return false;
     using RTFormat = Tegra::RenderTargetFormat;
     RTFormat format{};
     switch (input->format) {
@@ -663,7 +702,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
     }();
     if (static u32 count{}; ++count == trace_at) g_nx2_trace_draws_after_upscale = 40;
     static u32 logged{};
-    if (logged++ < 4) {
+    if (logged++ < 24) {
         LOG_INFO(HW_GPU, "Upscale fallback {:#x} {}x{} block {}/{}/{} -> {:#x} {}x{} block {}/{}/{} levels {}: {}",
                  input->Address(), input->Width(), input->Height(), input->block_width.Value(),
                  input->block_height.Value(), input->block_depth.Value(), output->Address(),

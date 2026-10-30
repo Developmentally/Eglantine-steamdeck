@@ -5,12 +5,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <bit>
 #include <numeric>
 #include <ranges>
 #include "common/cityhash.h"
 #include "common/common_types.h"
+#include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/renderer_vulkan/fixed_pipeline_state.h"
@@ -163,6 +165,19 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
         }
     }
 
+    // EDEN_NX2_PROVOKING_LAST=0|1: override while the native register for it is unconfirmed.
+    static const int provoking_override = [] {
+        const char* value = std::getenv("EDEN_NX2_PROVOKING_LAST");
+        return value ? (*value != '0' ? 1 : 0) : -1;
+    }();
+    if (provoking_override >= 0) {
+        use_last_provoking_vertex = provoking_override != 0;
+    }
+    if (static bool logged = false; !logged) {
+        logged = true;
+        LOG_INFO(Render_Vulkan, "Provoking vertex register {} -> {}", static_cast<u32>(regs.provoking_vertex),
+                 use_last_provoking_vertex ? "last" : "first");
+    }
     provoking_vertex_last.Assign(use_last_provoking_vertex ? 1 : 0);
     conservative_raster_enable.Assign(regs.conservative_raster_enable != 0 ? 1 : 0);
     smooth_lines.Assign(regs.line_anti_alias_enable != 0 ? 1 : 0);
