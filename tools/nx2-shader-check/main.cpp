@@ -6,9 +6,11 @@
 // without a GPU or a console title running. Failures are grouped by reason so a translator change
 // can be validated against a whole corpus in seconds.
 //
-//   nx2-shader-check [-l] [-q] [-b baseline] <file.bin | directory>...
+//   nx2-shader-check [-l] [-q] [-v] [-d] [-b baseline] <file.bin | directory>...
 //     -l           lowering only (skip IR translation and SPIR-V emission)
 //     -q           print the summary only
+//     -v           describe each program: header inputs/outputs, IPA forms, descriptors
+//     -d           dump the IR of each program after translation
 //     -b <file>    baseline: one program file name per line that is allowed to fail; the exit
 //                  status then reports only new failures, and fixed programs are listed
 
@@ -20,6 +22,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <span>
 #include <string>
 #include <typeinfo>
 #include <vector>
@@ -32,6 +35,7 @@
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "shader_recompiler/frontend/ampere/program_dump.h"
+#include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/program_header.h"
@@ -45,6 +49,7 @@ namespace {
 
 namespace fs = std::filesystem;
 bool verbose = false;
+bool dump_ir = false;
 using Shader::Ampere::Instruction;
 using Shader::Ampere::ProgramDumpInfo;
 
@@ -194,7 +199,8 @@ std::string StripInstructionWords(std::string message) {
 
 // -v: what the header made of the program (interpolation, inputs and outputs), to compare
 // against what the shader's code evidently expects.
-void DescribeProgram(const ProgramDumpInfo& info, const Shader::IR::Program& program) {
+void DescribeProgram(const ProgramDumpInfo& info, const Shader::IR::Program& program,
+                     std::span<const Instruction> native) {
     const auto& sph = *reinterpret_cast<const Shader::ProgramHeader*>(info.header.data());
     fmt::print("  stage {} header: imap_systemb {:#04x} omap target {:#x} local {:#x}\n",
                static_cast<u32>(program.stage), static_cast<u32>(sph.ps.imap_systemb.raw),
@@ -205,6 +211,10 @@ void DescribeProgram(const ProgramDumpInfo& info, const Shader::IR::Program& pro
             const char* mode = program.info.interpolation[index] == Shader::Interpolation::Flat ? "flat"
                 : program.info.interpolation[index] == Shader::Interpolation::NoPerspective ? "noperspective" : "smooth";
             inputs += fmt::format(" {}:{}", index, mode);
+            if (program.stage == Shader::Stage::Fragment) {
+                // Per-component SPH bits (2 each: 0 unused, 1 constant, 2 perspective, 3 linear).
+                inputs += fmt::format("/{:02x}", sph.ps.imap_generic_vector[index].raw);
+            }
         }
         if (program.info.stores.Generic(index)) outputs += fmt::format(" {}", index);
     }
@@ -213,6 +223,39 @@ void DescribeProgram(const ProgramDumpInfo& info, const Shader::IR::Program& pro
     }
     fmt::print("  inputs:{}\n  outputs:{}\n  frag colors:{} depth {}\n", inputs, outputs, colors,
                program.info.stores_frag_depth);
+    if (program.stage == Shader::Stage::Fragment) {
+        // Native IPA forms: attribute byte address, sample mode (bits 76-77), constant (78).
+        std::map<u32, std::set<std::string>> ipa;
+        for (const auto& insn : native) {
+            const u32 op = insn.Bits(0, 12);
+            if (op != 0x326 && op != 0x526) continue;
+            const u32 attribute = insn.Bits(64, 8) * 4;
+            ipa[attribute].insert(fmt::format("{}{}{}", insn.Bits(78, 1) ? "const" : "interp",
+                                              insn.Bits(76, 2) == 1 ? ".centroid" : insn.Bits(76, 2) ? ".offset" : "",
+                                              op == 0x526 ? ".idx" : ""));
+        }
+        std::string text;
+        for (const auto& [attribute, modes] : ipa) {
+            text += fmt::format(" a[{:#x}]", attribute);
+            for (const auto& mode : modes) text += ":" + mode;
+        }
+        fmt::print("  ipa:{}\n", text);
+    }
+    std::string textures;
+    for (const auto& desc : program.info.texture_descriptors) {
+        textures += fmt::format(" [cb{}+{:#x}{}{} type {} count {}]", desc.cbuf_index, desc.cbuf_offset,
+                                desc.has_secondary ? fmt::format(" | cb{}+{:#x}", desc.secondary_cbuf_index,
+                                                                 desc.secondary_cbuf_offset) : "",
+                                desc.shift_left ? fmt::format(" <<{}", desc.shift_left) : "",
+                                static_cast<u32>(desc.type), desc.count);
+    }
+    std::string buffers;
+    for (const auto& desc : program.info.storage_buffers_descriptors) {
+        buffers += fmt::format(" [cb{}+{:#x}{}]", desc.cbuf_index, desc.cbuf_offset,
+                               desc.is_written ? " w" : "");
+    }
+    fmt::print("  textures:{}\n  ssbos:{} global {} indexed-attrs {}\n", textures, buffers,
+               program.info.uses_global_memory, program.info.loads_indexed_attributes);
 }
 
 Outcome Check(const fs::path& path, bool lowering_only) {
@@ -270,7 +313,10 @@ Outcome Check(const fs::path& path, bool lowering_only) {
         Shader::Maxwell::Flow::CFG cfg(env, flow_pool, env.StartAddress());
         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
         if (verbose) {
-            DescribeProgram(info, program);
+            DescribeProgram(info, program, native);
+        }
+        if (dump_ir) {
+            fmt::print("{}\n", Shader::IR::DumpProgram(program));
         }
         outcome.phase = "spirv";
         Shader::RuntimeInfo runtime_info{};
@@ -313,6 +359,7 @@ int main(int argc, char** argv) {
         if (arg == "-l") lowering_only = true;
         else if (arg == "-q") quiet = true;
         else if (arg == "-v") verbose = true;
+        else if (arg == "-d") dump_ir = verbose = true;
         else if (arg == "-b" && i + 1 < argc) baseline_path = argv[++i];
         else inputs.emplace_back(arg);
     }

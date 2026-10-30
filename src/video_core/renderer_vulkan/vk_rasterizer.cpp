@@ -461,15 +461,21 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     }
     // EDEN_NX2_TRACE_VS=<address>: describe the next few draws using that vertex shader like the
     // after-upscale trace does (render target, blend, fragment textures).
+    // EDEN_NX2_TRACE_VS_MASK=<hex> compares only those address bits (shader pools move between
+    // runs; the offset inside the pool does not).
     static const u64 trace_vs = [] {
         const char* value = std::getenv("EDEN_NX2_TRACE_VS");
         return value ? std::strtoull(value, nullptr, 16) : 0ULL;
+    }();
+    static const u64 trace_vs_mask = [] {
+        const char* value = std::getenv("EDEN_NX2_TRACE_VS_MASK");
+        return value ? std::strtoull(value, nullptr, 16) : ~0ULL;
     }();
     if (trace_vs != 0) {
         const auto& regs = maxwell3d->regs;
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
         static u32 traced{};
-        if (vs == trace_vs && traced++ % 200 == 0 && traced < 1000) {
+        if ((vs & trace_vs_mask) == (trace_vs & trace_vs_mask) && traced++ % 200 == 0 && traced < 1000) {
             Tegra::Engines::g_nx2_trace_draws_after_upscale = 1;
         }
     }
@@ -497,6 +503,19 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                          tic.Address(), tic.Width(), tic.Height(), static_cast<u32>(tic.format.Value()));
             }
         }
+        // Vertex input: enabled attributes (format type/size/offset/buffer) and their streams.
+        for (u32 i = 0; i < Maxwell::NumVertexAttributes; ++i) {
+            const auto& attrib = regs.vertex_attrib_format[i];
+            if (attrib.constant != 0 || attrib.hex == 0) continue;
+            const auto& stream = regs.vertex_streams[attrib.buffer];
+            LOG_INFO(HW_GPU, "  attrib[{}] = {:#x}: buffer {} offset {:#x} size {:#x} type {} bgra {} | stream stride {} enabled {} at {:#x}",
+                     i, attrib.hex, attrib.buffer.Value(), attrib.offset.Value(),
+                     static_cast<u32>(attrib.size.Value()), static_cast<u32>(attrib.type.Value()),
+                     attrib.bgra.Value(), stream.stride.Value(), stream.enable.Value(), stream.Address());
+        }
+        LOG_INFO(HW_GPU, "  topology {:#x} index format {} provoking {} draw mode {}",
+                 static_cast<u32>(regs.draw.topology.Value()), static_cast<u32>(regs.index_buffer.format),
+                 static_cast<u32>(regs.provoking_vertex), static_cast<u32>(regs.draw.instance_id.Value()));
         const auto& bt = regs.blend_per_target[0];
         LOG_INFO(HW_GPU, "  blend enable {} per-target {} global op {} src {:#x} dst {:#x} | rt0 op {} src {:#x} dst {:#x} alpha {:#x}/{:#x} mask {:#x}",
                  regs.blend.enable[0], regs.blend_per_target_enabled,

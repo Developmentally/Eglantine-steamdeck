@@ -173,10 +173,13 @@ void FixedPipelineState::Refresh(Tegra::Engines::Maxwell3D& maxwell3d, DynamicFe
     if (provoking_override >= 0) {
         use_last_provoking_vertex = provoking_override != 0;
     }
-    if (static bool logged = false; !logged) {
-        logged = true;
-        LOG_INFO(Render_Vulkan, "Provoking vertex register {} -> {}", static_cast<u32>(regs.provoking_vertex),
-                 use_last_provoking_vertex ? "last" : "first");
+    // Logs the first pipeline and every later change of the register (does the driver write
+    // SET_PROVOKING_VERTEX at all, and when).
+    if (static u32 last_logged = ~0U; last_logged != static_cast<u32>(regs.provoking_vertex)) {
+        last_logged = static_cast<u32>(regs.provoking_vertex);
+        LOG_INFO(Render_Vulkan, "Provoking vertex register {} -> {}{}", last_logged,
+                 use_last_provoking_vertex ? "last" : "first",
+                 provoking_override >= 0 ? " (EDEN_NX2_PROVOKING_LAST override)" : "");
     }
     provoking_vertex_last.Assign(use_last_provoking_vertex ? 1 : 0);
     conservative_raster_enable.Assign(regs.conservative_raster_enable != 0 ? 1 : 0);
