@@ -197,6 +197,10 @@ public:
         MapView(virtual_offset, host_offset, length);
     }
 
+    bool ReleaseBackingRegion(size_t, size_t) {
+        return false;
+    }
+
     void Unmap(size_t virtual_offset, size_t length) {
         std::scoped_lock lock{placeholder_mutex};
 
@@ -627,6 +631,21 @@ public:
         ASSERT_MSG(ret != MAP_FAILED, "mmap: {}", strerror(errno));
     }
 
+    // Zero a backing range by punching a hole in the memfd: the pages read back as zero and
+    // their host memory is released instead of committed, which matters when a title takes a
+    // multi-GiB heap it has not touched yet.
+    bool ReleaseBackingRegion(size_t physical_offset, size_t length) {
+#if defined(__linux__)
+        if (fd < 0) {
+            return false;
+        }
+        return fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                         static_cast<off_t>(physical_offset), static_cast<off_t>(length)) == 0;
+#else
+        return false;
+#endif
+    }
+
     void Protect(size_t virtual_offset, size_t length, bool read, bool write, bool execute) {
         // Intersect the range with our address space.
         AdjustMap(&virtual_offset, &length);
@@ -791,6 +810,13 @@ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission 
 }
 
 void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 fill_value) {
+    // Large zero fills release the pages instead of writing them; small ones are cheaper as a
+    // plain memset than as a syscall.
+    constexpr size_t ReleaseThreshold = HugePageSize;
+    if (fill_value == 0 && length >= ReleaseThreshold && impl &&
+        impl->ReleaseBackingRegion(physical_offset, length)) {
+        return;
+    }
     std::memset(backing_base + physical_offset, fill_value, length);
 }
 
