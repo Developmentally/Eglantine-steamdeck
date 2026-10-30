@@ -4,10 +4,12 @@
 // SPDX-FileCopyrightText: Copyright 2023 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdlib>
 
 #include "core/core.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_system_control.h"
 #include "core/hle/kernel/svc.h"
 
 namespace Kernel::Svc {
@@ -16,9 +18,12 @@ namespace Kernel::Svc {
 Result SetHeapSize(Core::System& system, u64* out_address, u64 size) {
     LOG_TRACE(Kernel_SVC, "called, heap_size={:#x}", size);
 
-    // Validate size.
+    // Validate size. Switch 2 titles may ask for the whole application pool (~9.6 GiB), which is
+    // above the Switch 1 main memory ceiling.
+    const size_t max_heap_size =
+        std::max(MainMemorySizeMax, KSystemControl::Init::GetIntendedMemorySize());
     R_UNLESS(Common::IsAligned(size, HeapSizeAlignment), ResultInvalidSize);
-    R_UNLESS(size < MainMemorySizeMax, ResultInvalidSize);
+    R_UNLESS(size < max_heap_size, ResultInvalidSize);
 
     // Set the heap size.
     KProcessAddress address{};
@@ -153,8 +158,12 @@ static bool MemTrace() {
 Result SetHeapSize64(Core::System& system, uint64_t* out_address, uint64_t size) {
     const Result result = SetHeapSize(system, out_address, size);
     if (MemTrace()) {
-        LOG_INFO(Kernel_SVC, "mem trace: SetHeapSize {:#x} -> {:#x} at {:#x}", size, result.raw,
-                 *out_address);
+        auto& memory_manager = system.Kernel().MemoryManager();
+        LOG_INFO(Kernel_SVC,
+                 "mem trace: SetHeapSize {:#x} -> {:#x} at {:#x} (application pool free {:#x} of {:#x})",
+                 size, result.raw, *out_address,
+                 memory_manager.GetFreeSize(KMemoryManager::Pool::Application),
+                 memory_manager.GetSize(KMemoryManager::Pool::Application));
     }
     R_RETURN(result);
 }

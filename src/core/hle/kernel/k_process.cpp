@@ -28,6 +28,9 @@ namespace Kernel {
 
 namespace {
 
+// Large enough for a Switch 2 title to take the whole ~9.6 GiB application pool as heap.
+constexpr size_t Switch2HeapRegionSize = 16ULL * 1024 * 1024 * 1024;
+
 Result TerminateChildren(KernelCore& kernel, KProcess* process, const KThread* thread_to_not_terminate) {
     // Request that all children threads terminate.
     {
@@ -417,9 +420,10 @@ Result KProcess::Initialize(KernelCore& kernel, const Svc::CreateProcessParamete
         const bool enable_aslr = True(params.flags & Svc::CreateProcessFlag::EnableAslr);
         const bool enable_das_merge =
             False(params.flags & Svc::CreateProcessFlag::DisableDeviceAddressSpaceMerge);
+        const size_t min_heap_region_size = m_is_switch2 ? Switch2HeapRegionSize : 0;
         R_TRY(m_page_table.Initialize(as_type, enable_aslr, enable_das_merge, !enable_aslr, pool,
                                       params.code_address, code_size, m_system_resource, res_limit,
-                                      m_memory, aslr_space_start));
+                                      m_memory, aslr_space_start, min_heap_region_size));
     }
     ON_RESULT_FAILURE_2 {
         m_page_table.Finalize();
@@ -1255,6 +1259,9 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
     static_assert(sizeof(params.name) <= sizeof(name));
     std::memcpy(params.name.data(), name.data(), sizeof(params.name));
 
+    // Decided before the page table is set up so it can size the heap region accordingly.
+    m_is_switch2 = metadata.IsSwitch2();
+
     // Initialize for application process.
     R_TRY(this->Initialize(kernel, params, metadata.GetKernelCapabilities(), res_limit, pool, aslr_space_start));
 
@@ -1264,8 +1271,7 @@ Result KProcess::LoadFromMetadata(KernelCore& kernel, const FileSys::ProgramMeta
     // Switch 2 applications get more memory than a 64-bit heap region holds (nninitStartup sizes
     // its heap as total memory minus ~6.3 GiB), so count the alias region as well, bounded by the
     // pool through the resource limit.
-    if (metadata.IsSwitch2()) {
-        m_is_switch2 = true;
+    if (m_is_switch2) {
         m_max_process_memory = m_page_table.GetHeapRegionSize() + m_page_table.GetAliasRegionSize();
     }
 
