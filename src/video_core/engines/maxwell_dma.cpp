@@ -15,6 +15,7 @@
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/guest_memory.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/renderer_base.h"
 #include "video_core/textures/decoders.h"
 
@@ -64,13 +65,11 @@ void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* ba
 
 void MaxwellDMA::Launch() {
     LOG_TRACE(Render_OpenGL, "DMA copy {:#x} -> {:#x}", static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out));
-    // EDEN_NX2_TRACE_DST=<hex>: also log copies writing within 32 MiB above that GPU address.
-    static const u64 trace_destination = [] {
-        const char* value = std::getenv("EDEN_NX2_TRACE_DST");
-        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
-    }();
-    if (trace_destination != 0 && GPUVAddr(regs.offset_out) >= trace_destination &&
-        GPUVAddr(regs.offset_out) < trace_destination + (32ULL << 20)) {
+    // EDEN_NX2_TRACE_DST: log copies that write into the traced range (Tegra::Nx2TracedDestination).
+    const u64 out_span = regs.launch_dma.multi_line_enable
+                             ? u64{regs.line_count} * (std::max)(static_cast<u32>(std::abs(regs.pitch_out)), regs.line_length_in)
+                             : u64{regs.line_length_in};
+    if (Tegra::Nx2TracedDestination(GPUVAddr(regs.offset_out), (std::max)(out_span, u64{1}))) {
         static u32 traced_destination{};
         if (traced_destination++ < 40) {
             LOG_INFO(HW_GPU,

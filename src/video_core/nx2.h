@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -182,6 +183,21 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
         }
     }
     return true;
+}
+
+/// EDEN_NX2_TRACE_DST=<hex> with EDEN_NX2_TRACE_DST_MIB=<n> (32): true when a write of `size`
+/// at `gpu_address` touches [dst, dst + n MiB). The DMA engines, Fermi 2D and written storage
+/// buffers log their writes there, to find out what fills a texture.
+inline bool Nx2TracedDestination(u64 gpu_address, u64 size) {
+    static const u64 start = [] {
+        const char* value = std::getenv("EDEN_NX2_TRACE_DST");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
+    }();
+    static const u64 length = [] {
+        const char* value = std::getenv("EDEN_NX2_TRACE_DST_MIB");
+        return (value != nullptr ? std::strtoull(value, nullptr, 10) : 32ULL) << 20;
+    }();
+    return start != 0 && gpu_address < start + length && gpu_address + size > start;
 }
 
 /// GPU VA in the first page that mirrors a release at `address`, or 0.

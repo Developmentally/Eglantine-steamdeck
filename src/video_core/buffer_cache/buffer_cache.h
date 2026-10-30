@@ -17,6 +17,7 @@
 #include "video_core/buffer_cache/buffer_cache_base.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/texture_cache/util.h"
 
@@ -2196,6 +2197,13 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     u32 binding_size = static_cast<u32>(cpu_end - *aligned_device_addr);
     if (is_written) {
         binding_size = aligned_size;
+    }
+    if (is_written && Tegra::Nx2TracedDestination(gpu_addr, size)) {
+        static u32 traced{};
+        if (traced++ < 40) {
+            LOG_INFO(HW_GPU, "nx2 written storage buffer in traced range: {:#x} size {:#x} (cbuf {})",
+                     gpu_addr, size, cbuf_index);
+        }
     }
     const Binding binding{
         .device_addr = *aligned_device_addr,
