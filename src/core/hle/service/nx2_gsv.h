@@ -7,6 +7,10 @@
 #include <array>
 #include <thread>
 #include <chrono>
+#include <condition_variable>
+#include <cstring>
+#include <set>
+#include <span>
 #include <string>
 #include <cstdlib>
 #include <cstdio>
@@ -17,11 +21,11 @@
 #include <optional>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <vector>
 
 #include "common/alignment.h"
 #include "common/settings.h"
+#include "common/thread.h"
 #include "core/core.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_base.h"
@@ -44,10 +48,13 @@
 #include "core/hle/kernel/k_transfer_memory.h"
 #include "core/memory.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/host1x/nx2_video_decoder.h"
 #include "video_core/nx2.h"
 #include "core/hle/service/hle_ipc.h"
 #include "core/hle/service/ipc_helpers.h"
 #include "core/hle/service/kernel_helpers.h"
+#include "core/hle/service/nvdrv/core/container.h"
+#include "core/hle/service/nvdrv/core/syncpoint_manager.h"
 #include "core/hle/service/nvdrv/devices/nx2_stub_device.h"
 #include "core/hle/service/nvdrv/nvdrv.h"
 #include "core/hle/service/nvdrv/nvdrv_interface.h"
@@ -81,12 +88,16 @@ inline Kernel::KClientSession* CreateRawSession(Core::System& system, HLERequest
 // Replies to a TIPC request with success and raw u32 data words. ResponseBuilder::Push(Result)
 // writes the CMIF two-word result, which shifts TIPC data one word past where the client reads
 // it (and past the copied size); TIPC has a one-word result followed directly by the data.
-inline void TipcReplyWords(HLERequestContext& ctx, std::initializer_list<u32> words) {
+inline void TipcReplyWords(HLERequestContext& ctx, std::span<const u32> words) {
     IPC::ResponseBuilder rb{ctx, static_cast<u32>(2 + words.size())};
     rb.PushRaw<u32>(ResultSuccess.raw);
     for (const u32 w : words) {
         rb.Push<u32>(w);
     }
+}
+
+inline void TipcReplyWords(HLERequestContext& ctx, std::initializer_list<u32> words) {
+    TipcReplyWords(ctx, std::span<const u32>{words.begin(), words.size()});
 }
 
 // Replies with success and a copied handle to a new session served by `iface`.
@@ -199,7 +210,7 @@ private:
         const u32 syncpoint = ~cmd_buf[3];
         const u64 value = u64{cmd_buf[4]} | (u64{cmd_buf[5]} << 32);
         const u32 mode = cmd_buf[6];
-        LOG_INFO(Service, "nx2:syncpt TIPC 201 slot={:#x} syncpoint={} value={:#x} mode={}", slot,
+        LOG_DEBUG(Service, "nx2:syncpt TIPC 201 slot={:#x} syncpoint={} value={:#x} mode={}", slot,
                   syncpoint, value, mode);
         auto*& event = m_events[slot];
         if (event == nullptr) {
@@ -214,6 +225,10 @@ private:
         }
         auto& request = m_requests[slot];
         Cancel(request);
+        // A new request starts unsignalled. Slots are reused by different client objects: title 1's
+        // movie player got slot 0 after NVN's fence waits had left it signalled, took that as a
+        // decoded frame and aborted when the decoder had none.
+        event->Clear(system.Kernel());
         request.syncpoint = syncpoint;
         request.pending = true;
         auto& manager = system.Host1x().GetSyncpointManager();
@@ -234,16 +249,21 @@ private:
 
     void CancelSlotEvent(HLERequestContext& ctx) {
         const u32 slot = ctx.CommandBuffer()[2];
-        LOG_INFO(Service, "nx2:syncpt TIPC 202 slot={:#x}", slot);
-        if (auto it = m_requests.find(slot); it != m_requests.end() && Cancel(it->second)) {
-            // The client waits on the slot's event after a cancel (NvOsEventPool, after its
-            // ~100 ms wait times out), so a cancel must signal it like a completion; it rechecks
-            // the counter (TIPC 103) itself. Title 1 hung forever there when the GPU thread ran
-            // a frame behind (EDEN_NX2_FRAMES_AHEAD) and a mid-frame wait outlasted 100 ms.
-            if (const auto event = m_events.find(slot); event != m_events.end()) {
-                event->second->Signal(system.Kernel());
-            }
+        LOG_DEBUG(Service, "nx2:syncpt TIPC 202 slot={:#x}", slot);
+        if (auto it = m_requests.find(slot); it != m_requests.end()) {
+            Cancel(it->second);
         }
+        // nn::syncpt::sdk's cancel always waits on the slot's event after this reply, so a cancel
+        // signals it like a completion, also when nothing was pending; the client rechecks the
+        // counter (TIPC 103) itself. Title 1 hung forever there when the GPU thread ran a frame
+        // behind (EDEN_NX2_FRAMES_AHEAD) and a mid-frame wait outlasted NvOsEventPool's 100 ms,
+        // and its movie player cancels each slot before its first request: signalled only for
+        // pending requests, the player never got to start a movie.
+        auto*& event = m_events[slot];
+        if (event == nullptr) {
+            event = m_context.CreateEvent(fmt::format("nx2:syncpt:Slot{:x}", slot));
+        }
+        event->Signal(system.Kernel());
         TipcReplyWords(ctx, {});
     }
 
@@ -289,6 +309,7 @@ public:
             {101, &INx2GpuSession::SubRegisterMemory, "CreateGpuAccessibleMemory"},
             {102, &INx2GpuSession::SubDestroyMemory, "DestroyGpuAccessibleMemory (guessed)"},
             {211, &INx2GpuSession::SubSubmitJob, "NormalMapGpuMemory4K"},
+            {212, &INx2GpuSession::SubModifyKind, "NormalModifyMemoryKind4K"},
             {213, &INx2GpuSession::SubUnmapJob, "NormalUnmapGpuMemory4K"},
             {214, &INx2GpuSession::SubCreateGpuOnlyRegion, "CreateSparseRegion"},
             {215, &INx2GpuSession::SubDestroySparseRegion, "DestroySparseRegion"},
@@ -381,7 +402,7 @@ private:
         const auto* b = ctx.CommandBuffer();
         const u64 start = u64{b[2]} | (u64{b[3]} << 32);
         const u64 last = u64{b[4]} | (u64{b[5]} << 32);
-        LOG_INFO(Service, "nx2:gpu sub 101 start={:#x} last={:#x} [6]={:#x} [7]={:#x}", start,
+        LOG_DEBUG(Service, "nx2:gpu sub 101 start={:#x} last={:#x} [6]={:#x} [7]={:#x}", start,
                     last, b[6], b[7]);
         if (last > start) {
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Register(start, last - start + 1);
@@ -389,7 +410,7 @@ private:
             // read the first (see video_core/nx2.h).
             if (last - start + 1 == 0x2000) {
                 Tegra::Nx2AddSemaphoreRegion(start);
-                LOG_INFO(Service, "nx2:gpu semaphore page {:#x} mirrored to {:#x}", start + 0x1000,
+                LOG_DEBUG(Service, "nx2:gpu semaphore page {:#x} mirrored to {:#x}", start + 0x1000,
                          start);
             }
         }
@@ -404,7 +425,7 @@ private:
     template <size_t Slot>
     void SubSlotJob(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
-        LOG_INFO(Service, "(STUBBED) nx2:gpu {} words {:08x} slot={}", ctx.GetCommand(),
+        LOG_DEBUG(Service, "(STUBBED) nx2:gpu {} words {:08x} slot={}", ctx.GetCommand(),
                  fmt::join(std::span<const u32>{w + 2, 18}, " "), w[Slot]);
         EventFor(w[Slot])->Signal(system.Kernel());
         IPC::ResponseBuilder rb{ctx, 2};
@@ -422,7 +443,7 @@ private:
         const u64 c = u64{cmd_buf[8]} | (u64{cmd_buf[9]} << 32);
         // Words 3-4: first GPU address, 5-6: last, 7: memory handle, 8-9: offset into it.
         const u32 handle = cmd_buf[7];
-        LOG_INFO(Service, "nx2:gpu 211 map [{:#x}, {:#x}] handle={} offset={:#x} slot={}", a, b,
+        LOG_DEBUG(Service, "nx2:gpu 211 map [{:#x}, {:#x}] handle={} offset={:#x} slot={}", a, b,
                  handle, c, slot);
         if (const auto it = m_memory.find(handle); it != m_memory.end() && b > a) {
             // Also at the memory's own address: an earlier 213 may have unmapped the mapping 101
@@ -435,6 +456,21 @@ private:
         EventFor(slot)->Signal(system.Kernel());
         IPC::ResponseBuilder rb{ctx, 2};
         rb.Push(ResultSuccess);
+    }
+
+    // Sub 212 (nn::gpu::sdk::NormalModifyMemoryKind4K, behind NvRmGpuMappingModify): word 2 the
+    // address space, 3-4 first GPU address, 5-6 last, 7 the wanted (compressible) kind, 8 the
+    // fallback kind, 9 a sync flag, 10 the job slot. The reply's word 3 is the kind applied. Kinds
+    // do not matter to the emulated GPU, so keep the mapping and report the wanted kind.
+    void SubModifyKind(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const u64 first = u64{w[3]} | (u64{w[4]} << 32);
+        const u64 last = u64{w[5]} | (u64{w[6]} << 32);
+        const u32 kind = w[7] & 0xff;
+        LOG_DEBUG(Service, "nx2:gpu 212 modify [{:#x}, {:#x}] kind={:#x} fallback={:#x} slot={}",
+                  first, last, kind, w[8] & 0xff, w[10]);
+        EventFor(w[10])->Signal(system.Kernel());
+        TipcReplyWords(ctx, {kind});
     }
 
     // Sub 213: words 3-4 first GPU address, 5-6 last, job slot in word 8.
@@ -492,7 +528,7 @@ private:
         const u64 start = u64{w[3]} | (u64{w[4]} << 32);
         const u64 last = u64{w[5]} | (u64{w[6]} << 32);
         const u32 slot = w[11];
-        LOG_INFO(Service, "nx2:gpu 214 words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
+        LOG_DEBUG(Service, "nx2:gpu 214 words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
                  w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12]);
         // Word 7 bits 8-11 = 6: an address-space reservation the game maps memory into later
         // (title 5 asks for six of 1.4-5.8 GB, 17 GB in all); backing those drained the pool.
@@ -524,7 +560,7 @@ private:
         const auto* w = ctx.CommandBuffer();
         const u64 first = u64{w[3]} | (u64{w[4]} << 32);
         const u64 last = u64{w[5]} | (u64{w[6]} << 32);
-        LOG_INFO(Service, "nx2:gpu 215 destroy sparse region [{:#x}, {:#x}] words {:#x} {:#x} {:#x} {:#x}",
+        LOG_DEBUG(Service, "nx2:gpu 215 destroy sparse region [{:#x}, {:#x}] words {:#x} {:#x} {:#x} {:#x}",
                  first, last, w[1], w[2], w[7], w[8]);
         FreeReleasedRegions();
         if (last > first) {
@@ -638,7 +674,9 @@ struct Nx2NativeObjects {
         std::array<u32, 16> preference{};
         u64 size{};
         u32 count{1}; // images in the pool; handle id + i is image i
+        u64 offset{}; // into its memory (images of a decoder pool share one)
         bool window_pool{};
+        bool decoder{}; // a video decoder output image (gsv 911)
     };
     std::mutex mutex;
     std::map<u32, Memory> memories;
@@ -721,6 +759,50 @@ private:
     KernelHelpers::ServiceContext m_context;
     std::map<u32, Kernel::KEvent*> m_events;
 };
+
+// Video decoder output images (nn::codec image pools, gsv 991/911/961). The preference
+// (MakeDecodeImagePreference) holds an output layout code at word 1 and (width - 1) |
+// (height - 1) << 16 at word 2. Codes come in pairs, one per CodecMode: 1/4 NV12 (format 3, what
+// the movie players use), 2/5 BGRA, 3/6 RGBA; the HDR codes (10-13) are written as RGBA. The
+// server picks the layout and describes it to the client with gsv 961: here pitch-linear rows,
+// NV12's half-height chroma plane below the luma plane, each plane padded to 128 rows.
+struct Nx2DecoderImageLayout {
+    u32 code;
+    u32 width;
+    u32 height;
+    Tegra::Host1x::Nx2PictureFormat format;
+    u64 pitch;
+    u64 chroma_offset;
+    u64 size;
+};
+
+inline Nx2DecoderImageLayout Nx2CalculateDecoderImageLayout(const u32* preference) {
+    using Tegra::Host1x::Nx2PictureFormat;
+    Nx2DecoderImageLayout layout{};
+    layout.code = preference[1];
+    layout.width = (preference[2] & 0xFFFF) + 1;
+    layout.height = (preference[2] >> 16) + 1;
+    switch (layout.code) {
+    case 1:
+    case 4:
+        layout.format = Nx2PictureFormat::Nv12;
+        break;
+    case 2:
+    case 5:
+        layout.format = Nx2PictureFormat::Bgra8;
+        break;
+    default:
+        layout.format = Nx2PictureFormat::Rgba8;
+        break;
+    }
+    const bool nv12 = layout.format == Nx2PictureFormat::Nv12;
+    constexpr u64 BlockRows = 128;
+    layout.pitch = Common::AlignUp(u64{layout.width} * (nv12 ? 1 : 4), 64);
+    layout.chroma_offset = layout.pitch * Common::AlignUp(u64{layout.height}, BlockRows);
+    layout.size = layout.chroma_offset +
+                  (nv12 ? layout.pitch * Common::AlignUp((u64{layout.height} + 1) / 2, BlockRows) : 0);
+    return layout;
+}
 
 // Placeholder for the Switch 2 display session (nn::vi2::sdk), handed out by gsv 305. Reply
 // shapes read from the SDK: TIPC 1 -> u32 < 0x400, TIPC 3 -> u32 < 8, TIPC 11/31(u32) and
@@ -811,7 +893,10 @@ private:
         // game is blocked here while Eden's GPU thread catches up (fence) and composites.
         {
             using us = std::chrono::microseconds;
-            const auto to_us = [](auto d) { return std::chrono::duration_cast<us>(d).count(); };
+            // long long like the stats: microseconds::rep is long on Linux (std::max needs one type).
+            const auto to_us = [](auto d) -> long long {
+                return std::chrono::duration_cast<us>(d).count();
+            };
             m_stats.fence_us += to_us(waited - entered);
             m_stats.composite_us += to_us(composited - waited);
             m_stats.pace_us += to_us(paced - composited);
@@ -953,6 +1038,16 @@ private:
             presented_height <= layout.height) {
             crop_width = presented_width;
             crop_height = presented_height;
+        } else if (system.GetApplicationProcessProgramID() == 0x0400C3F00006E000ULL) {
+            // Mario Kart World draws into the top-left corner of its present images: 2560x1440
+            // docked (in 3840x2160 images), 1920x1080 handheld; fallback when word 7 is absent.
+            if (!Settings::IsDockedMode()) {
+                crop_width = (std::min)(crop_width, 1920U);
+                crop_height = (std::min)(crop_height, 1080U);
+            } else if (layout.width == 3840 && layout.height == 2160) {
+                crop_width = 2560;
+                crop_height = 1440;
+            }
         }
         static const u32 env_crop_w = [] {
             const char* v = std::getenv("EDEN_NX2_CROP_WIDTH");
@@ -966,7 +1061,10 @@ private:
             crop_width = env_crop_w;
             crop_height = env_crop_h;
         }
-        if (m_presents <= 4) {
+        const u64 shown = (u64{layout.width} << 48) | (u64{layout.height} << 32) |
+                          (u64{crop_width} << 16) | crop_height;
+        if (shown != m_shown_layout) {
+            m_shown_layout = shown;
             LOG_INFO(Service, "nx2:vi2 composite image {} layout {}x{}, crop {}x{}",
                      image_id, layout.width, layout.height, crop_width, crop_height);
         }
@@ -1149,27 +1247,39 @@ private:
     std::shared_ptr<VsyncState> m_vsync = std::make_shared<VsyncState>();
     std::shared_ptr<Core::Timing::EventType> m_vsync_timer;
     u64 m_presents{};
+    u64 m_shown_layout{}; // image and crop size last logged
     std::shared_ptr<std::atomic<bool>> m_capture_pending = std::make_shared<std::atomic<bool>>(false);
 };
 
-// The Switch 2 video decoder (nn::codec::video::detail::ipc). gsv 902/1002 hand out a session
+// True the first time a Switch 2 video command is seen, so each one is logged once in full and new
+// or unexpected commands stand out.
+inline bool Nx2FirstVideoCommand(std::string_view service, u32 command) {
+    static std::mutex mutex;
+    static std::set<std::pair<std::string, u32>> seen;
+    std::scoped_lock lk{mutex};
+    return seen.emplace(std::string{service}, command).second;
+}
+
+// The Switch 2 video decoder (nn::codec::video::detail::ipc). gsv 902/906/1002 hand out a session
 // whose TIPC 1 (CreateVideoDecoderService: handle at word 3, result at word 4) creates a decoder
 // service, another session of this class. Layouts read from the SDK's nn::codec VP9 decoder:
 // - 200(copy handle: work buffer transfer memory, u64 size, u32, u32, u32): initialize.
-// - 101(X: codec configuration, u32 0, u32 width, u32 height, u32 rate, u32 max input): configure.
-// - 3(): an event (copy handle at word 3, result at word 4) the client attaches as its
-//   submission-ready event.
+// - 101(A: codec name, "video/vp9\0"; u32 width, u32 height, u32 rate, u32): configure.
+// - 3(): the submission-ready event (copy handle at word 3, result at word 4).
 // - 6 / 207 / 8: start / stop / flush; 115: finalize.
-// - 311(u32 image id): register an output image (gsv 911 creates it); reply a 16-byte
-//   NativeSyncHandle, all zero reading as already signalled. The client acquires output images
-//   in registration/release order from a ring of its own (no IPC).
-// - 314(u32 image id, u32, NativeSyncHandle): give an output image back; reply a new handle.
+// - 311(u32 image id): register an output image (gsv 911 creates it); reply its NativeSyncHandle,
+//   signalled once a frame has been decoded into the image. The client acquires output images in
+//   registration/release order from a ring of its own (no IPC), so frames fill them in that order.
+// - 314(u32 image id, u32, NativeSyncHandle): give an output image back; the image may be
+//   rewritten once that handle (the client's reads) has passed. Reply the image's next handle.
 // - 212(u32 image id): unregister it.
 // - 109(A: one compressed frame, u64 pts in us, u8 end of stream): submit input; reply a u64.
 // - 213(): the next finished frame (16 words): u32 image id, u32 width, u32 height, u32 width,
-//   u32 height, u32 colour space, u64 pts, u8 end of stream.
-// Frames are not decoded yet: each submitted frame completes at once into the next free output
-// image, so movies run to their end (with no picture) instead of stalling.
+//   u32 height, u32 colour space, TimeSpan pts (ns), u8 end of stream.
+// A NativeSyncHandle is {u32 SyncCounterId (~syncpoint), u32 mode, u64 value}; clients wait on it
+// with nx2:syncpt 103/201. Each decoder service owns a syncpoint that counts its finished frames.
+// FFmpeg decodes on a thread of the session's own (a 1440p VP9 frame takes milliseconds, and the
+// service thread also serves presents and syncpoint waits) into the layout gsv 961 describes.
 class INx2VideoSession final : public ServiceFramework<INx2VideoSession> {
 public:
     explicit INx2VideoSession(Core::System& system_, std::shared_ptr<Nx2NativeObjects> objects_,
@@ -1180,13 +1290,13 @@ public:
             {1, &INx2VideoSession::CreateDecoderService, "CreateVideoDecoderService"},
             {3, &INx2VideoSession::GetEvent, "GetEvent"},
             {6, &INx2VideoSession::Succeed, "Start"},
-            {8, &INx2VideoSession::Succeed, "Flush"},
+            {8, &INx2VideoSession::Flush, "Flush"},
             {101, &INx2VideoSession::Configure, "Configure"},
             {109, &INx2VideoSession::SubmitInput, "SubmitInputBuffer"},
             {115, &INx2VideoSession::Succeed, "Finalize"},
             {200, &INx2VideoSession::Succeed, "Initialize"},
-            {201, &INx2VideoSession::AttachObject, "AttachObject (guessed)"},
-            {207, &INx2VideoSession::Succeed, "Stop"},
+            {201, &INx2VideoSession::AttachMemory, "AttachMemory (guessed)"},
+            {207, &INx2VideoSession::Flush, "Stop"},
             {212, &INx2VideoSession::UnregisterBuffer, "UnregisterBuffer"},
             {213, &INx2VideoSession::GetOutputInfo, "GetOutputInfo"},
             {311, &INx2VideoSession::RegisterBuffer, "RegisterBuffer"},
@@ -1195,6 +1305,14 @@ public:
     }
 
     ~INx2VideoSession() override {
+        if (m_worker.joinable()) {
+            {
+                std::scoped_lock lk{m_mutex};
+                m_quit = true;
+            }
+            m_cv.notify_all();
+            m_worker.join();
+        }
         // The ready timer runs on the HostTiming thread: clear its event under its lock first.
         {
             std::scoped_lock lk{m_ready->mutex};
@@ -1206,24 +1324,56 @@ public:
         if (m_event != nullptr) {
             m_context.CloseEvent(m_event);
         }
-        if (m_client_event != nullptr) {
-            m_client_event->Close(system.Kernel());
+        if (m_syncpoint != NoSyncpoint) {
+            NvdrvSyncpoints().FreeSyncpoint(m_syncpoint);
         }
     }
 
 private:
-    struct Output {
-        u32 image;
+    struct Input {
+        std::vector<u8> data;
+        u64 pts; // us
+        bool end;
+    };
+    struct Decoded {
+        std::optional<Tegra::Host1x::Nx2Picture> picture; // none: an empty end-of-stream frame
         u64 pts;
         bool end;
     };
+    struct Output {
+        u32 image;
+        u32 width;
+        u32 height;
+        u64 pts;
+        bool end;
+    };
+    struct Fence {
+        u32 syncpoint;
+        u32 value;
+    };
+
+    static constexpr u32 NoSyncpoint = ~0U;
+    static constexpr size_t MaxQueuedInputs = 8;
+    static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
+    static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
 
     void Log(HLERequestContext& ctx, std::string_view what) {
-        if (m_logged++ < 64 || m_logged % 256 == 0) {
-            const auto* w = ctx.CommandBuffer();
-            LOG_INFO(Service, "{} TIPC {} {}: [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x} [6]={:#x} [7]={:#x}",
-                     GetServiceName(), ctx.GetCommand(), what, w[2], w[3], w[4], w[5], w[6], w[7]);
+        const auto* w = ctx.CommandBuffer();
+        if (Nx2FirstVideoCommand(GetServiceName(), ctx.GetCommand())) {
+            LOG_INFO(Service, "{} TIPC {} {} (first use): words {:08x}", GetServiceName(),
+                     ctx.GetCommand(), what, fmt::join(std::span<const u32>{w, 12}, " "));
+        } else {
+            LOG_DEBUG(Service, "{} TIPC {} {}: [2]={:#x} [3]={:#x} [4]={:#x} [5]={:#x}",
+                      GetServiceName(), ctx.GetCommand(), what, w[2], w[3], w[4], w[5]);
         }
+    }
+
+    Nvidia::NvCore::SyncpointManager& NvdrvSyncpoints() {
+        return system.ServiceManager()
+            .GetService<Nvidia::NVDRV>("nvdrv", true)
+            ->GetModule()
+            ->GetContainer()
+            .GetSyncpointManager();
     }
 
     void CreateDecoderService(HLERequestContext& ctx) {
@@ -1237,44 +1387,42 @@ private:
         TipcReplyWords(ctx, {});
     }
 
-    // 201(copy handle, u64, u32...): title 5 sends this once before its first submit, with a
-    // 135 MB figure and the words 1, 3, 3, 1 behind it, then after submitting its whole movie
-    // never asks for output again (auto-stubbed, the handle was dropped). Record what object
-    // the handle is; an event here is kept and signalled whenever a frame completes.
-    void AttachObject(HLERequestContext& ctx) {
+    // 201(copy handle, u64 size, u32...): title 5 attaches a transfer memory (135 MB; words 1, 3,
+    // 3, 1 behind the size) before its first submit. Accepted and logged; the decoder keeps its own
+    // buffers.
+    void AttachMemory(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
         const u32 desc = (w[1] & 0x80000000) ? w[2] : 0;
         const size_t data = (w[1] & 0x80000000)
                                 ? 3 + ((desc & 1) ? 2 : 0) + ((desc >> 1) & 0xF) + ((desc >> 5) & 0xF)
                                 : 2;
-        const Handle handle = ctx.GetCopyHandle(0);
-        auto object = ctx.GetObjectFromHandle<Kernel::KAutoObject>(handle);
-        const char* type = object.IsNull() ? "none" : object->GetTypeName();
-        LOG_WARNING(Service, "{} TIPC 201 handle {:#x} ({}) words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
-                    GetServiceName(), handle, type, w[data], w[data + 1], w[data + 2],
-                    w[data + 3], w[data + 4], w[data + 5]);
-        if (auto event = ctx.GetObjectFromHandle<Kernel::KReadableEvent>(handle);
-            event.IsNotNull()) {
-            m_client_event = event.ReleasePointerUnsafe(); // keeps the reference
-        }
+        auto memory = ctx.GetObjectFromHandle<Kernel::KTransferMemory>(ctx.GetCopyHandle(0));
+        LOG_INFO(Service, "{} TIPC 201 transfer memory {} bytes, words {:#x} {:#x} {:#x} {:#x}",
+                 GetServiceName(), memory.IsNotNull() ? memory->GetSize() : 0, w[data + 2],
+                 w[data + 3], w[data + 4], w[data + 5]);
         TipcReplyWords(ctx, {});
-    }
-
-    void SignalCompletion() {
-        if (m_event != nullptr) {
-            m_event->Signal(system.Kernel());
-        }
-        if (m_client_event != nullptr) {
-            m_client_event->Signal(system.Kernel());
-        }
     }
 
     void Configure(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
-        // Words 2-3 are the X descriptor of the configuration data.
-        m_width = w[5];
-        m_height = w[6];
+        std::string codec;
+        if (!ctx.BufferDescriptorA().empty()) {
+            const auto name = ctx.ReadBufferA(0);
+            codec.assign(reinterpret_cast<const char*>(name.data()),
+                         strnlen(reinterpret_cast<const char*>(name.data()), name.size()));
+        }
         Log(ctx, "configure");
+        LOG_INFO(Service, "{} configure codec \"{}\" {}x{} rate {}", GetServiceName(), codec, w[5],
+                 w[6], w[7]);
+        {
+            std::scoped_lock lk{m_mutex};
+            m_codec = std::move(codec);
+            m_width = w[5];
+            m_height = w[6];
+        }
+        if (!m_worker.joinable()) {
+            m_worker = std::thread{[this] { DecodeLoop(); }};
+        }
         TipcReplyWords(ctx, {});
     }
 
@@ -1282,9 +1430,9 @@ private:
         Log(ctx, "event");
         if (m_event == nullptr) {
             m_event = m_context.CreateEvent(fmt::format("{}:Ready", GetServiceName()));
-            // Ready for input at all times (frames complete as they are submitted). The client
-            // attaches it auto-clearing, so one signal is consumed by the first wait: re-signal
-            // every 4 ms; a spurious wake only makes it check again.
+            // The client attaches it auto-clearing, so one signal is consumed by the first wait:
+            // while the input queue has room, re-signal every 4 ms; a spurious wake only makes it
+            // check again.
             {
                 std::scoped_lock lk{m_ready->mutex};
                 m_ready->event = m_event;
@@ -1294,7 +1442,7 @@ private:
                 [ready = m_ready, &kernel = system.Kernel()](
                     s64, std::chrono::nanoseconds) -> std::optional<std::chrono::nanoseconds> {
                     std::scoped_lock lk{ready->mutex};
-                    if (ready->event != nullptr) {
+                    if (ready->event != nullptr && ready->room.load(std::memory_order_relaxed)) {
                         ready->event->Signal(kernel);
                     }
                     return std::nullopt;
@@ -1308,32 +1456,50 @@ private:
         rb.PushCopyObjects(ctx, m_event->GetReadableEvent());
     }
 
+    // Queues an output image for the next decoded frame; returns the NativeSyncHandle words that
+    // signal once that frame is in it.
+    std::array<u32, 4> HandOut(u32 image, std::optional<Fence> release_fence) {
+        if (m_syncpoint == NoSyncpoint) {
+            m_syncpoint = NvdrvSyncpoints().AllocateSyncpoint(false);
+            m_sync_base = system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(m_syncpoint);
+            LOG_INFO(Service, "{} counts decoded frames on syncpoint {} from {}",
+                     GetServiceName(), m_syncpoint, m_sync_base);
+        }
+        u32 value;
+        {
+            std::scoped_lock lk{m_mutex};
+            m_free.push_back(image);
+            if (release_fence) {
+                m_release_fences[image] = *release_fence;
+            }
+            value = m_sync_base + ++m_handed;
+        }
+        m_cv.notify_one();
+        return {~m_syncpoint, 0, value, 0};
+    }
+
     void RegisterBuffer(HLERequestContext& ctx) {
         Log(ctx, "register output");
-        GiveBack(ctx.CommandBuffer()[2]);
-        TipcReplyWords(ctx, {0, 0, 0, 0});
+        const auto handle = HandOut(ctx.CommandBuffer()[2], std::nullopt);
+        TipcReplyWords(ctx, {handle[0], handle[1], handle[2], handle[3]});
     }
 
     void ReleaseBuffer(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
         Log(ctx, "release output");
-        GiveBack(ctx.CommandBuffer()[2]);
-        TipcReplyWords(ctx, {0, 0, 0, 0});
+        const auto handle = HandOut(w[2], Fence{~w[4], w[6]});
+        TipcReplyWords(ctx, {handle[0], handle[1], handle[2], handle[3]});
     }
 
     void UnregisterBuffer(HLERequestContext& ctx) {
         Log(ctx, "unregister output");
-        std::erase(m_free, ctx.CommandBuffer()[2]);
-        TipcReplyWords(ctx, {});
-    }
-
-    // An output image is free again: a frame waiting for one completes into it.
-    void GiveBack(u32 image) {
-        if (!m_waiting.empty()) {
-            m_outputs.push_back({image, m_waiting.front().pts, m_waiting.front().end});
-            m_waiting.pop_front();
-            return;
+        const u32 image = ctx.CommandBuffer()[2];
+        {
+            std::scoped_lock lk{m_mutex};
+            std::erase(m_free, image);
+            m_release_fences.erase(image);
         }
-        m_free.push_back(image);
+        TipcReplyWords(ctx, {});
     }
 
     void SubmitInput(HLERequestContext& ctx) {
@@ -1342,83 +1508,248 @@ private:
         const u64 pts = u64{w[5]} | (u64{w[6]} << 32);
         const bool end = (w[7] & 0xFF) != 0;
         Log(ctx, "submit");
-        if (!m_free.empty()) {
-            m_outputs.push_back({m_free.front(), pts, end});
-            m_free.pop_front();
-        } else {
-            m_waiting.push_back({0, pts, end});
+        Input input{{}, pts, end};
+        if (!ctx.BufferDescriptorA().empty()) {
+            const auto data = ctx.ReadBufferA(0);
+            input.data.assign(data.begin(), data.end());
         }
+        {
+            std::scoped_lock lk{m_mutex};
+            m_inputs.push_back(std::move(input));
+            m_ready->room.store(m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
+        }
+        m_cv.notify_one();
         const u64 id = ++m_submitted;
-        SignalCompletion();
         TipcReplyWords(ctx, {static_cast<u32>(id), static_cast<u32>(id >> 32)});
+    }
+
+    // Flush (8) and Stop (207): drop queued input and frames not yet in an image. Images already
+    // handed out keep their place, so the sync values stay in step with the client's ring.
+    void Flush(HLERequestContext& ctx) {
+        Log(ctx, ctx.GetCommand() == 8 ? "flush" : "stop");
+        {
+            std::scoped_lock lk{m_mutex};
+            m_inputs.clear();
+            m_flush = true;
+            m_ready->room.store(true, std::memory_order_relaxed);
+        }
+        m_cv.notify_one();
+        TipcReplyWords(ctx, {});
     }
 
     void GetOutputInfo(HLERequestContext& ctx) {
         Log(ctx, "output info");
-        if (m_outputs.empty()) {
+        std::optional<Output> output;
+        {
+            std::scoped_lock lk{m_mutex};
+            if (!m_outputs.empty()) {
+                output = m_outputs.front();
+                m_outputs.pop_front();
+            }
+        }
+        if (!output) {
             // Nothing finished: the code the client's own Acquire uses for an empty ring.
             IPC::ResponseBuilder rb{ctx, 2};
             rb.PushRaw<u32>(0x1c286f);
             return;
         }
-        const Output output = m_outputs.front();
-        m_outputs.pop_front();
-        Paint(output.image);
-        TipcReplyWords(ctx, {output.image, m_width, m_height, m_width, m_height, 0,
-                             static_cast<u32>(output.pts), static_cast<u32>(output.pts >> 32),
-                             output.end ? 1U : 0U, 0, 0, 0, 0, 0, 0, 0});
+        const u64 pts_ns = output->pts * 1000;
+        TipcReplyWords(ctx, {output->image, output->width, output->height, output->width,
+                             output->height, 0, static_cast<u32>(pts_ns),
+                             static_cast<u32>(pts_ns >> 32), output->end ? 1U : 0U, 0, 0, 0, 0,
+                             0, 0, 0});
     }
 
-    // Frames are not decoded: fill the output image with 0x80 once (Y = U = V = 0x80 is mid-grey
-    // in any planar layout) so a playing movie shows as grey, not as a black screen that looks
-    // like a hang. Output images are pool entries from 429 (handle = pool id + index) bound by 114.
-    void Paint(u32 image) {
-        if (!m_painted.insert(image).second) {
+    // The decode thread: turns queued input into decoded frames and decoded frames into output
+    // images, in order.
+    void DecodeLoop() {
+        Common::SetCurrentThreadName("nx2:vdec");
+        std::unique_ptr<Tegra::Host1x::Nx2VideoDecoder> decoder;
+        std::vector<Tegra::Host1x::Nx2Picture> pictures;
+        std::vector<u8> bytes;
+        std::unique_lock lk{m_mutex};
+        while (true) {
+            m_cv.wait(lk, [&] {
+                return m_quit || m_flush || (!m_decoded.empty() && !m_free.empty()) ||
+                       (!m_inputs.empty() && m_decoded.size() < MaxDecodedAhead);
+            });
+            if (m_quit) {
+                return;
+            }
+            if (m_flush) {
+                m_flush = false;
+                m_decoded.clear();
+                if (decoder) {
+                    lk.unlock();
+                    decoder->Reset();
+                    lk.lock();
+                }
+                continue;
+            }
+            if (!m_decoded.empty() && !m_free.empty()) {
+                Decoded frame = std::move(m_decoded.front());
+                m_decoded.pop_front();
+                const u32 image = m_free.front();
+                m_free.pop_front();
+                std::optional<Fence> fence;
+                if (const auto it = m_release_fences.find(image); it != m_release_fences.end()) {
+                    fence = it->second;
+                    m_release_fences.erase(it);
+                }
+                lk.unlock();
+                if (fence) {
+                    WaitForRelease(*fence);
+                }
+                const auto [width, height] = WriteImage(decoder.get(), image, frame, bytes);
+                lk.lock();
+                // Even an image written during a flush counts: the client waits for its value.
+                m_outputs.push_back({image, width, height, frame.pts, frame.end});
+                system.Host1x().GetSyncpointManager().IncrementGuest(m_syncpoint);
+                ++m_frames_out;
+                if (m_frames_out == 1 || (m_frames_out % 600) == 0 || frame.end) {
+                    LOG_INFO(Service, "{} frame {} ({}x{}, pts {} us{}) in image {}",
+                             GetServiceName(), m_frames_out, width, height, frame.pts,
+                             frame.end ? ", end of stream" : "", image);
+                }
+                continue;
+            }
+            Input input = std::move(m_inputs.front());
+            m_inputs.pop_front();
+            m_ready->room.store(m_inputs.size() < MaxQueuedInputs, std::memory_order_relaxed);
+            const std::string codec = m_codec;
+            lk.unlock();
+            if (!decoder || decoder->Name() != codec) {
+                decoder = std::make_unique<Tegra::Host1x::Nx2VideoDecoder>(codec);
+            }
+            pictures.clear();
+            decoder->Decode(input.data, input.pts, pictures);
+            if (input.end) {
+                decoder->Drain(pictures);
+            }
+            lk.lock();
+            if (m_flush) {
+                continue;
+            }
+            for (auto& picture : pictures) {
+                const u64 pts = picture.pts;
+                m_decoded.push_back({std::move(picture), pts, false});
+            }
+            if (input.end) {
+                // The client stops at the frame marked end of stream; give it one even when the
+                // last input held no picture.
+                if (m_decoded.empty()) {
+                    m_decoded.push_back({std::nullopt, input.pts, true});
+                } else {
+                    m_decoded.back().end = true;
+                }
+            }
+        }
+    }
+
+    // Waits (bounded) until the client's reads of an image it gave back have passed.
+    void WaitForRelease(const Fence& fence) {
+        if (fence.syncpoint >= HostSyncpoints) {
             return;
         }
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{100};
+        while (!syncpoints.IsReadyGuest(fence.syncpoint, fence.value) &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds{1});
+        }
+    }
+
+    // Writes a decoded frame into an output image; returns the size the frame reports.
+    std::pair<u32, u32> WriteImage(Tegra::Host1x::Nx2VideoDecoder* decoder, u32 image_id,
+                                   const Decoded& frame, std::vector<u8>& bytes) {
         u64 address{};
-        u64 size{};
+        Nx2DecoderImageLayout layout{};
         {
             std::scoped_lock lk{m_objects->mutex};
-            auto it = m_objects->images.upper_bound(image);
-            if (it == m_objects->images.begin()) {
-                return;
+            const auto image = m_objects->images.find(image_id);
+            if (image == m_objects->images.end()) {
+                return {m_width, m_height};
             }
-            --it;
-            const auto& pool = it->second;
-            const auto memory = m_objects->memories.find(pool.memory);
-            if (image >= it->first + pool.count || memory == m_objects->memories.end() ||
-                memory->second.address == 0 || memory->second.size == 0) {
-                return;
+            layout = Nx2CalculateDecoderImageLayout(image->second.preference.data());
+            const auto memory = m_objects->memories.find(image->second.memory);
+            if (memory != m_objects->memories.end() && memory->second.address != 0) {
+                address = memory->second.address + image->second.offset;
             }
-            size = memory->second.size / pool.count;
-            address = memory->second.address + u64{image - it->first} * size;
         }
-        const std::vector<u8> grey(static_cast<size_t>(size), 0x80);
-        system.Host1x().MemoryManager().WriteBlock(address, grey.data(), grey.size());
-        LOG_INFO(Service, "{} painted output image {} ({:#x} bytes at {:#x}) grey", GetServiceName(),
-                 image, size, address);
+        if (!frame.picture || decoder == nullptr || address == 0 ||
+            system.ApplicationProcess() == nullptr) {
+            return {std::min(m_width, layout.width), std::min(m_height, layout.height)};
+        }
+        // A frame larger than the image is scaled down to it.
+        const u32 width = std::min(frame.picture->width, layout.width);
+        const u32 height = std::min(frame.picture->height, layout.height);
+        bytes.resize(layout.size);
+        decoder->Render(*frame.picture, layout.format, width, height, layout.pitch,
+                        layout.chroma_offset, bytes);
+        DumpFrame(bytes, layout, width, height);
+        auto& memory = system.ApplicationMemory();
+        memory.WriteBlock(address, bytes.data(), layout.pitch * height);
+        if (layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12) {
+            memory.WriteBlock(address + layout.chroma_offset, bytes.data() + layout.chroma_offset,
+                              layout.pitch * ((height + 1) / 2));
+        }
+        return {width, height};
+    }
+
+    // EDEN_NX2_VDEC_DUMP=<dir>: save the luma of every 120th decoded frame, a quarter of its size,
+    // as nx2-vdec-<frame>.pgm (to check what the decoder wrote, apart from how the game shows it).
+    void DumpFrame(const std::vector<u8>& bytes, const Nx2DecoderImageLayout& layout, u32 width,
+                   u32 height) {
+        static const char* const directory = std::getenv("EDEN_NX2_VDEC_DUMP");
+        if (directory == nullptr || (m_frames_out % 120) != 0) {
+            return;
+        }
+        const u32 bpp = layout.format == Tegra::Host1x::Nx2PictureFormat::Nv12 ? 1 : 4;
+        const u32 w = width / 4;
+        const u32 h = height / 4;
+        const std::string path = fmt::format("{}/nx2-vdec-{:05}.pgm", directory, m_frames_out + 1);
+        if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+            std::fprintf(file, "P5 %u %u 255\n", w, h);
+            for (u32 y = 0; y < h; ++y) {
+                for (u32 x = 0; x < w; ++x) {
+                    std::fputc(bytes[y * 4 * layout.pitch + x * 4 * bpp], file);
+                }
+            }
+            std::fclose(file);
+        }
     }
 
     struct ReadyState {
         std::mutex mutex;
         Kernel::KEvent* event{};
+        std::atomic<bool> room{true}; ///< The input queue takes more frames
     };
 
     KernelHelpers::ServiceContext m_context;
     std::shared_ptr<Nx2NativeObjects> m_objects;
-    std::set<u32> m_painted;
     Kernel::KEvent* m_event{};
-    Kernel::KReadableEvent* m_client_event{};
     std::shared_ptr<ReadyState> m_ready = std::make_shared<ReadyState>();
     std::shared_ptr<Core::Timing::EventType> m_ready_timer;
+    u64 m_submitted{};
+    u32 m_syncpoint{NoSyncpoint}; ///< Counts finished frames (allocated at the first register)
+    u32 m_sync_base{};            ///< Its value before the first frame
+
+    // Shared with the decode thread.
+    std::mutex m_mutex;
+    std::condition_variable m_cv;
+    std::string m_codec;
     u32 m_width{};
     u32 m_height{};
-    u64 m_submitted{};
-    u32 m_logged{};
-    std::deque<u32> m_free;
-    std::deque<Output> m_waiting;
-    std::deque<Output> m_outputs;
+    u32 m_handed{}; ///< Output images handed out (registered or released) so far
+    u64 m_frames_out{};
+    std::deque<Input> m_inputs;
+    std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
+    std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
+    std::map<u32, Fence> m_release_fences;
+    std::deque<Output> m_outputs;      ///< Finished, for 213
+    bool m_flush{};
+    bool m_quit{};
+    std::thread m_worker;
 };
 
 // Placeholder for the Switch 2 graphics-system server that nn::gsv::BootWithRemoteMemory talks
@@ -1453,10 +1784,7 @@ public:
              "CalculateDecoderImagePoolBuffer"},
             {901, &INx2GraphicsSystemSession::Stub, "VideoInitialize (guessed)"},
             {902, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSession (guessed)"},
-            // Title 5's SDK sends 906(u32 0, u32 0x20000, u32 3) after 901 instead of 902;
-            // auto-stubbed without a handle, it aborted with InvalidHandle when its attract
-            // movie started.
-            {906, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSession3 (guessed)"},
+            {906, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSessionWithVersion"},
             {1001, &INx2GraphicsSystemSession::Stub, "VideoInitialize2 (guessed)"},
             {1002, &INx2GraphicsSystemSession::OpenVideoSession, "OpenVideoDecoderSession2 (guessed)"},
             {601, &INx2GraphicsSystemSession::Stub, "CameraInitialize (guessed)"},
@@ -1467,8 +1795,8 @@ public:
             {1211, &INx2GraphicsSystemSession::CreateNativeImage, "CreateChatImagePool (guessed)"},
             {1291, &INx2GraphicsSystemSession::CalculateChatImagePoolSize,
              "CalculateChatImagePoolSize (guessed)"},
-            // Same request as 429: the image backing a decoder output (nn::codec image pools).
-            {911, &INx2GraphicsSystemSession::CreateNativeImage, "CreateDecoderImage (guessed)"},
+            {911, &INx2GraphicsSystemSession::CreateDecoderImage, "CreateDecoderImage"},
+            {961, &INx2GraphicsSystemSession::GetCpuImageDescriptor, "GetCpuUserImageDescriptor"},
         });
     }
 
@@ -1505,10 +1833,14 @@ private:
     // nn::codec::video::detail::ipc::Initialize sends 901, 902, 1001, 1002. 902 and 1002 return
     // a session handle at word 3 and the result at word 4; left to the auto stub, the handle was 0
     // and InitializeVp9Decoder failed with 2001-0114 (title 1 aborts when a movie starts).
+    // Newer SDKs (nn::codec::video::detail::InitializeServerContext) send 906(u8, u64 decoder
+    // library version) instead of 902; title 4 sends version 0x3'00030000 and aborted with
+    // InvalidHandle at its first movie while 906 was auto-stubbed.
     void OpenVideoSession(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
         const bool second = ctx.GetCommand() == 1002;
-        LOG_WARNING(Service, "(STUBBED) nx2:gsv TIPC {}, returning a video decoder session",
-                    ctx.GetCommand());
+        LOG_INFO(Service, "nx2:gsv TIPC {} [2]={:#x} [3]={:#x} [4]={:#x}, returning a video decoder session",
+                 ctx.GetCommand(), w[2], w[3], w[4]);
         ReturnRawSession(system, ctx,
                          std::make_shared<INx2VideoSession>(system, m_objects,
                                                             second ? "nx2:vdec2" : "nx2:vdec"));
@@ -1672,21 +2004,12 @@ private:
     // bytes per pixel for the other codes; nothing is decoded into them yet.
     void CalculateDecoderImagePoolBuffer(HLERequestContext& ctx) {
         const auto* w = ctx.CommandBuffer();
-        const u32 code = w[3];
-        const u64 width = (w[4] & 0xFFFF) + 1;
-        const u64 height = (w[4] >> 16) + 1;
+        const auto layout = Nx2CalculateDecoderImageLayout(w + 2);
         const u32 count = std::max<u32>(w[18], 1);
-        constexpr u64 BlockRows = 128;
-        const bool nv12 = code == 1 || code == 4;
-        const u64 pitch = Common::AlignUp(width * (nv12 ? 1 : 4), 64);
-        u64 size = pitch * Common::AlignUp(height, BlockRows);
-        if (nv12) {
-            size += pitch * Common::AlignUp((height + 1) / 2, BlockRows);
-        }
-        size *= count;
-        const u64 alignment = 64 * BlockRows;
+        const u64 size = layout.size * count;
+        const u64 alignment = 64 * 128;
         LOG_INFO(Service, "nx2:gsv 991 decoder image pool code={} {}x{} count={} -> size={:#x}",
-                 code, width, height, count, size);
+                 layout.code, layout.width, layout.height, count, size);
         TipcReplyWords(ctx, {static_cast<u32>(size), static_cast<u32>(size >> 32),
                              static_cast<u32>(alignment), static_cast<u32>(alignment >> 32)});
     }
@@ -1835,6 +2158,62 @@ private:
         for (const u32 w : words) {
             rb.Push<u32>(w);
         }
+    }
+
+    // 911(preference[16], u32 count, u32 memory id) (nn::codec::InitializeDecoderImagePool):
+    // result, the id of the first of `count` decoder output images; the client names image i of
+    // the pool id + i. They share the pool's memory, one image size apart.
+    void CreateDecoderImage(HLERequestContext& ctx) {
+        const auto* w = ctx.CommandBuffer();
+        const u32 count = std::max<u32>(w[18], 1);
+        const auto layout = Nx2CalculateDecoderImageLayout(w + 2);
+        std::scoped_lock lk{m_objects->mutex};
+        const u32 first = m_objects->next_image;
+        m_objects->next_image += count;
+        for (u32 i = 0; i < count; ++i) {
+            auto& image = m_objects->images[first + i];
+            image.memory = w[19];
+            std::copy_n(w + 2, image.preference.size(), image.preference.begin());
+            image.size = layout.size;
+            image.offset = layout.size * i;
+            image.decoder = true;
+        }
+        LOG_INFO(Service, "nx2:gsv 911 decoder images {}..{} code={} {}x{} in memory {}", first,
+                 first + count - 1, layout.code, layout.width, layout.height, w[19]);
+        TipcReplyWords(ctx, {first});
+    }
+
+    // 961(u32 image id): result, the 128-byte nn::gsv::CpuUserImageDescriptor that
+    // nn::gs::sdk::ReadUserImage* (behind nn::codec::ReadDecoderOutputImage*) copy an image out
+    // with: u8 kind at +0; for the pitch-linear kinds (8 RGBA, 9 BGRA, 10 NV12) the plane's
+    // offset into the pool memory (u32 +0x8) and row pitch (u64 +0x10), NV12's chroma plane at
+    // +0x18/+0x20. 11-13 are the block-linear kinds, not used here.
+    void GetCpuImageDescriptor(HLERequestContext& ctx) {
+        using Tegra::Host1x::Nx2PictureFormat;
+        const u32 id = ctx.CommandBuffer()[2];
+        std::array<u32, 32> words{};
+        {
+            std::scoped_lock lk{m_objects->mutex};
+            const auto image = m_objects->images.find(id);
+            if (image != m_objects->images.end() && image->second.decoder) {
+                const auto layout = Nx2CalculateDecoderImageLayout(image->second.preference.data());
+                const u64 offset = image->second.offset;
+                words[0] = layout.format == Nx2PictureFormat::Nv12    ? 0xa
+                           : layout.format == Nx2PictureFormat::Bgra8 ? 0x9
+                                                                      : 0x8;
+                words[2] = static_cast<u32>(offset);
+                words[4] = static_cast<u32>(layout.pitch);
+                if (layout.format == Nx2PictureFormat::Nv12) {
+                    words[6] = static_cast<u32>(offset + layout.chroma_offset);
+                    words[8] = static_cast<u32>(layout.pitch);
+                }
+            }
+        }
+        if (Nx2FirstVideoCommand("nx2:gsv", 961) || words[0] == 0) {
+            LOG_INFO(Service, "nx2:gsv 961 image {} -> kind {:#x} offset {:#x} pitch {:#x}", id,
+                     words[0], words[2], words[4]);
+        }
+        TipcReplyWords(ctx, words);
     }
 
     void DestroyNativeImage(HLERequestContext& ctx) {

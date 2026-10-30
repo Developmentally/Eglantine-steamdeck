@@ -84,6 +84,8 @@ add_library(video_core STATIC
     host1x/nvdec.cpp
     host1x/nvdec.h
     host1x/nvdec_common.h
+    host1x/nx2_video_decoder.cpp
+    host1x/nx2_video_decoder.h
     host1x/syncpoint_manager.cpp
     host1x/syncpoint_manager.h
     host1x/vic.cpp
@@ -95,6 +97,8 @@ add_library(video_core STATIC
     fence_manager.h
     gpu.cpp
     gpu.h
+    gpu_split.cpp
+    gpu_split.h
     gpu_thread.cpp
     gpu_thread.h
     guest_memory.h
