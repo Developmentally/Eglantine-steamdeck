@@ -46,6 +46,9 @@ public:
 
     void TickFrame();
 
+    /// Bytes held by the cached staging buffers (all usages), excluding the stream buffer.
+    [[nodiscard]] u64 CachedBytes() const noexcept;
+
 private:
     struct StreamBufferCommit {
         size_t upper_bound;

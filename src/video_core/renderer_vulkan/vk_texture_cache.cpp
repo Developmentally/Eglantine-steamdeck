@@ -2207,6 +2207,8 @@ bool TextureCacheRuntime::CanReportMemoryUsage() const {
 
 void TextureCacheRuntime::LogMemoryStatistics() const {
     Vulkan::LogMemoryStatistics(device);
+    LOG_INFO(Render_Vulkan, "Staging pool holds {} MiB; transcode scratch {} MiB",
+             staging_buffer_pool.CachedBytes() >> 20, pending_transcode_bytes >> 20);
 }
 
 bool TextureCacheRuntime::UseOpaqueAstcFormat() const {

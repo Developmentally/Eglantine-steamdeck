@@ -163,6 +163,16 @@ void StagingBufferPool::TickFrame() {
     }
 }
 
+u64 StagingBufferPool::CachedBytes() const noexcept {
+    u64 bytes{};
+    for (const auto* cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (size_t log2 = 0; log2 < NUM_LEVELS; ++log2) {
+            bytes += (1ULL << log2) * (*cache)[log2].entries.size();
+        }
+    }
+    return bytes;
+}
+
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
     if (AreRegionsActive(Region(free_iterator) + 1,
                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {

@@ -295,6 +295,15 @@ void TextureCache<P>::TickFrame() {
     // collector thrash).
     static const bool profile = std::getenv("EDEN_NX2_GPU_PROFILE") != nullptr;
     static const u64 stats_interval = profile ? 200 : 600;
+    // EDEN_NX2_MEM_TRACE=1: the same every 60 frames, to see what fills the device during a load.
+    static const bool mem_trace = std::getenv("EDEN_NX2_MEM_TRACE") != nullptr;
+    if (static u64 trace_frames{}; mem_trace && ++trace_frames % 60 == 0) {
+        LOG_INFO(HW_GPU, "mem trace: device memory {} MiB, {} images, {} unbacked",
+                 total_used_memory >> 20, slot_images.size(), unbacked_image_ids.size());
+        if constexpr (requires { runtime.LogMemoryStatistics(); }) {
+            runtime.LogMemoryStatistics();
+        }
+    }
     if (profile) {
         // Under the profile, every 256 MiB step up or down as well: the Deck's GTT pool fills
         // in seconds when a title loads, between two regular reports.
@@ -2096,6 +2105,20 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             join_copies_to_do.emplace_back(JoinCopy{false, overlap_id});
             return;
         }
+        // A Switch 2 render target re-created at another size at the same address (dynamic
+        // resolution changes it every frame: 15 sizes in a second in Mario Kart World's menus).
+        // Aliasing would keep every size alive until the collector gets to it, and that filled
+        // the Deck's GTT. The old one is dead on the console as well; copy what overlaps and
+        // drop it.
+        if (overlap.gpu_addr == gpu_addr && new_info.type == ImageType::e2D &&
+            overlap.info.type == ImageType::e2D && new_info.resources.levels == 1 &&
+            overlap.info.resources.levels == 1 &&
+            (new_info.size.width != overlap.info.size.width ||
+             new_info.size.height != overlap.info.size.height) &&
+            Service::Nvidia::Devices::IsNx2GpuOnlyAddress(gpu_addr)) {
+            join_copies_to_do.emplace_back(JoinCopy{false, overlap_id, true});
+            return;
+        }
         constexpr auto options = RelaxedOptions::Size | RelaxedOptions::Format;
         const ImageBase new_image_base(new_info, gpu_addr, cpu_addr);
         if (IsSubresource(new_info, overlap, gpu_addr, options, broken_views, native_bgr)) {
@@ -2264,7 +2287,32 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             new_image.modification_tick = overlap.modification_tick;
             continue;
         }
-        if (True(overlap.flags & ImageFlagBits::GpuModified)) {
+        if (copy_object.resize) {
+            if (overlap.IsSafeGpuCopy() && overlap.info.format == new_image.info.format &&
+                overlap.info.num_samples == new_image.info.num_samples &&
+                False(overlap.flags & ImageFlagBits::Unbacked) &&
+                False(new_image.flags & ImageFlagBits::Unbacked)) {
+                new_image.flags |= ImageFlagBits::GpuModified;
+                const s32 layers = (std::min)(overlap.info.resources.layers,
+                                              new_image.info.resources.layers);
+                const ImageCopy copy{
+                    .src_subresource = {.base_level = 0, .base_layer = 0, .num_layers = layers},
+                    .dst_subresource = {.base_level = 0, .base_layer = 0, .num_layers = layers},
+                    .src_offset = {},
+                    .dst_offset = {},
+                    .extent = {(std::min)(overlap.info.size.width, new_image.info.size.width),
+                               (std::min)(overlap.info.size.height, new_image.info.size.height), 1},
+                };
+                runtime.CopyImage(new_image, overlap, std::array{copy});
+                new_image.modification_tick = overlap.modification_tick;
+            }
+            if (static u32 logged{}; logged++ < 8) {
+                LOG_INFO(HW_GPU, "Render target {:#x} resized {}x{} -> {}x{} (format {} -> {}); dropping the old one",
+                         gpu_addr, overlap.info.size.width, overlap.info.size.height,
+                         new_image.info.size.width, new_image.info.size.height,
+                         static_cast<u32>(overlap.info.format), static_cast<u32>(new_image.info.format));
+            }
+        } else if (True(overlap.flags & ImageFlagBits::GpuModified)) {
             new_image.flags |= ImageFlagBits::GpuModified;
             const auto& resolution = Settings::values.resolution_info;
             const SubresourceBase base = new_image.TryFindBase(overlap.gpu_addr).value();

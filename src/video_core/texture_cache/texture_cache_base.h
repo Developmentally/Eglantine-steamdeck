@@ -587,6 +587,7 @@ private:
     struct JoinCopy {
         bool is_alias;
         ImageId id;
+        bool resize{}; // a render target re-created at another size at the same address
     };
     boost::container::small_vector<JoinCopy, 4> join_copies_to_do;
     ::Common::unordered_map<ImageId, size_t> join_alias_indices;
