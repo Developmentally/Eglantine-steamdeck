@@ -379,10 +379,11 @@ void TextureCache<P>::TickFrame() {
                  stats_interval, images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer), {} written back for the CPU",
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer), {} written back for the CPU in {} flushes",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads,
-                 images_written_back);
-        images_uploaded = uploaded_bytes = largest_upload = layer_uploads = images_written_back = 0;
+                 images_written_back, download_requests);
+        images_uploaded = uploaded_bytes = largest_upload = layer_uploads = images_written_back =
+            download_requests = 0;
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
@@ -859,6 +860,7 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
 
 template <class P>
 void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
+    ++download_requests;
     boost::container::small_vector<ImageId, 16> images;
     ForEachImageInRegion(cpu_addr, size, [this, &images](ImageId image_id, ImageBase& image) {
         if (!IsDownloadable(image)) {
