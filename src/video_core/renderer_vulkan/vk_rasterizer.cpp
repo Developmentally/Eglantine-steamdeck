@@ -274,6 +274,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
             LOG_WARNING(HW_GPU, "Draw skipped ({}): vs={:#x} ps={:#x} rt0={:#x} {}x{}", reason, vs, ps,
                         regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height);
         }
+        if (frame_trace_state == 2) {
+            // Every enabled stage slot, so the rejected program behind the skip can be named.
+            std::string stages;
+            for (size_t index = 0; index < Maxwell::Regs::MaxShaderProgram; ++index) {
+                if (regs.IsShaderConfigEnabled(index)) {
+                    const auto& slot = regs.pipelines[index];
+                    stages += fmt::format(" {}:{:#x}", index,
+                                          (u64{slot.reserved[0] & 0xff} << 32) | slot.reserved[1]);
+                }
+            }
+            LOG_INFO(HW_GPU, "frame trace:   draw skipped ({}) stages{}", reason, stages);
+        }
     };
     GraphicsPipeline* const pipeline{[&] {
         Profile::Scope scope{Profile::Zone::PipelineLookup};

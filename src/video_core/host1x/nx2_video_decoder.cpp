@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <set>
@@ -95,6 +96,16 @@ Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime) : impl{std::make_unique<
         return;
     }
     impl->context.emplace(*impl->decoder);
+    // DecoderContext turns frame threading off for nvdec, whose client expects each picture back
+    // at once. This decoder reorders by pts and drains at the end of the stream, so it can take
+    // the latency: Mario Kart World's 2560x1440 VP9 movies decode at 37 fps single-threaded on a
+    // Steam Deck, and the game aborts partway when they fall behind.
+    static const bool frame_threads = std::getenv("EDEN_NX2_VDEC_FRAME_THREADS") == nullptr ||
+                                      std::strtoul(std::getenv("EDEN_NX2_VDEC_FRAME_THREADS"), nullptr, 10) != 0;
+    if (frame_threads) {
+        impl->context->GetCodecContext()->thread_type |= FF_THREAD_FRAME;
+        impl->context->GetCodecContext()->thread_count = 0;
+    }
     if (Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu) {
         impl->hardware.emplace();
         impl->hardware->InitializeForDecoder(*impl->context, *impl->decoder);
