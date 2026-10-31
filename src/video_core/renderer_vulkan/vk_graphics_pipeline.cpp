@@ -510,7 +510,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
 
-    // EDEN_NX2_PS_TEX_LOG=<program key hex prefix>: once per image, every texture that pixel
+    // EDEN_NX2_PS_TEX_LOG=<program key hex prefix>|all: once per image, every texture that pixel
     // program samples, with its descriptor (cbuf offset), geometry, format and how much of its
     // guest memory is non-zero (an untextured-looking surface: empty or wrong image?). The key
     // names the program's dump file and is stable across sessions.
@@ -519,9 +519,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         return value != nullptr ? std::string{value} : std::string{};
     }();
     if (!log_ps_textures.empty() && Spec::enabled_stages[4] &&
-        fmt::format("{:016x}", Tegra::Nx2ProgramKey((u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
-                                                    regs.pipelines[5].reserved[1]))
-            .starts_with(log_ps_textures)) {
+        (log_ps_textures == "all" ||
+         fmt::format("{:016x}", Tegra::Nx2ProgramKey((u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                                                     regs.pipelines[5].reserved[1]))
+             .starts_with(log_ps_textures))) {
         static std::unordered_set<u64> logged;
         const u64 ps_address{(u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
                              regs.pipelines[5].reserved[1]};
@@ -569,9 +570,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 const size_t nonzero{static_cast<size_t>(
                     std::count_if(bytes.begin(), bytes.end(), [](u8 b) { return b != 0; }))};
                 LOG_INFO(Render_Vulkan,
-                         "PS {:#x} texture cb{}+{:#x} type {}: image {:#x} {}x{}x{} layers {} levels {} "
+                         "PS {:#x} key {:016x} texture cb{}+{:#x} type {}: image {:#x} {}x{}x{} layers {} levels {} "
                          "format {} view format {} flags {:#x} guest {} KiB, {}% of first {} KiB non-zero",
-                         ps_address, desc.cbuf_index, desc.cbuf_offset,
+                         ps_address, Tegra::Nx2ProgramKey(ps_address), desc.cbuf_index, desc.cbuf_offset,
                          static_cast<u32>(desc.type), image.gpu_addr, image.info.size.width,
                          image.info.size.height, image.info.size.depth,
                          image.info.resources.layers, image.info.resources.levels,
