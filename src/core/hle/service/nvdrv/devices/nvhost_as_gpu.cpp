@@ -161,6 +161,21 @@ void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
     if (!gmmu) {
         return;
     }
+    // Inside a sparse region the range goes back to the region's own (zero) pages.
+    if (auto it = nx2_sparse_ranges.upper_bound(gpu_address); it != nx2_sparse_ranges.begin()) {
+        --it;
+        const auto& [start, range] = *it;
+        const auto& [region_size, device_address] = range;
+        if (gpu_address >= start && gpu_address + size <= start + region_size) {
+            system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size,
+                                     device = device_address + (gpu_address - start)] {
+                gmmu->Map(gpu_address, device, size, Tegra::PTEKind::PITCH, false);
+            });
+            LOG_DEBUG(Service_NVDRV, "Switch 2 GPU unmapping {:#x}+{:#x}: back to sparse region {:#x}",
+                      gpu_address, size, start);
+            return;
+        }
+    }
     // The GPU thread may still be running command lists that use the range.
     system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] { gmmu->Unmap(gpu_address, size); });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU unmapping {:#x}+{:#x}", gpu_address, size);

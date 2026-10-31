@@ -458,6 +458,7 @@ private:
             // made there.
             const u64 cpu = it->second.address + c;
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().MapAt(a, cpu, b - a + 1);
+            NoteMappingIntoSparseRegion(a, b - a + 1);
         } else {
             LOG_WARNING(Service, "nx2:gpu 211 map of unknown handle {}", handle);
         }
@@ -693,6 +694,36 @@ private:
         return std::nullopt;
     }
 
+    // A 211 map whose range lies in a sparse region: the game fills the region with pages of its
+    // own (title 5's 8192² terrain pools are loaded this way, not rendered). Those blocks count as
+    // written, so the images over them get device memory and upload from the mapped pages instead
+    // of staying all-zero, and BackSparseWrite leaves them alone.
+    void NoteMappingIntoSparseRegion(u64 gpu_address, u64 size) {
+        std::scoped_lock lk{m_region_mutex};
+        auto it = m_sparse_regions.upper_bound(gpu_address);
+        if (it == m_sparse_regions.begin()) {
+            return;
+        }
+        --it;
+        auto& [start, region] = *it;
+        if (gpu_address >= start + region.size) {
+            return;
+        }
+        const u64 end = (std::min)(gpu_address + size, start + region.size);
+        const u64 first_block = (gpu_address - start) / SparseBlockSize;
+        const u64 last_block = (end - 1 - start) / SparseBlockSize;
+        for (u64 block = first_block; block <= last_block; ++block) {
+            if (region.blocks[block] == BlockEmpty) {
+                region.blocks[block] = BlockMapped;
+            }
+        }
+        Tegra::Nx2SparseMarkWritten(gpu_address, end - gpu_address);
+        if (m_sparse_mapped_logs++ < 8) {
+            LOG_INFO(Service, "nx2:gpu 211 maps [{:#x}, +{:#x}] into sparse region {:#x} (blocks {}-{})",
+                     gpu_address, size, start, first_block, last_block);
+        }
+    }
+
     // Runs before a GPU-side write that may land in a sparse region (Tegra::Nx2BackSparseWrite,
     // usually on the GPU thread): the blocks the write touches get memory, cleared, behind the
     // region's device pages. The GPU mapping stays as it is, so the images over the region keep
@@ -757,12 +788,14 @@ private:
     static constexpr u8 BlockEmpty = 0;
     static constexpr u8 BlockBacked = 1;
     static constexpr u8 BlockFailed = 2;
+    static constexpr u8 BlockMapped = 3; ///< The game mapped its own memory there (211)
     struct SparseRegion {
         u64 size;
-        std::vector<u8> blocks; ///< BlockEmpty / BlockBacked / BlockFailed per SparseBlockSize
+        std::vector<u8> blocks; ///< BlockEmpty / BlockBacked / BlockFailed / BlockMapped per SparseBlockSize
         bool warned{};          ///< Logged that the pool ran out for its blocks
     };
     std::map<u64, SparseRegion> m_sparse_regions; ///< By GPU address
+    u32 m_sparse_mapped_logs{};  ///< 211 maps into sparse regions logged so far
     u64 m_sparse_blocks{};       ///< Sparse blocks backed so far
     u64 m_sparse_backed_bytes{}; ///< Sparse region memory given out so far
     u64 m_gpu_only_bytes{};      ///< Backing of GPU-only regions and sparse blocks right now
