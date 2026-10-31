@@ -403,16 +403,26 @@ std::unordered_set<GPUVAddr> rendered_untrimmed;
     return texels;
 }
 
-// Images the UMA hard limit must not leave unbacked: layered material arrays up to 640 MiB on
-// the host (the trimmed virtual texture, Mario Kart World's 46-layer terrain array; unbacked,
-// the whole ground reads black). Everything else that arrives late takes the hit.
-[[nodiscard]] bool ExemptFromHardLimit(const ImageInfo& host_info) {
-    if (host_info.type != ImageType::e2D || host_info.resources.layers < 8) {
+// Images the UMA hard limit must not leave unbacked. Render targets: refused, Mario Kart World's
+// 8 MiB HDR scene buffer read zero and was replaced on every write (~100 times a second, the race
+// view black except what the last draws left). Textures in guest memory up to 64 MiB: a title's
+// assets, with nothing to rebuild them from (Mario Kart World's 10-15 MiB track atlases arrived
+// at the cap and the whole ground read black for the race). Layered material arrays up to 640
+// MiB on the host (the trimmed virtual texture, the 46-layer terrain array: unbacked, the ground
+// reads black too). The GPU-only pools (sparse page pools, 256 MiB render buffers) take the hit.
+[[nodiscard]] bool ExemptFromHardLimit(const ImageInfo& host_info, GPUVAddr gpu_addr) {
+    if (host_info.render_target) {
+        return true;
+    }
+    if (host_info.type != ImageType::e2D) {
         return false;
     }
     const u64 bytes = u64{host_info.size.width} * host_info.size.height * 4 * 4 / 3 *
                       host_info.resources.layers;
-    return bytes <= (u64{640} << 20);
+    if (host_info.resources.layers >= 8) {
+        return bytes <= (u64{640} << 20);
+    }
+    return bytes <= (u64{64} << 20) && !Service::Nvidia::Devices::IsNx2GpuOnlyAddress(gpu_addr);
 }
 
 // The most a trimmed ASTC array keeps on the host: 512 MiB, 256 MiB on GPUs with less than 7 GiB
@@ -541,7 +551,7 @@ std::unordered_set<GPUVAddr> rendered_untrimmed;
 [[nodiscard]] vk::Image MakeImage(const Device& device, const MemoryAllocator& allocator,
                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
                                   std::optional<VkFormat> format_override = {},
-                                  bool unbacked = false) {
+                                  bool unbacked = false, bool exempt_from_hard_limit = false) {
     if (info.type == ImageType::Buffer) {
         return vk::Image{};
     }
@@ -574,7 +584,7 @@ std::unordered_set<GPUVAddr> rendered_untrimmed;
             return image;
         }
     }
-    return allocator.CreateImage(image_ci, false, ExemptFromHardLimit(info));
+    return allocator.CreateImage(image_ci, false, exempt_from_hard_limit);
 }
 
 [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
@@ -2410,7 +2420,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
                                    : runtime->ViewFormats(info.format),
                                AstcHostFormat(runtime_.device, info),
                                UsesSparseLayers(runtime_.device, info, gpu_addr_) ||
-                                   IsUnwrittenSparse(info, gpu_addr_))),
+                                   IsUnwrittenSparse(info, gpu_addr_),
+                               ExemptFromHardLimit(
+                                   TrimmedHostInfo(runtime_.device, info, gpu_addr_, host_level_offset),
+                                   gpu_addr_))),
       aspect_mask(ImageAspectMask(info.format)) {
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;

@@ -193,8 +193,7 @@ void TextureCache<P>::RetryUnbackedImages() {
     // big to ever back (the allocator's huge rule) and images unbacked on purpose (sparse layers,
     // unwritten sparse regions) stay as they are.
     if constexpr (requires { runtime.OverUmaHardLimit(u64{}); }) {
-        constexpr auto deliberate = ImageFlagBits::IsDecoding | ImageFlagBits::SparseLayers |
-                                    ImageFlagBits::UnwrittenSparse;
+        constexpr auto deliberate = ImageFlagBits::IsDecoding | ImageFlagBits::SparseLayers;
         u32 retried = 0;
         for (size_t i = 0; i < unbacked_image_ids.size() && retried < 2;) {
             const ImageId image_id = unbacked_image_ids[i];
@@ -202,7 +201,11 @@ void TextureCache<P>::RetryUnbackedImages() {
             const ImageInfo& info = image.info;
             const u64 texels = u64{info.size.width} * info.size.height * info.size.depth *
                                static_cast<u64>(info.resources.layers);
-            if (texels > (u64{1} << 28) || True(image.flags & deliberate)) {
+            // UnwrittenSparse also marks hard-limit refusals (their first GPU write replaces
+            // them); only images over a region nobody has written stay as they are.
+            if (texels > (u64{1} << 28) || True(image.flags & deliberate) ||
+                (True(image.flags & ImageFlagBits::UnwrittenSparse) &&
+                 Tegra::Nx2SparseUnwritten(image.gpu_addr, image.guest_size_bytes))) {
                 ++i;
                 continue;
             }
@@ -2254,6 +2257,8 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
     join_alias_indices.clear();
     const bool this_is_linear = info.type == ImageType::Linear;
     const auto region_check = [&](ImageId overlap_id, ImageBase& overlap) {
+        // What the GPU rendered into stays a render target when a texture lookup rebuilds it.
+        new_info.render_target |= overlap.info.render_target;
         if (True(overlap.flags & ImageFlagBits::Remapped)) {
             join_ignore_textures.insert(overlap_id);
             return;
