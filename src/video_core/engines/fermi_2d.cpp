@@ -64,9 +64,16 @@ void Fermi2D::Blit() {
     if (Tegra::Nx2TracedDestination(regs.dst.Address(), u64{regs.dst.pitch} * regs.dst.height + 1)) {
         static u32 traced_destination{};
         if (traced_destination++ < 40) {
-            LOG_INFO(HW_GPU, "nx2 2D blit to traced dst: {:#x} {}x{} -> {:#x} {}x{}",
+            const auto& pfm = regs.pixels_from_memory;
+            LOG_INFO(HW_GPU,
+                     "nx2 2D blit to traced dst: {:#x} {}x{} -> {:#x} {}x{} format {:#x} {} block "
+                     "{}x{}x{} depth {} layer {} rect {},{} {}x{} src {},{}",
                      regs.src.Address(), regs.src.width, regs.src.height, regs.dst.Address(),
-                     regs.dst.width, regs.dst.height);
+                     regs.dst.width, regs.dst.height, static_cast<u32>(regs.dst.format),
+                     regs.dst.linear == MemoryLayout::Pitch ? "pitch" : "blocklinear",
+                     regs.dst.block_width.Value(), regs.dst.block_height.Value(),
+                     regs.dst.block_depth.Value(), regs.dst.depth, regs.dst.layer, pfm.dst_x0,
+                     pfm.dst_y0, pfm.dst_width, pfm.dst_height, pfm.src_x0 >> 32, pfm.src_y0 >> 32);
         }
     }
     if (static const bool trace = std::getenv("EDEN_NX2_RT_TRACE") != nullptr; trace) {

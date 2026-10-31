@@ -1738,6 +1738,7 @@ private:
         const u64 pts = u64{w[5]} | (u64{w[6]} << 32);
         const bool end = (w[7] & 0xFF) != 0;
         Log(ctx, "submit");
+        LogRate();
         Input input{{}, pts, end};
         if (!ctx.BufferDescriptorA().empty()) {
             const auto data = ctx.ReadBufferA(0);
@@ -1767,8 +1768,32 @@ private:
         TipcReplyWords(ctx, {});
     }
 
+    // Once a second while a movie plays: what the client submitted and polled against what the
+    // decoder delivered (Mario Kart World aborts with 2162-0001 a few seconds into a movie now
+    // and then, and the first-use logs above do not show the stall).
+    void LogRate() {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - m_rate_time < std::chrono::seconds{1}) {
+            return;
+        }
+        m_rate_time = now;
+        size_t inputs, decoded, free, outputs;
+        {
+            std::scoped_lock lk{m_mutex};
+            inputs = m_inputs.size();
+            decoded = m_decoded.size();
+            free = m_free.size();
+            outputs = m_outputs.size();
+        }
+        LOG_INFO(Service, "{} 1s: submitted {} frames out {} polls {} ({} empty) | queued inputs {} decoded ahead {} free images {} finished {}",
+                 GetServiceName(), m_submitted, m_frames_out, m_polls, m_empty_polls, inputs,
+                 decoded, free, outputs);
+    }
+
     void GetOutputInfo(HLERequestContext& ctx) {
         Log(ctx, "output info");
+        ++m_polls;
+        LogRate();
         std::optional<Output> output;
         {
             std::scoped_lock lk{m_mutex};
@@ -1778,6 +1803,7 @@ private:
             }
         }
         if (!output) {
+            ++m_empty_polls;
             // Nothing finished: the code the client's own Acquire uses for an empty ring.
             IPC::ResponseBuilder rb{ctx, 2};
             rb.PushRaw<u32>(0x1c286f);
@@ -1961,6 +1987,9 @@ private:
     std::shared_ptr<ReadyState> m_ready = std::make_shared<ReadyState>();
     std::shared_ptr<Core::Timing::EventType> m_ready_timer;
     u64 m_submitted{};
+    u64 m_polls{};
+    u64 m_empty_polls{};
+    std::chrono::steady_clock::time_point m_rate_time{};
     u32 m_syncpoint{NoSyncpoint}; ///< Counts finished frames (allocated at the first register)
     u32 m_sync_base{};            ///< Its value before the first frame
 

@@ -10,6 +10,7 @@
 #include <numeric>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <vector>
@@ -915,7 +916,14 @@ void TextureCache<P>::DumpRequestedImages() {
 // (100) files were written.
 template <class P>
 bool TextureCache<P>::DumpImage(ImageId image_id, std::string_view tag) {
-    static const char* const dir = std::getenv("EDEN_NX2_IMAGE_DUMP_DIR");
+    static const char* const dir = [] {
+        const char* const value = std::getenv("EDEN_NX2_IMAGE_DUMP_DIR");
+        if (value != nullptr) {
+            std::error_code ec;
+            std::filesystem::create_directories(value, ec);
+        }
+        return value;
+    }();
     static const u32 max_dumps = [] {
         const char* const max = std::getenv("EDEN_NX2_IMAGE_DUMP_MAX");
         return max != nullptr ? static_cast<u32>(std::strtoul(max, nullptr, 10)) : 100u;

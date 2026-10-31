@@ -757,46 +757,65 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
-    // EDEN_NX2_PS_TEX_OVERRIDE=<program key hex prefix>:<cbuf offset hex>=<rgba8 hex>[,...]:
+    // EDEN_NX2_PS_TEX_OVERRIDE=<program key hex prefix>:<cbuf offset hex>=<rgba8 hex>[,...][;...]:
     // pixel programs matching the prefix sample a constant at those descriptors (A/B single
-    // material inputs without depending on the scene).
-    static const auto tex_override = [] {
-        std::pair<std::string, std::vector<Nx2TextureOverride>> result;
+    // material inputs without depending on the scene). An empty prefix matches every program.
+    // Several sets separated by ';' are selected by the gate file's suffix (below).
+    struct OverrideSet {
+        std::string prefix;
+        std::vector<Nx2TextureOverride> overrides;
+    };
+    static const std::vector<OverrideSet> tex_overrides = [] {
+        std::vector<OverrideSet> result;
         const char* value = std::getenv("EDEN_NX2_PS_TEX_OVERRIDE");
-        const char* colon = value != nullptr ? std::strchr(value, ':') : nullptr;
-        if (colon == nullptr) {
-            return result;
-        }
-        result.first.assign(value, colon);
-        for (const char* cursor = colon + 1; *cursor != '\0';) {
-            char* end{};
-            const u32 offset = static_cast<u32>(std::strtoul(cursor, &end, 16));
-            if (*end != '=') {
+        for (const char* cursor = value; cursor != nullptr && *cursor != '\0';) {
+            const char* colon = std::strchr(cursor, ':');
+            if (colon == nullptr) {
                 break;
             }
-            const u32 rgba = static_cast<u32>(std::strtoul(end + 1, &end, 16));
-            result.second.push_back({offset, rgba});
-            cursor = *end == ',' ? end + 1 : end;
+            OverrideSet set{.prefix = std::string(cursor, colon), .overrides = {}};
+            cursor = colon + 1;
+            while (*cursor != '\0' && *cursor != ';') {
+                char* end{};
+                const u32 offset = static_cast<u32>(std::strtoul(cursor, &end, 16));
+                if (*end != '=') {
+                    break;
+                }
+                const u32 rgba = static_cast<u32>(std::strtoul(end + 1, &end, 16));
+                set.overrides.push_back({offset, rgba});
+                cursor = *end == ',' ? end + 1 : end;
+            }
+            result.push_back(std::move(set));
+            cursor = *cursor == ';' ? cursor + 1 : std::strchr(cursor, '\0');
         }
         return result;
     }();
-    // EDEN_NX2_PS_TEX_OVERRIDE_GATE=<path>: the override is active only while that file exists
-    // (toggled by the harness, so one scene can be shot with and without it).
+    // EDEN_NX2_PS_TEX_OVERRIDE_GATE=<path>: a set is active only while a gate file exists
+    // (toggled by the harness, so one scene can be shot with and without it): <path> selects
+    // the first set, <path>.2 the second, and so on.
     static const char* const override_gate = std::getenv("EDEN_NX2_PS_TEX_OVERRIDE_GATE");
-    static bool gate_open = override_gate == nullptr;
+    static size_t open_set = override_gate == nullptr ? 0 : tex_overrides.size();
     if (override_gate != nullptr) {
         static auto last_check = std::chrono::steady_clock::now();
         if (const auto now = std::chrono::steady_clock::now(); now - last_check > std::chrono::milliseconds(100)) {
             last_check = now;
-            gate_open = std::filesystem::exists(override_gate);
+            open_set = tex_overrides.size();
+            for (size_t set = 0; set < tex_overrides.size(); ++set) {
+                const std::string path = set == 0 ? std::string{override_gate}
+                                                  : fmt::format("{}.{}", override_gate, set + 1);
+                if (std::filesystem::exists(path)) {
+                    open_set = set;
+                    break;
+                }
+            }
         }
     }
     std::span<const Nx2TextureOverride> ps_overrides;
-    if (gate_open && !tex_override.second.empty() && Spec::enabled_stages[4] &&
+    if (open_set < tex_overrides.size() && Spec::enabled_stages[4] &&
         fmt::format("{:016x}", Tegra::Nx2ProgramKey((u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
                                                     regs.pipelines[5].reserved[1]))
-            .starts_with(tex_override.first)) {
-        ps_overrides = tex_override.second;
+            .starts_with(tex_overrides[open_set].prefix)) {
+        ps_overrides = tex_overrides[open_set].overrides;
     }
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
