@@ -205,6 +205,9 @@ public:
     /// Notify the cache that a new frame has been queued
     void TickFrame();
 
+    /// Read back the images named by EDEN_NX2_IMAGE_DUMP to files
+    void DumpRequestedImages();
+
     /// Return a constant reference to the given image view id
     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
 
