@@ -616,17 +616,33 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                  traced, halfs.size(), zeros, nans, negatives, big, min, max, halfs[0], halfs[1],
                  halfs[2], halfs[3], halfs[4], halfs[5], halfs[6], halfs[7]);
     }
-    // EDEN_NX2_DUMP_VS=<hex low 20 bits>[,<hex>...]: write the index buffer, every enabled vertex
-    // stream (from base_vertex) and the VS/PS constant buffers of the first 6 draws of each listed
-    // vertex program to EDEN_NX2_DUMP_DIR (default /tmp) as
-    // vsdump-<vs>-<n>-{ib,vb<b>,cb<i>,pscb<i>}.bin plus a .txt summary.
+    // EDEN_NX2_DUMP_VS=<hex low 20 bits | program key prefix>[,...]: write the index buffer, every
+    // enabled vertex stream (from base_vertex) and the VS/PS constant buffers of the first 6 draws of
+    // each listed vertex program to EDEN_NX2_DUMP_DIR (default /tmp) as
+    // vsdump-<vs>-<n>-{ib,vb<b>,cb<i>,pscb<i>}.bin plus a .txt summary. Entries longer than five
+    // hex digits are matched against the native program key (stable across sessions).
     static const std::vector<u64> dump_vs = [] {
         std::vector<u64> keys;
         if (const char* value = std::getenv("EDEN_NX2_DUMP_VS")) {
             std::vector<std::string> parts;
             Common::SplitString(value, ',', parts);
             for (const auto& part : parts) {
-                keys.push_back(std::strtoull(part.c_str(), nullptr, 16));
+                if (part.size() <= 5) {
+                    keys.push_back(std::strtoull(part.c_str(), nullptr, 16));
+                }
+            }
+        }
+        return keys;
+    }();
+    static const std::vector<std::string> dump_vs_keys = [] {
+        std::vector<std::string> keys;
+        if (const char* value = std::getenv("EDEN_NX2_DUMP_VS")) {
+            std::vector<std::string> parts;
+            Common::SplitString(value, ',', parts);
+            for (const auto& part : parts) {
+                if (part.size() > 5) {
+                    keys.push_back(part);
+                }
             }
         }
         return keys;
@@ -640,10 +656,18 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const char* value = std::getenv("EDEN_NX2_DUMP_VP");
         return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0u;
     }();
-    if (!dump_vs.empty() && frame_counter >= dump_after) {
+    if ((!dump_vs.empty() || !dump_vs_keys.empty()) && frame_counter >= dump_after) {
         const auto& regs = maxwell3d->regs;
         const u64 vs_low = regs.pipelines[1].reserved[1] & 0xfffff;
-        if (std::find(dump_vs.begin(), dump_vs.end(), vs_low) != dump_vs.end() &&
+        const auto program_key = [&regs](size_t pipeline) {
+            return fmt::format("{:016x}",
+                               Tegra::Nx2ProgramKey((u64{regs.pipelines[pipeline].reserved[0] & 0xff} << 32) |
+                                                    regs.pipelines[pipeline].reserved[1]));
+        };
+        const bool key_match = std::any_of(dump_vs_keys.begin(), dump_vs_keys.end(), [&](const auto& k) {
+            return program_key(1).starts_with(k);
+        });
+        if ((key_match || std::find(dump_vs.begin(), dump_vs.end(), vs_low) != dump_vs.end()) &&
             vs_dump_counts[vs_low] < 6 &&
             (dump_viewport == 0 ||
              static_cast<u32>(regs.viewport_transform[0].scale_x * 2) == dump_viewport)) {
@@ -680,9 +704,10 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             }
             const u32 base_vertex = is_indexed ? ds.base_index : 0;
             const u64 vertex_count = u64{max_index} + 1;
-            txt << fmt::format("vs {:#x} ps {:#x} indexed {} index_size {} first {} count {} base_vertex {} "
-                               "max_index {} ib {:#x}\n",
-                               regs.pipelines[1].reserved[1], regs.pipelines[5].reserved[1], is_indexed,
+            txt << fmt::format("vs {:#x} ({}) ps {:#x} ({}) indexed {} index_size {} first {} count {} "
+                               "base_vertex {} max_index {} ib {:#x}\n",
+                               regs.pipelines[1].reserved[1], program_key(1),
+                               regs.pipelines[5].reserved[1], program_key(5), is_indexed,
                                index_size, ds.index_buffer.first, count, base_vertex, max_index,
                                regs.index_buffer.StartAddress());
             u32 streams_used = 0;
