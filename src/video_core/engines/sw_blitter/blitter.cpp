@@ -162,6 +162,24 @@ bool SoftwareBlitEngine::Blit(Fermi2D::Surface& src, Fermi2D::Surface& dst,
     const auto dst_bytes_per_pixel = BytesPerBlock(PixelFormatFromRenderTargetFormat(dst.format));
     const size_t src_size = get_surface_size(src, src_bytes_per_pixel);
 
+    // A whole surface copied onto one with the same layout (Mario Kart World streams its terrain
+    // array layers this way, 16 MiB levels): the bytes are identical in both, so copy them as
+    // they are instead of unswizzling and swizzling every texel.
+    const bool same_layout =
+        src.format == dst.format && src.linear == dst.linear && src.width == dst.width &&
+        src.height == dst.height && src.depth == dst.depth && src.pitch == dst.pitch &&
+        src.block_height.Value() == dst.block_height.Value() &&
+        src.block_depth.Value() == dst.block_depth.Value() &&
+        src.layer == 0 && dst.layer == 0;
+    const bool whole_surface = config.src_x0 == 0 && config.src_y0 == 0 && config.dst_x0 == 0 &&
+                               config.dst_y0 == 0 && src_extent_x == src.width &&
+                               src_extent_y == src.height && dst_extent_x == dst.width &&
+                               dst_extent_y == dst.height;
+    if (same_layout && whole_surface && src_size != 0) {
+        memory_manager.CopyBlock(dst.Address(), src.Address(), src_size);
+        return true;
+    }
+
     Tegra::Memory::GpuGuestMemory<u8, Tegra::Memory::GuestMemoryFlags::SafeRead> tmp_buffer(
         memory_manager, src.Address(), src_size, &impl->tmp_buffer);
 

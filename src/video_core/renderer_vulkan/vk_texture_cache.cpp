@@ -451,7 +451,10 @@ std::unordered_set<GPUVAddr> rendered_untrimmed;
         return astc_decode ? LevelsTexels(info, skip) * 4 : LevelsHostBytes(info, skip);
     };
     if (astc_decode) {
-        const u64 trim_texels = AstcTrimTexels(device);
+        // The texel trim is for textures held whole; a huge array is bound a layer at a time
+        // (BindLayers, SparseLayersCap) and only its array limit applies, else Mario Kart World's
+        // 8192x8192x68 terrain arrays keep 256x256 of every layer.
+        const u64 trim_texels = IsHugeAstcArray(device, info) ? 0 : AstcTrimTexels(device);
         const auto over_trim = [&](u32 skip) {
             return trim_texels != 0 && LevelsTexels(info, skip) > trim_texels;
         };

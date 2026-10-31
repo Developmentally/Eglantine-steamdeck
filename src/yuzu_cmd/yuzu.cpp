@@ -63,6 +63,11 @@
 #if defined(__unix__) || defined(__APPLE__)
 #include <sys/resource.h>
 #endif
+#ifdef __linux__
+#include <csignal>
+#include <execinfo.h>
+#include <unistd.h>
+#endif
 
 #ifdef _WIN32
 // windows.h needs to be included before shellapi.h
@@ -146,6 +151,18 @@ static LONG WINAPI WriteCrashDump(EXCEPTION_POINTERS* exception) {
                      path, error);
     }
     return EXCEPTION_CONTINUE_SEARCH;
+}
+#elif defined(__linux__)
+// SIGUSR1 (tgkill a thread) prints that thread's stack to stderr as binary+offset for addr2line:
+// a thread stuck at 100% on a machine where ptrace is off (the Deck, yama ptrace_scope 1).
+static void PrintThreadBacktrace(int) {
+    void* frames[64];
+    const int count = backtrace(frames, 64);
+    const auto tid = static_cast<long>(gettid());
+    char header[64];
+    const int length = std::snprintf(header, sizeof(header), "--- backtrace of thread %ld ---\n", tid);
+    (void)!write(STDERR_FILENO, header, static_cast<size_t>(length));
+    backtrace_symbols_fd(frames, count, STDERR_FILENO);
 }
 #endif
 
@@ -296,6 +313,8 @@ static bool TryAutoMapGamepad(SdlState& state) {
 extern "C" SDL_AppResult SDL_AppInit(void **appstate, int argc, char **argv) {
 #ifdef _WIN32
     SetUnhandledExceptionFilter(WriteCrashDump);
+#elif defined(__linux__)
+    std::signal(SIGUSR1, PrintThreadBacktrace);
 #endif
     Nx2Sampler::StartFromEnvironment();
     // SDL calls SDL_AppIterate back to back by default, which kept a host core at 100% polling

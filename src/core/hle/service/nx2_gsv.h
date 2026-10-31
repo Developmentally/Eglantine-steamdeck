@@ -686,8 +686,32 @@ private:
                  spec.second);
     }
 
+    struct GpuOnlyRegion {
+        u64 cpu_address;
+        u64 size;
+        std::unique_ptr<Kernel::KPageGroup> pages;
+    };
+
     std::optional<u64> BackGpuOnlyRegion(u64 gpu_address, u64 size, bool log_failure = true,
                                          bool clear = false) {
+        auto region = AllocateGpuOnlyBacking(size, log_failure, clear);
+        if (!region) {
+            return std::nullopt;
+        }
+        return RegisterGpuOnlyBacking(gpu_address, std::move(*region));
+    }
+
+    u64 RegisterGpuOnlyBacking(u64 gpu_address, GpuOnlyRegion&& region) {
+        const u64 address = region.cpu_address;
+        m_gpu_only_bytes += region.size;
+        m_gpu_only_peak = (std::max)(m_gpu_only_peak, m_gpu_only_bytes);
+        m_gpu_only_regions[gpu_address] = std::move(region);
+        return address;
+    }
+
+    // Kernel pages for a GPU-only region, mapped in the alias code region. Takes the kernel's
+    // page table lock and nothing of this service's: see BackSparseWrite.
+    std::optional<GpuOnlyRegion> AllocateGpuOnlyBacking(u64 size, bool log_failure, bool clear) {
         using Core::Memory::YUZU_PAGESIZE;
         auto& kernel_core = system.Kernel();
         auto* const process = system.ApplicationProcess();
@@ -722,19 +746,18 @@ private:
         constexpr u64 Alignment = 0x200000; // 2 MiB
         // From where the last backing went (sparse regions back hundreds of blocks), then wrapping.
         const u64 slots = region_size / Alignment;
+        const u64 hint = m_alias_hint.load(std::memory_order_relaxed);
         for (u64 i = 0; i < slots; ++i) {
-            const u64 offset = ((m_alias_hint + i) % slots) * Alignment;
+            const u64 offset = ((hint + i) % slots) * Alignment;
             if (offset + size > region_size) {
                 continue;
             }
             const Common::ProcessAddress address{region_start + offset};
             if (R_SUCCEEDED(page_table.MapPageGroup(address, *pg, Kernel::KMemoryState::IoMemory,
                                                     Kernel::KMemoryPermission::UserReadWrite))) {
-                m_alias_hint = (offset + Common::AlignUp(size, Alignment)) / Alignment;
-                m_gpu_only_regions[gpu_address] = {GetInteger(address), size, std::move(pg)};
-                m_gpu_only_bytes += size;
-                m_gpu_only_peak = (std::max)(m_gpu_only_peak, m_gpu_only_bytes);
-                return GetInteger(address);
+                m_alias_hint.store((offset + Common::AlignUp(size, Alignment)) / Alignment,
+                                   std::memory_order_relaxed);
+                return GpuOnlyRegion{GetInteger(address), size, std::move(pg)};
             }
         }
         LOG_ERROR(Service, "nx2:gpu 214 no room for {:#x} bytes in the alias code region "
@@ -795,48 +818,77 @@ private:
     // usually on the GPU thread): the blocks the write touches get memory, cleared, behind the
     // region's device pages. The GPU mapping stays as it is, so the images over the region keep
     // their storage and only see the write.
+    // The kernel work runs without m_region_mutex. Held across it, title 5 deadlocked: the GPU
+    // thread waited for the page table lock, whose owner was a thread of core 3 that could not
+    // run because core 3 was busy with this service's thread, blocked on m_region_mutex in a 211.
     void BackSparseWrite(u64 gpu_address, u64 size) {
-        std::scoped_lock lk{m_region_mutex};
-        const u64 end = gpu_address + size;
-        auto it = m_sparse_regions.upper_bound(gpu_address);
-        if (it != m_sparse_regions.begin()) {
-            --it;
+        struct Pending {
+            u64 start; ///< The region
+            u64 block;
+            u64 size;
+        };
+        std::vector<Pending> pending;
+        {
+            std::scoped_lock lk{m_region_mutex};
+            const u64 end = gpu_address + size;
+            auto it = m_sparse_regions.upper_bound(gpu_address);
+            if (it != m_sparse_regions.begin()) {
+                --it;
+            }
+            for (; it != m_sparse_regions.end() && it->first < end; ++it) {
+                auto& [start, region] = *it;
+                if (start + region.size <= gpu_address) {
+                    continue;
+                }
+                const u64 first_block = ((std::max)(gpu_address, start) - start) / SparseBlockSize;
+                const u64 last_block =
+                    ((std::min)(end, start + region.size) - 1 - start) / SparseBlockSize;
+                for (u64 block = first_block; block <= last_block; ++block) {
+                    if (region.blocks[block] != BlockEmpty) {
+                        continue;
+                    }
+                    region.blocks[block] = BlockPending;
+                    pending.push_back({start, block,
+                                       (std::min)(SparseBlockSize, region.size - block * SparseBlockSize)});
+                }
+            }
         }
-        for (; it != m_sparse_regions.end() && it->first < end; ++it) {
-            auto& [start, region] = *it;
-            if (start + region.size <= gpu_address) {
+        for (const Pending& p : pending) {
+            auto backing = AllocateGpuOnlyBacking(p.size, false, true);
+            std::scoped_lock lk{m_region_mutex};
+            const auto it = m_sparse_regions.find(p.start);
+            if (it == m_sparse_regions.end()) {
+                // Destroyed meanwhile (215): its pages go back once the GPU thread is past it.
+                if (backing) {
+                    auto done = std::make_shared<std::atomic<bool>>(false);
+                    system.GPU().RunInOrder([done] { done->store(true, std::memory_order_release); });
+                    m_gpu_only_bytes += backing->size;
+                    m_released_regions.push_back({std::move(*backing), done});
+                }
                 continue;
             }
-            const u64 first_block = ((std::max)(gpu_address, start) - start) / SparseBlockSize;
-            const u64 last_block = ((std::min)(end, start + region.size) - 1 - start) / SparseBlockSize;
-            for (u64 block = first_block; block <= last_block; ++block) {
-                if (region.blocks[block] != BlockEmpty) {
-                    continue;
+            auto& region = it->second;
+            if (!backing) {
+                region.blocks[p.block] = BlockFailed; // out of memory: not again for every write
+                if (!region.warned) {
+                    region.warned = true;
+                    LOG_WARNING(Service, "nx2:gpu sparse region at {:#x}: pool exhausted, GPU writes "
+                                         "to its unbacked blocks are dropped",
+                                p.start);
                 }
-                const u64 block_address = start + block * SparseBlockSize;
-                const u64 block_size = (std::min)(SparseBlockSize, region.size - block * SparseBlockSize);
-                const auto address = BackGpuOnlyRegion(block_address, block_size, false, true);
-                if (!address) {
-                    region.blocks[block] = BlockFailed; // out of memory: not again for every write
-                    if (!region.warned) {
-                        region.warned = true;
-                        LOG_WARNING(Service, "nx2:gpu sparse region at {:#x}: pool exhausted, GPU writes "
-                                             "to its unbacked blocks are dropped",
-                                    start);
-                    }
-                    continue;
-                }
-                region.blocks[block] = BlockBacked;
-                Nvidia::Devices::Nx2GpuMemoryRegistry::Get().BackSparse(block_address, *address,
-                                                                        block_size);
-                Tegra::Nx2SparseBlockWritten(start, block);
-                m_sparse_backed_bytes += block_size;
-                if (++m_sparse_blocks == 1 || (m_sparse_blocks % 64) == 0) {
-                    LOG_INFO(Service, "nx2:gpu {} sparse blocks backed ({} MiB); {} MiB of GPU-only "
-                                      "memory in use, peak {} MiB",
-                             m_sparse_blocks, m_sparse_backed_bytes >> 20, m_gpu_only_bytes >> 20,
-                             m_gpu_only_peak >> 20);
-                }
+                continue;
+            }
+            const u64 block_address = p.start + p.block * SparseBlockSize;
+            const u64 address = RegisterGpuOnlyBacking(block_address, std::move(*backing));
+            region.blocks[p.block] = BlockBacked;
+            Nvidia::Devices::Nx2GpuMemoryRegistry::Get().BackSparse(block_address, address, p.size);
+            Tegra::Nx2SparseBlockWritten(p.start, p.block);
+            m_sparse_backed_bytes += p.size;
+            if (++m_sparse_blocks == 1 || (m_sparse_blocks % 64) == 0) {
+                LOG_INFO(Service, "nx2:gpu {} sparse blocks backed ({} MiB); {} MiB of GPU-only "
+                                  "memory in use, peak {} MiB",
+                         m_sparse_blocks, m_sparse_backed_bytes >> 20, m_gpu_only_bytes >> 20,
+                         m_gpu_only_peak >> 20);
             }
         }
     }
@@ -856,6 +908,7 @@ private:
     static constexpr u8 BlockBacked = 1;
     static constexpr u8 BlockFailed = 2;
     static constexpr u8 BlockMapped = 3; ///< The game mapped its own memory there (211)
+    static constexpr u8 BlockPending = 4; ///< BackSparseWrite is getting it memory
     struct SparseRegion {
         u64 size;
         std::vector<u8> blocks; ///< BlockEmpty / BlockBacked / BlockFailed / BlockMapped per SparseBlockSize
@@ -868,15 +921,10 @@ private:
     u64 m_sparse_backed_bytes{}; ///< Sparse region memory given out so far
     u64 m_gpu_only_bytes{};      ///< Backing of GPU-only regions and sparse blocks right now
     u64 m_gpu_only_peak{};
-    u64 m_alias_hint{}; ///< 2 MiB slot after the last backing in the alias code region
+    std::atomic<u64> m_alias_hint{}; ///< 2 MiB slot after the last backing in the alias code region
     /// Regions are created and destroyed on the service thread and backed on the GPU thread.
     std::recursive_mutex m_region_mutex;
 
-    struct GpuOnlyRegion {
-        u64 cpu_address;
-        u64 size;
-        std::unique_ptr<Kernel::KPageGroup> pages;
-    };
     struct ReleasedRegion {
         GpuOnlyRegion region;
         std::shared_ptr<std::atomic<bool>> done; ///< Set by the GPU thread past the region's last use
