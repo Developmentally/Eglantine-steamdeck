@@ -379,11 +379,11 @@ void TextureCache<P>::TickFrame() {
                  stats_interval, images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer), {} written back for the CPU in {} flushes",
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer), {} written back for the CPU in {} flushes, {} render targets re-created at another size",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads,
-                 images_written_back, download_requests);
+                 images_written_back, download_requests, render_target_resizes);
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = images_written_back =
-            download_requests = 0;
+            download_requests = render_target_resizes = 0;
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
@@ -879,7 +879,7 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
         Image& image = slot_images[image_id];
         if (Tegra::Nx2TracedDestination(image.gpu_addr, image.guest_size_bytes)) {
             static u32 traced{};
-            if (traced++ < 40) {
+            if (traced++ < 400) {
                 LOG_INFO(HW_GPU, "nx2 image in traced range written back to guest memory: {:#x} {}x{} format {}",
                          image.gpu_addr, image.info.size.width, image.info.size.height,
                          static_cast<u32>(image.info.format));
@@ -2318,6 +2318,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
                 runtime.CopyImage(new_image, overlap, std::array{copy});
                 new_image.modification_tick = overlap.modification_tick;
             }
+            ++render_target_resizes;
             if (static u32 logged{}; logged++ < 8) {
                 LOG_INFO(HW_GPU, "Render target {:#x} resized {}x{} -> {}x{} (format {} -> {}); dropping the old one",
                          gpu_addr, overlap.info.size.width, overlap.info.size.height,
@@ -3157,7 +3158,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         if (True(image.flags & ImageFlagBits::CpuModified) &&
             Tegra::Nx2TracedDestination(image.gpu_addr, image.guest_size_bytes)) {
             static u32 traced{};
-            if (traced++ < 40) {
+            if (traced++ < 400) {
                 LOG_INFO(HW_GPU, "nx2 CPU upload into image in traced range: {:#x} {}x{} format {}",
                          image.gpu_addr, image.info.size.width, image.info.size.height,
                          static_cast<u32>(image.info.format));
@@ -3171,7 +3172,7 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
     if (is_modification) {
         if (Tegra::Nx2TracedDestination(image.gpu_addr, image.guest_size_bytes)) {
             static u32 traced{};
-            if (traced++ < 40) {
+            if (traced++ < 400) {
                 LOG_INFO(HW_GPU, "nx2 GPU write into image in traced range: {:#x} {}x{}x{} layers {} format {} flags {:#x}",
                          image.gpu_addr, image.info.size.width, image.info.size.height,
                          image.info.size.depth, image.info.resources.layers,
