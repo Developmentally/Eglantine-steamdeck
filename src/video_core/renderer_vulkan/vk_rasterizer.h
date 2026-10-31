@@ -164,7 +164,7 @@ private:
 
     void UpdateDynamicStates();
 
-    void Nx2DumpRenderTargetAfterDraw();
+    void Nx2DumpRenderTarget(bool after_draw);
 
     void HandleTransformFeedback();
 

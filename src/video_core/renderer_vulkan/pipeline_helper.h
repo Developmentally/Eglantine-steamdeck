@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <optional>
+#include <span>
 
 #include <boost/container/small_vector.hpp>
 
@@ -350,11 +351,18 @@ public:
     std::array<f32, 4> words{};
 };
 
+/// Diagnostic (EDEN_NX2_PS_TEX_OVERRIDE): replace the texture at a cbuf offset with a constant
+struct Nx2TextureOverride {
+    u32 cbuf_offset;
+    u32 rgba;
+};
+
 inline void PushImageDescriptors(TextureCache& texture_cache,
                                  GuestDescriptorQueue& guest_descriptor_queue,
                                  const Shader::Info& info, RescalingPushConstant& rescaling,
                                  const VideoCommon::SamplerId*& samplers,
-                                 const VideoCommon::ImageViewInOut*& views) {
+                                 const VideoCommon::ImageViewInOut*& views,
+                                 std::span<const Nx2TextureOverride> overrides = {}) {
     const u32 num_texture_buffers = Shader::NumDescriptors(info.texture_buffer_descriptors);
     const u32 num_image_buffers = Shader::NumDescriptors(info.image_buffer_descriptors);
     views += num_texture_buffers;
@@ -369,6 +377,11 @@ inline void PushImageDescriptors(TextureCache& texture_cache,
             if (vk_image_view == VK_NULL_HANDLE) {
                 const VkImageView null_image_view{texture_cache.GetImageView(VideoCommon::NULL_IMAGE_VIEW_ID).Handle(desc.type)};
                 if (null_image_view != VK_NULL_HANDLE) vk_image_view = null_image_view;
+            }
+            for (const auto& override : overrides) {
+                if (override.cbuf_offset == desc.cbuf_offset) {
+                    vk_image_view = texture_cache.Nx2Runtime().Nx2ConstantView(desc.type, override.rgba);
+                }
             }
             Sampler& sampler{texture_cache.GetSampler(sampler_id)};
             guest_descriptor_queue.AddSampledImage(vk_image_view,

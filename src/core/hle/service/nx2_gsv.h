@@ -453,6 +453,10 @@ private:
         const u32 handle = cmd_buf[7];
         LOG_DEBUG(Service, "nx2:gpu 211 map [{:#x}, {:#x}] handle={} offset={:#x} slot={}", a, b,
                  handle, c, slot);
+        if (b > a && Tegra::Nx2TracedDestination(a, b - a + 1)) {
+            LOG_INFO(Service, "nx2:gpu 211 map [{:#x}, {:#x}] handle={} offset={:#x} into the traced range",
+                     a, b, handle, c);
+        }
         if (const auto it = m_memory.find(handle); it != m_memory.end() && b > a) {
             // Also at the memory's own address: an earlier 213 may have unmapped the mapping 101
             // made there.
@@ -478,6 +482,10 @@ private:
         const u32 kind = w[7] & 0xff;
         LOG_DEBUG(Service, "nx2:gpu 212 modify [{:#x}, {:#x}] kind={:#x} fallback={:#x} slot={}",
                   first, last, kind, w[8] & 0xff, w[10]);
+        if (last > first && Tegra::Nx2TracedDestination(first, last - first + 1)) {
+            LOG_INFO(Service, "nx2:gpu 212 modify [{:#x}, {:#x}] kind={:#x} fallback={:#x} in the traced range",
+                     first, last, kind, w[8] & 0xff);
+        }
         NoteSparseRegionTouch("212 modify", first, last, w[7], w[8], w[9]);
         EventFor(w[10])->Signal(system.Kernel());
         TipcReplyWords(ctx, {kind});
@@ -489,6 +497,9 @@ private:
         const u64 first = u64{w[3]} | (u64{w[4]} << 32);
         const u64 last = u64{w[5]} | (u64{w[6]} << 32);
         LOG_DEBUG(Service, "nx2:gpu 213 unmap [{:#x}, {:#x}] slot={}", first, last, w[8]);
+        if (last > first && Tegra::Nx2TracedDestination(first, last - first + 1)) {
+            LOG_INFO(Service, "nx2:gpu 213 unmap [{:#x}, {:#x}] in the traced range", first, last);
+        }
         NoteSparseRegionTouch("213 unmap", first, last, w[2], w[7], w[8]);
         if (last > first) {
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
@@ -567,6 +578,7 @@ private:
                 LOG_INFO(Service, "nx2:gpu 214 GPU-only region [{:#x}, {:#x}] backed at {:#x} "
                                   "({} MiB of GPU-only memory in use, peak {} MiB)",
                          start, last, *address, m_gpu_only_bytes >> 20, m_gpu_only_peak >> 20);
+                FillGpuOnlyRegionForTest(start);
             }
         } else {
             LOG_WARNING(Service, "nx2:gpu 214 unexpected region [{:#x}, {:#x}]", start, last);
@@ -637,6 +649,37 @@ private:
             m_gpu_only_bytes -= region.size;
             return true;
         });
+    }
+
+    // EDEN_NX2_GPU_ONLY_FILL=<gpu address hex>:<byte hex>: fill that GPU-only region's backing
+    // with the byte when it is created, to tell whether a texture over it that nothing in the
+    // emulated command stream writes is what a pass downstream is missing.
+    void FillGpuOnlyRegionForTest(u64 gpu_address) {
+        static const auto spec = [] {
+            std::pair<u64, u32> result{0, 0};
+            if (const char* value = std::getenv("EDEN_NX2_GPU_ONLY_FILL")) {
+                char* end{};
+                result.first = std::strtoull(value, &end, 16);
+                if (*end == ':') {
+                    result.second = static_cast<u32>(std::strtoul(end + 1, nullptr, 16)) & 0xff;
+                }
+            }
+            return result;
+        }();
+        if (spec.first == 0 || spec.first != gpu_address) {
+            return;
+        }
+        const auto it = m_gpu_only_regions.find(gpu_address);
+        if (it == m_gpu_only_regions.end()) {
+            return;
+        }
+        for (const auto& block : *it->second.pages) {
+            system.DeviceMemory().buffer.ClearBackingRegion(
+                GetInteger(block.GetAddress()) - Core::DramMemoryMap::Base, block.GetSize(),
+                spec.second == 0 ? 0 : spec.second);
+        }
+        LOG_INFO(Service, "nx2:gpu 214 region {:#x} filled with {:#x} for the test", gpu_address,
+                 spec.second);
     }
 
     std::optional<u64> BackGpuOnlyRegion(u64 gpu_address, u64 size, bool log_failure = true,

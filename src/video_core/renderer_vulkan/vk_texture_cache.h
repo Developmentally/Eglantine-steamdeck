@@ -170,6 +170,9 @@ public:
 
     VkFormat GetSupportedFormat(VkFormat requested_format, VkFormatFeatureFlags required_features) const;
 
+    /// Diagnostic: a 1x1 RGBA8 view of the given type holding one constant colour (0xAABBGGRR)
+    VkImageView Nx2ConstantView(Shader::TextureType type, u32 rgba);
+
     const Device& device;
     Scheduler& scheduler;
     MemoryAllocator& memory_allocator;
@@ -198,6 +201,13 @@ public:
     };
     std::deque<PendingTranscode> pending_transcodes;
     u64 pending_transcode_bytes{};
+
+    struct ConstantImages {
+        vk::Image image_2d;
+        vk::Image image_3d;
+        std::array<vk::ImageView, Shader::NUM_TEXTURE_TYPES> views;
+    };
+    std::unordered_map<u32, ConstantImages> constant_images;
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     const Settings::ResolutionScalingInfo& resolution;

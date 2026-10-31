@@ -216,6 +216,14 @@ public:
         return rt_image_id[index];
     }
 
+    [[nodiscard]] const ImageInfo& Nx2ImageInfo(ImageId id) const noexcept {
+        return slot_images[id].info;
+    }
+
+    [[nodiscard]] Runtime& Nx2Runtime() noexcept {
+        return runtime;
+    }
+
     /// Return a constant reference to the given image view id
     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
 
@@ -473,6 +481,9 @@ private:
     /// Deletes a written storage image over an unwritten sparse region so its next lookup
     /// creates a backed one; true when it did.
     bool ReplaceUnwrittenSparseStorageImage(ImageViewId image_view_id);
+
+    /// Same for an image the GPU is about to write by any other path (render target, copy).
+    bool ReplaceUnwrittenSparseImage(ImageId image_id);
 
     /// Execute copies from one image to the other, even if they are incompatible
     void CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies);

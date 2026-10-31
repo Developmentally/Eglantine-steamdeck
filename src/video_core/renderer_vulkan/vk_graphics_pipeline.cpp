@@ -5,7 +5,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <span>
 #include <string>
@@ -518,7 +520,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         const char* value = std::getenv("EDEN_NX2_PS_TEX_LOG");
         return value != nullptr ? std::string{value} : std::string{};
     }();
+    // EDEN_NX2_PS_TEX_LOG_TRACED=1: only during a frame trace, so EDEN_NX2_IMAGE_DUMP_PS reads
+    // the images back as the traced frame sees them rather than at their first binding.
+    static const bool log_only_traced = std::getenv("EDEN_NX2_PS_TEX_LOG_TRACED") != nullptr;
     if (!log_ps_textures.empty() && Spec::enabled_stages[4] &&
+        (!log_only_traced || Tegra::g_nx2_frame_trace_active.load(std::memory_order_relaxed)) &&
         (log_ps_textures == "all" ||
          fmt::format("{:016x}", Tegra::Nx2ProgramKey((u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
                                                      regs.pipelines[5].reserved[1]))
@@ -532,6 +538,35 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         if (logged.insert((ps_address << 24) ^ vs_address ^ (u64{1} << 63)).second) {
             LOG_INFO(Render_Vulkan, "PS {:#x} key {:016x} drawn with VS {:#x} key {:016x}", ps_address,
                      Tegra::Nx2ProgramKey(ps_address), vs_address, Tegra::Nx2ProgramKey(vs_address));
+        }
+        // EDEN_NX2_PS_CBUF_LOG=<cbuf index>:<byte offset>:<float count>: the constants the logged
+        // program reads there, for the first 40 draws.
+        static const auto cbuf_log = [] {
+            std::array<u32, 3> result{~0u, 0, 0};
+            if (const char* value = std::getenv("EDEN_NX2_PS_CBUF_LOG")) {
+                char* end{};
+                result[0] = static_cast<u32>(std::strtoul(value, &end, 10));
+                if (*end == ':') {
+                    result[1] = static_cast<u32>(std::strtoul(end + 1, &end, 0));
+                }
+                if (*end == ':') {
+                    result[2] = static_cast<u32>(std::strtoul(end + 1, &end, 10));
+                }
+            }
+            return result;
+        }();
+        if (static u32 cbuf_logged{}; cbuf_log[0] < 18 && cbuf_logged < 40) {
+            const auto& cbuf{maxwell3d->state.shader_stages[4].const_buffers[cbuf_log[0]]};
+            if (cbuf.enabled) {
+                ++cbuf_logged;
+                std::string values;
+                for (u32 i = 0; i < cbuf_log[2]; ++i) {
+                    const u32 word{gpu_memory->Read<u32>(cbuf.address + cbuf_log[1] + i * 4)};
+                    values += fmt::format(" {:#010x}({:.4g})", word, std::bit_cast<float>(word));
+                }
+                LOG_INFO(Render_Vulkan, "PS {:#x} key {:016x} cb{}+{:#x} size {:#x}:{}", ps_address,
+                         Tegra::Nx2ProgramKey(ps_address), cbuf_log[0], cbuf_log[1], cbuf.size, values);
+            }
         }
         size_t first{};
         for (size_t stage = 0; stage < 4; ++stage) {
@@ -610,17 +645,34 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 const size_t nonzero{static_cast<size_t>(
                     std::count_if(bytes.begin(), bytes.end(), [](u8 b) { return b != 0; }))};
                 LOG_INFO(Render_Vulkan,
-                         "PS {:#x} key {:016x} texture cb{}+{:#x} type {}: image {:#x} {}x{}x{} layers {} levels {} "
-                         "format {} view format {} flags {:#x} guest {} KiB, {}% of first {} KiB non-zero, sampler {} (handle {:#x} {:#x})",
+                         "PS {:#x} key {:016x} texture cb{}+{:#x} type {}: image {:#x} (id {}) {}x{}x{} layers {} levels {} "
+                         "format {} view format {} type {} layers {}+{} levels {}+{} flags {:#x} guest {} KiB, {}% of first {} KiB non-zero, sampler {} (handle {:#x} {:#x})",
                          ps_address, Tegra::Nx2ProgramKey(ps_address), desc.cbuf_index, desc.cbuf_offset,
-                         static_cast<u32>(desc.type), image.gpu_addr, image.info.size.width,
+                         static_cast<u32>(desc.type), image.gpu_addr, view.image_id.index, image.info.size.width,
                          image.info.size.height, image.info.size.depth,
                          image.info.resources.layers, image.info.resources.levels,
                          static_cast<u32>(image.info.format), static_cast<u32>(view.format),
+                         static_cast<u32>(view.type), view.range.base.layer, view.range.extent.layers,
+                         view.range.base.level, view.range.extent.levels,
                          static_cast<u32>(image.flags), image.guest_size_bytes / 1024,
                          probe != 0 ? nonzero * 100 / probe : 0, probe / 1024,
                          sampler_index < samplers.size() ? samplers[sampler_index].index : ~0u,
                          handle_lo, handle_hi);
+                const auto [tic_index, tsc_index] =
+                    Tegra::Texture::TexturePair(handle_lo, regs.sampler_binding == Maxwell::SamplerBinding::ViaHeaderBinding);
+                Tegra::Texture::TICEntry tic{};
+                gpu_memory->ReadBlockUnsafe(regs.tex_header.Address() + tic_index * sizeof(tic), &tic,
+                                            sizeof(tic));
+                LOG_INFO(Render_Vulkan,
+                         "PS {:#x} key {:016x} texture cb{}+{:#x} TIC {} TSC {}: raw {:016x} {:016x} {:016x} {:016x} | "
+                         "swizzle {} {} {} {} | type {} | base {}x{}x{} layers {} mips {} | header {}",
+                         ps_address, Tegra::Nx2ProgramKey(ps_address), desc.cbuf_index, desc.cbuf_offset,
+                         tic_index, tsc_index, tic.raw[0], tic.raw[1], tic.raw[2], tic.raw[3],
+                         static_cast<u32>(tic.x_source.Value()), static_cast<u32>(tic.y_source.Value()),
+                         static_cast<u32>(tic.z_source.Value()), static_cast<u32>(tic.w_source.Value()),
+                         static_cast<u32>(tic.texture_type.Value()), tic.Width(), tic.Height(),
+                         tic.Depth(), tic.BaseLayer(), tic.max_mip_level.Value(),
+                         static_cast<u32>(tic.header_version.Value()));
             }
         }
     }
@@ -705,6 +757,47 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     RenderAreaPushConstant render_area;
     const VideoCommon::SamplerId* samplers_it{samplers.data()};
     const VideoCommon::ImageViewInOut* views_it{views.data()};
+    // EDEN_NX2_PS_TEX_OVERRIDE=<program key hex prefix>:<cbuf offset hex>=<rgba8 hex>[,...]:
+    // pixel programs matching the prefix sample a constant at those descriptors (A/B single
+    // material inputs without depending on the scene).
+    static const auto tex_override = [] {
+        std::pair<std::string, std::vector<Nx2TextureOverride>> result;
+        const char* value = std::getenv("EDEN_NX2_PS_TEX_OVERRIDE");
+        const char* colon = value != nullptr ? std::strchr(value, ':') : nullptr;
+        if (colon == nullptr) {
+            return result;
+        }
+        result.first.assign(value, colon);
+        for (const char* cursor = colon + 1; *cursor != '\0';) {
+            char* end{};
+            const u32 offset = static_cast<u32>(std::strtoul(cursor, &end, 16));
+            if (*end != '=') {
+                break;
+            }
+            const u32 rgba = static_cast<u32>(std::strtoul(end + 1, &end, 16));
+            result.second.push_back({offset, rgba});
+            cursor = *end == ',' ? end + 1 : end;
+        }
+        return result;
+    }();
+    // EDEN_NX2_PS_TEX_OVERRIDE_GATE=<path>: the override is active only while that file exists
+    // (toggled by the harness, so one scene can be shot with and without it).
+    static const char* const override_gate = std::getenv("EDEN_NX2_PS_TEX_OVERRIDE_GATE");
+    static bool gate_open = override_gate == nullptr;
+    if (override_gate != nullptr) {
+        static auto last_check = std::chrono::steady_clock::now();
+        if (const auto now = std::chrono::steady_clock::now(); now - last_check > std::chrono::milliseconds(100)) {
+            last_check = now;
+            gate_open = std::filesystem::exists(override_gate);
+        }
+    }
+    std::span<const Nx2TextureOverride> ps_overrides;
+    if (gate_open && !tex_override.second.empty() && Spec::enabled_stages[4] &&
+        fmt::format("{:016x}", Tegra::Nx2ProgramKey((u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                                                    regs.pipelines[5].reserved[1]))
+            .starts_with(tex_override.first)) {
+        ps_overrides = tex_override.second;
+    }
     const auto prepare_stage{[&](size_t stage) LAMBDA_FORCEINLINE {
         {
             Profile::Scope scope{Profile::Zone::BindStageBuffers};
@@ -713,7 +806,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         {
             Profile::Scope scope{Profile::Zone::PushDescriptors};
             PushImageDescriptors(texture_cache, guest_descriptor_queue, stage_infos[stage],
-                                 rescaling, samplers_it, views_it);
+                                 rescaling, samplers_it, views_it,
+                                 stage == 4 ? ps_overrides : std::span<const Nx2TextureOverride>{});
         }
         const auto& info{stage_infos[stage]};
         if (info.uses_render_area) {

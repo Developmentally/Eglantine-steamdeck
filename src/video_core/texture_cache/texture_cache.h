@@ -2737,6 +2737,19 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
         has_deleted_images = false;
         image_id = FindOrInsertImage(info, gpu_addr);
         delete_state |= has_deleted_images;
+        // Rendering into an unwritten sparse region (Mario Kart World's baked shadow atlas, a
+        // 512x512x101 D16 array whose tiles are drawn on demand): give it memory now, or this
+        // draw is lost and the tile reads as depth 0, which the ESM lookup takes as full shadow.
+        // The flag also marks images refused under the UMA hard limit: only a region nobody wrote
+        // yet qualifies, and marking it written keeps this from repeating.
+        if (image_id) {
+            const Image& found = slot_images[image_id];
+            if (True(found.flags & ImageFlagBits::UnwrittenSparse) &&
+                Tegra::Nx2SparseUnwritten(found.gpu_addr, found.guest_size_bytes) &&
+                ReplaceUnwrittenSparseImage(image_id)) {
+                has_deleted_images = true;
+            }
+        }
     } while (has_deleted_images);
     has_deleted_images = delete_state;
     if (!image_id) {
@@ -3414,14 +3427,18 @@ bool TextureCache<P>::ReplaceUnwrittenSparseStorageImage(ImageViewId image_view_
     if (image_view.IsBuffer()) {
         return false;
     }
-    const ImageId image_id = image_view.image_id;
+    return ReplaceUnwrittenSparseImage(image_view.image_id);
+}
+
+template <class P>
+bool TextureCache<P>::ReplaceUnwrittenSparseImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::UnwrittenSparse)) {
         return false;
     }
     static u32 logged{};
     if (logged++ < 32) {
-        LOG_WARNING(HW_GPU, "Storage write into unwritten sparse image {:#x} {}x{}x{} layers {} format {}; replacing it",
+        LOG_WARNING(HW_GPU, "GPU write into unwritten sparse image {:#x} {}x{}x{} layers {} format {}; replacing it",
                     image.gpu_addr, image.info.size.width, image.info.size.height,
                     image.info.size.depth, image.info.resources.layers,
                     static_cast<u32>(image.info.format));

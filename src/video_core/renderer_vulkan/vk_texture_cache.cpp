@@ -22,6 +22,7 @@
 #include "common/bit_util.h"
 #include "common/div_ceil.h"
 #include "common/settings.h"
+#include "core/hle/service/nvdrv/devices/nx2_gpu_memory.h"
 
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/nx2.h"
@@ -351,7 +352,10 @@ std::unordered_set<GPUVAddr> rendered_untrimmed;
 // floor, 0 disables. Explicit-LOD samples of a trimmed texture land one level lower.
 // Depth/stencil images are render targets (Mario Kart World's 512x512x101 D16 shadow atlas is
 // rendered at level 0; trimmed, nothing lit the ground), as is anything the game already
-// rendered into below the trim: neither is trimmed.
+// rendered into below the trim, and anything in GPU-only memory (nx2:gpu 214): only the GPU
+// fills those, at level 0, and the mip tail is generated from it (Mario Kart World's 3072x3072x2
+// screen-space occlusion buffer; trimmed, every terrain material read zero occlusion and the
+// ground went black). None of them is trimmed.
 [[nodiscard]] u32 ResolutionTrimLevels(const Device& device, const ImageInfo& info,
                                        GPUVAddr gpu_addr) {
     static const u64 floor = [&device]() -> u64 {
@@ -365,7 +369,7 @@ std::unordered_set<GPUVAddr> rendered_untrimmed;
         info.resources.levels < 2 || info.rescaleable || !UploadsTrimmableLevels(device, info) ||
         LevelsHostBytes(info, 0) < floor ||
         VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture ||
-        IsRenderedUntrimmed(gpu_addr)) {
+        IsRenderedUntrimmed(gpu_addr) || Service::Nvidia::Devices::IsNx2GpuOnlyAddress(gpu_addr)) {
         return 0;
     }
     return (std::min)(resolution.down_shift, static_cast<u32>(info.resources.levels) - 1);
@@ -1357,6 +1361,98 @@ TextureCacheRuntime::TextureCacheRuntime(const Device& device_, Scheduler& sched
 
 void TextureCacheRuntime::Finish() {
     scheduler.Finish();
+}
+
+VkImageView TextureCacheRuntime::Nx2ConstantView(Shader::TextureType type, u32 rgba) {
+    auto& entry = constant_images[rgba];
+    if (!entry.image_2d) {
+        ImageInfo info{};
+        info.format = PixelFormat::A8B8G8R8_UNORM;
+        info.type = ImageType::e2D;
+        info.resources.layers = 6; // cube compatible
+        entry.image_2d = MakeImage(device, memory_allocator, info, {});
+        info.type = ImageType::e3D;
+        info.resources.layers = 1;
+        entry.image_3d = MakeImage(device, memory_allocator, info, {});
+
+        const VkClearColorValue color{.float32{(rgba & 0xff) / 255.0f, ((rgba >> 8) & 0xff) / 255.0f,
+                                               ((rgba >> 16) & 0xff) / 255.0f,
+                                               ((rgba >> 24) & 0xff) / 255.0f}};
+        const VkImage images[2]{*entry.image_2d, *entry.image_3d};
+        scheduler.RequestOutsideRenderPassOperationContext();
+        scheduler.Record([images, color](vk::CommandBuffer cmdbuf) {
+            static constexpr VkImageSubresourceRange range{
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = VK_REMAINING_ARRAY_LAYERS,
+            };
+            for (const VkImage image : images) {
+                const VkImageMemoryBarrier to_general{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = 0,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = image,
+                    .subresourceRange = range,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       0, to_general);
+                cmdbuf.ClearColorImage(image, VK_IMAGE_LAYOUT_GENERAL, color, range);
+                const VkImageMemoryBarrier to_read{
+                    .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                    .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                    .image = image,
+                    .subresourceRange = range,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, to_read);
+            }
+        });
+        LOG_INFO(Render_Vulkan, "nx2 constant texture {:#010x} created", rgba);
+    }
+    auto& view = entry.views[static_cast<size_t>(type)];
+    if (!view) {
+        const bool is_3d = type == Shader::TextureType::Color3D;
+        const VkImageViewType view_type = ImageViewType(type);
+        const bool layered = view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ||
+                             view_type == VK_IMAGE_VIEW_TYPE_1D_ARRAY ||
+                             view_type == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY ||
+                             view_type == VK_IMAGE_VIEW_TYPE_CUBE;
+        view = device.GetLogical().CreateImageView({
+            .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .image = is_3d ? *entry.image_3d : *entry.image_2d,
+            .viewType = view_type,
+            .format = VK_FORMAT_A8B8G8R8_UNORM_PACK32,
+            .components{
+                .r = VK_COMPONENT_SWIZZLE_IDENTITY,
+                .g = VK_COMPONENT_SWIZZLE_IDENTITY,
+                .b = VK_COMPONENT_SWIZZLE_IDENTITY,
+                .a = VK_COMPONENT_SWIZZLE_IDENTITY,
+            },
+            .subresourceRange{
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .baseMipLevel = 0,
+                .levelCount = 1,
+                .baseArrayLayer = 0,
+                .layerCount = is_3d ? 1u : layered ? 6u : 1u,
+            },
+        });
+    }
+    return *view;
 }
 
 StagingBufferRef TextureCacheRuntime::UploadStagingBuffer(size_t size, bool deferred) {

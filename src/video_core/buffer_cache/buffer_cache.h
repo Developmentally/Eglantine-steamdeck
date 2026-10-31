@@ -2198,11 +2198,16 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
     if (is_written) {
         binding_size = aligned_size;
     }
-    if (is_written && Tegra::Nx2TracedDestination(gpu_addr, size)) {
+    // Tested against the mapping's whole extent: a heap-wide buffer the shader indexes far into
+    // would otherwise hide behind the 8 MiB cap on sizeless bindings.
+    if (is_written && Tegra::Nx2TracedDestination(gpu_addr, gpu_memory->GetMemoryLayoutSize(gpu_addr))) {
         static u32 traced{};
         if (traced++ < 40) {
-            LOG_INFO(HW_GPU, "nx2 written storage buffer in traced range: {:#x} size {:#x} (cbuf {})",
-                     gpu_addr, size, cbuf_index);
+            LOG_INFO(HW_GPU,
+                     "nx2 written storage buffer reaching the traced range: {:#x} bound size {:#x} "
+                     "mapping {:#x} next qword {:#x} (cbuf {})",
+                     gpu_addr, size, gpu_memory->GetMemoryLayoutSize(gpu_addr),
+                     gpu_memory->Read<u64>(ssbo_addr + 8), cbuf_index);
         }
     }
     const Binding binding{

@@ -524,14 +524,17 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
         LOG_INFO(HW_GPU,
                  "frame trace: draw vs {:#x} ps {:#x} count {} inst {} | depth {}{}func {:#x} | rts {} rt0 "
-                 "{:#x} {}x{} fmt {:#x} | zeta {:#x} {}x{} fmt {:#x} en {} | vp {}x{} | cull {} mask {:#x} | "
+                 "{:#x} {}x{} fmt {:#x} layers {} vol {} base {} pitch {:#x} | zeta {:#x} {}x{} fmt {:#x} en {} | "
+                 "vp {}x{} | cull {} mask {:#x} | "
                  "blend {} per_target {} eq {:#x} src {:#x} dst {:#x} a_eq {:#x} a_src {:#x} a_dst {:#x} | "
                  "logic {} {:#x}",
                  vs, ps, is_indexed ? ds.index_buffer.count : ds.vertex_buffer.count, instance_count,
                  regs.depth_test_enable ? "T" : "", regs.depth_write_enabled ? "W" : "",
                  static_cast<u32>(regs.depth_test_func), regs.rt_control.count.Value(),
                  regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
-                 static_cast<u32>(regs.rt[0].format), regs.zeta.Address(), regs.zeta_size.width,
+                 static_cast<u32>(regs.rt[0].format), regs.rt[0].depth.Value(),
+                 regs.rt[0].volume.Value(), regs.rt[0].base_layer, regs.rt[0].array_pitch,
+                 regs.zeta.Address(), regs.zeta_size.width,
                  regs.zeta_size.height, static_cast<u32>(regs.zeta.format), regs.zeta_enable,
                  regs.viewport_transform[0].scale_x * 2, regs.viewport_transform[0].scale_y * -2,
                  regs.gl_cull_test_enabled, regs.color_mask[0].raw, regs.blend.enable[0],
@@ -543,12 +546,19 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                  static_cast<u32>(regs.blend_per_target_enabled ? regs.blend_per_target[0].alpha_source : regs.blend.alpha_source),
                  static_cast<u32>(regs.blend_per_target_enabled ? regs.blend_per_target[0].alpha_dest : regs.blend.alpha_dest),
                  regs.logic_op.enable, static_cast<u32>(regs.logic_op.op));
+        for (u32 i = 1; i < regs.rt_control.count; ++i) {
+            LOG_INFO(HW_GPU, "frame trace:   rt{} {:#x} {}x{} fmt {:#x} layers {} base {} mask {:#x}", i,
+                     regs.rt[i].Address(), regs.rt[i].width, regs.rt[i].height,
+                     static_cast<u32>(regs.rt[i].format), regs.rt[i].depth.Value(),
+                     regs.rt[i].base_layer, regs.color_mask[i].raw);
+        }
         const auto& sc = regs.scissor_test[0];
         LOG_INFO(HW_GPU,
                  "frame trace:   render_enable mode {} ovr {} exec {} | scissor en {} x {}-{} y {}-{} | "
                  "rasterize {} | depth_bounds en {} {} {} | user_clip {:#x} | vp0 z {} {} near {} far {} | "
                  "stencil {} | clip_ctl {:#x} | ib {:#x} first {} base_v {} | va0 {:#x} | alpha_test {} "
-                 "func {:#x} ref {} | aa {} a2c {} | topology {:#x}",
+                 "func {:#x} ref {} | aa {} a2c {} | topology {:#x} | poly_off {}{}{} bias {} slope {} "
+                 "clamp {} | depth_mode {} z01 {} pix_z {}{}",
                  static_cast<u32>(regs.render_enable.mode), static_cast<u32>(regs.render_enable_override),
                  maxwell3d->ShouldExecute(), sc.enable, sc.min_x.Value(), sc.max_x.Value(),
                  sc.min_y.Value(), sc.max_y.Value(), regs.rasterize_enable, regs.depth_bounds_enable,
@@ -561,7 +571,13 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                  regs.vertex_streams[0].Address(), regs.alpha_test_enabled,
                  static_cast<u32>(regs.alpha_test_func), regs.alpha_test_ref, regs.anti_alias_enable,
                  regs.anti_alias_alpha_control.alpha_to_coverage.Value(),
-                 static_cast<u32>(ds.topology));
+                 static_cast<u32>(ds.topology), regs.polygon_offset_fill_enable,
+                 regs.polygon_offset_point_enable, regs.polygon_offset_line_enable, regs.depth_bias,
+                 regs.slope_scale_depth_bias, regs.depth_bias_clamp,
+                 static_cast<u32>(regs.depth_mode),
+                 regs.viewport_clip_control.depth_0_to_1.Value(),
+                 regs.viewport_clip_control.pixel_min_z.Value(),
+                 regs.viewport_clip_control.pixel_max_z.Value());
         // EDEN_NX2_TRACE_REG_DIFF_VS=<hex low20>: when the vertex program changes to or from that
         // one, list every 3D register that differs from the previous draw (finds state the named
         // fields above do not cover).
@@ -946,6 +962,7 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
             break;
         }
     }
+    Nx2DumpRenderTarget(false);
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
@@ -976,31 +993,63 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                 is_indexed ? "vkCmdDrawIndexed" : "vkCmdDraw", params, VK_SUCCESS);
         }
     });
-    Nx2DumpRenderTargetAfterDraw();
+    Nx2DumpRenderTarget(true);
 }
 
 // EDEN_NX2_RT_DUMP_EVERY=<n> (with EDEN_NX2_IMAGE_DUMP_DIR): while a frame trace is running, read
 // colour target 0 back after every n-th draw into it that targets a >= 1280 wide image, so the
 // draw that paints a region wrong can be found from the file numbering (`rtdraw-<draw index>`).
-void RasterizerVulkan::Nx2DumpRenderTargetAfterDraw() {
+// Depth-only passes leave the file unchanged, so the first dumps show the previous frame.
+// EDEN_NX2_RT_DUMP_TAIL=1 restricts this to the draws from the first blended one on (the
+// post-process and UI tail, whose indices move from scene to scene), with one extra dump of the
+// state before that draw.
+void RasterizerVulkan::Nx2DumpRenderTarget(bool after_draw) {
     static const u32 every = [] {
         const char* value = std::getenv("EDEN_NX2_RT_DUMP_EVERY");
         return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
     }();
-    if (every == 0 || frame_trace_state != 2) {
+    static const bool tail = std::getenv("EDEN_NX2_RT_DUMP_TAIL") != nullptr;
+    if (frame_trace_state != 2) {
         return;
     }
     const auto& regs = maxwell3d->regs;
-    if (regs.rt_control.count == 0 || regs.rt[0].width < 1280) {
+    // Every colour target of a traced-frame draw that renders into the EDEN_NX2_TRACE_DST range,
+    // after the draw (the image a later pass samples from that range, as that draw left it).
+    static u32 traced_draws{};
+    if (after_draw && traced_draws < 16) {
+        bool traced = false;
+        for (u32 i = 0; i < regs.rt_control.count; ++i) {
+            if (!Tegra::Nx2TracedDestination(regs.rt[i].Address(), 1)) {
+                continue;
+            }
+            traced = true;
+            if (const auto id = texture_cache.Nx2RenderTargetImage(i)) {
+                LOG_INFO(HW_GPU, "frame trace: traced rt{} {:#x} is image {} ({}x{} layers {})", i,
+                         regs.rt[i].Address(), id.index, texture_cache.Nx2ImageInfo(id).size.width,
+                         texture_cache.Nx2ImageInfo(id).size.height,
+                         texture_cache.Nx2ImageInfo(id).resources.layers);
+                texture_cache.DumpImage(id, fmt::format("traced-rt{}-{:02}", i, traced_draws));
+            }
+        }
+        traced_draws += traced ? 1 : 0;
+    }
+    if (every == 0 || regs.rt_control.count == 0 || regs.rt[0].width < 1280) {
         return;
     }
     static u32 draws{};
-    const u32 index = draws++;
-    if (index % every != 0) {
+    static bool in_tail{};
+    const auto image_id = texture_cache.Nx2RenderTargetImage(0);
+    if (!after_draw) {
+        if (tail && !in_tail && regs.blend.enable[0]) {
+            in_tail = true;
+            if (image_id) {
+                texture_cache.DumpImage(image_id, fmt::format("rtdraw-{:04}-before", draws));
+            }
+        }
         return;
     }
-    const auto image_id = texture_cache.Nx2RenderTargetImage(0);
-    if (!image_id) {
+    const u32 index = draws++;
+    if ((tail && !in_tail) || index % every != 0 || !image_id) {
         return;
     }
     const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
@@ -1129,9 +1178,11 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     if (frame_trace_state == 2) {
         const auto& regs = maxwell3d->regs;
         LOG_INFO(HW_GPU,
-                 "frame trace: clear surface {:#x} depth {} | rt0 {:#x} {}x{} fmt {:#x} | zeta {:#x} {}x{} "
+                 "frame trace: clear surface {:#x} depth {} color {} {} {} {} | rt0 {:#x} {}x{} fmt {:#x} | zeta {:#x} {}x{} "
                  "fmt {:#x} en {} | scissor {}",
-                 regs.clear_surface.raw, regs.clear_depth, regs.rt[0].Address(), regs.rt[0].width,
+                 regs.clear_surface.raw, regs.clear_depth, regs.clear_color[0],
+                 regs.clear_color[1], regs.clear_color[2], regs.clear_color[3],
+                 regs.rt[0].Address(), regs.rt[0].width,
                  regs.rt[0].height, static_cast<u32>(regs.rt[0].format), regs.zeta.Address(),
                  regs.zeta_size.width, regs.zeta_size.height, static_cast<u32>(regs.zeta.format),
                  regs.zeta_enable, regs.clear_control.use_scissor.Value());
