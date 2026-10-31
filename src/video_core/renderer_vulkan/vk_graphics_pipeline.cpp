@@ -571,6 +571,11 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     continue;
                 }
                 const auto& image{texture_cache.GetImage(view.image_id)};
+                const auto& ps_cbufs{maxwell3d->state.shader_stages[4].const_buffers};
+                const GPUVAddr handle_addr{ps_cbufs[desc.cbuf_index].address + desc.cbuf_offset +
+                                           (index << desc.size_shift)};
+                const u32 handle_lo{gpu_memory->Read<u32>(handle_addr)};
+                const u32 handle_hi{gpu_memory->Read<u32>(handle_addr + 4)};
                 const size_t probe{(std::min)(size_t{image.guest_size_bytes}, size_t{1} << 20)};
                 std::vector<u8> bytes(probe);
                 gpu_memory->ReadBlockUnsafe(image.gpu_addr, bytes.data(), probe);
@@ -578,7 +583,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     std::count_if(bytes.begin(), bytes.end(), [](u8 b) { return b != 0; }))};
                 LOG_INFO(Render_Vulkan,
                          "PS {:#x} key {:016x} texture cb{}+{:#x} type {}: image {:#x} {}x{}x{} layers {} levels {} "
-                         "format {} view format {} flags {:#x} guest {} KiB, {}% of first {} KiB non-zero, sampler {}",
+                         "format {} view format {} flags {:#x} guest {} KiB, {}% of first {} KiB non-zero, sampler {} (handle {:#x} {:#x})",
                          ps_address, Tegra::Nx2ProgramKey(ps_address), desc.cbuf_index, desc.cbuf_offset,
                          static_cast<u32>(desc.type), image.gpu_addr, image.info.size.width,
                          image.info.size.height, image.info.size.depth,
@@ -586,7 +591,8 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                          static_cast<u32>(image.info.format), static_cast<u32>(view.format),
                          static_cast<u32>(image.flags), image.guest_size_bytes / 1024,
                          probe != 0 ? nonzero * 100 / probe : 0, probe / 1024,
-                         sampler_index < samplers.size() ? samplers[sampler_index].index : ~0u);
+                         sampler_index < samplers.size() ? samplers[sampler_index].index : ~0u,
+                         handle_lo, handle_hi);
             }
         }
     }
