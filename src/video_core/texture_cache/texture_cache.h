@@ -2576,6 +2576,13 @@ ImageViewId TextureCache<P>::FindRenderTargetView(const ImageInfo& info, GPUVAdd
                      image.gpu_addr, gpu_addr, info.size.width, info.size.height, base.level, base.layer);
         }
     }
+    if constexpr (requires { image.RenderTargetBelowTrim(base.level); }) {
+        if (True(image.flags & ImageFlagBits::TrimmedLevels) &&
+            False(image.flags & ImageFlagBits::Remapped) && image.RenderTargetBelowTrim(base.level)) {
+            // This draw still lands on the trimmed image; the next lookup re-creates it whole.
+            image.flags |= ImageFlagBits::CpuModified | ImageFlagBits::Remapped;
+        }
+    }
     const SubresourceRange range{
         .base = base,
         .extent = {.levels = 1, .layers = layers},

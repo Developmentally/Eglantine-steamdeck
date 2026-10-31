@@ -11,6 +11,8 @@
 #include <optional>
 #include <span>
 #include <memory>
+#include <mutex>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <boost/container/small_vector.hpp>
@@ -333,12 +335,25 @@ constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
            BaseLevelTexels(info, 0) > HUGE_IMAGE_TEXELS;
 }
 
+// Images the game rendered into at a level the resolution trim had dropped: they come back whole.
+std::mutex rendered_untrimmed_mutex;
+std::unordered_set<GPUVAddr> rendered_untrimmed;
+
+[[nodiscard]] bool IsRenderedUntrimmed(GPUVAddr gpu_addr) {
+    std::scoped_lock lock{rendered_untrimmed_mutex};
+    return rendered_untrimmed.contains(gpu_addr);
+}
+
 // Levels a big mipmapped texture drops at a downscaled render resolution: derivative LOD never
 // reaches its top `down_shift` levels at 0.5x, so they cost memory for nothing. Textures of at
 // least 64 MiB on shared-memory GPUs (Mario Kart World's nine 341 MiB virtual texture pools are
 // what the Deck cannot back, and unbacked they read black); EDEN_NX2_RES_TRIM_MIB=<n> sets the
 // floor, 0 disables. Explicit-LOD samples of a trimmed texture land one level lower.
-[[nodiscard]] u32 ResolutionTrimLevels(const Device& device, const ImageInfo& info) {
+// Depth/stencil images are render targets (Mario Kart World's 512x512x101 D16 shadow atlas is
+// rendered at level 0; trimmed, nothing lit the ground), as is anything the game already
+// rendered into below the trim: neither is trimmed.
+[[nodiscard]] u32 ResolutionTrimLevels(const Device& device, const ImageInfo& info,
+                                       GPUVAddr gpu_addr) {
     static const u64 floor = [&device]() -> u64 {
         if (const char* value = std::getenv("EDEN_NX2_RES_TRIM_MIB")) {
             return u64{std::strtoull(value, nullptr, 10)} << 20;
@@ -348,7 +363,9 @@ constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
     const auto& resolution = Settings::values.resolution_info;
     if (floor == 0 || !resolution.downscale || resolution.down_shift == 0 ||
         info.resources.levels < 2 || info.rescaleable || !UploadsTrimmableLevels(device, info) ||
-        LevelsHostBytes(info, 0) < floor) {
+        LevelsHostBytes(info, 0) < floor ||
+        VideoCore::Surface::GetFormatType(info.format) != VideoCore::Surface::SurfaceType::ColorTexture ||
+        IsRenderedUntrimmed(gpu_addr)) {
         return 0;
     }
     return (std::min)(resolution.down_shift, static_cast<u32>(info.resources.levels) - 1);
@@ -408,7 +425,8 @@ constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
     return device.GetDeviceLocalMemory() < (u64{7} << 30) ? (u64{256} << 20) : (u64{512} << 20);
 }
 
-[[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info, u32& level_offset) {
+[[nodiscard]] ImageInfo TrimmedHostInfo(const Device& device, const ImageInfo& info,
+                                        GPUVAddr gpu_addr, u32& level_offset) {
     level_offset = 0;
     if (info.type != ImageType::e2D) {
         return info;
@@ -442,7 +460,7 @@ constexpr u64 HUGE_IMAGE_TEXELS = u64{1} << 28;
                 ++level_offset;
             }
         }
-        level_offset = (std::max)(level_offset, ResolutionTrimLevels(device, info));
+        level_offset = (std::max)(level_offset, ResolutionTrimLevels(device, info, gpu_addr));
         if (level_offset == 0) {
             return info;
         }
@@ -2288,7 +2306,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
     : VideoCommon::ImageBase(info_, gpu_addr_, cpu_addr_), scheduler{&runtime_.scheduler},
       runtime{&runtime_},
       original_image(MakeImage(runtime_.device, runtime_.memory_allocator,
-                               TrimmedHostInfo(runtime_.device, info, host_level_offset),
+                               TrimmedHostInfo(runtime_.device, info, gpu_addr_, host_level_offset),
                                IsHugeAstcArray(runtime_.device, info)
                                    ? std::span<const VkFormat>{HugeAstcViewFormats}
                                : IsOpaqueBc1Astc(runtime_.device, info)
@@ -2300,7 +2318,8 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
       aspect_mask(ImageAspectMask(info.format)) {
     if (original_image.IsUnbacked()) {
         flags |= VideoCommon::ImageFlagBits::Unbacked;
-        const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
+        const ImageInfo host_info =
+            TrimmedHostInfo(runtime_.device, info, gpu_addr_, host_level_offset);
         const u64 texels = u64{host_info.size.width} * host_info.size.height *
                            host_info.size.depth * static_cast<u64>(host_info.resources.layers);
         if (UsesSparseLayers(runtime_.device, info, gpu_addr_) && InitSparseLayers()) {
@@ -2368,6 +2387,23 @@ Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBas
 
 bool Image::IsGenericTrimmed() const noexcept {
     return host_level_offset != 0 && !WillUseAcceleratedAstcDecode(runtime->device, info);
+}
+
+bool Image::RenderTargetBelowTrim(s32 level) {
+    if (host_level_offset == 0 || level >= static_cast<s32>(host_level_offset) ||
+        WillUseAcceleratedAstcDecode(runtime->device, info)) {
+        return false;
+    }
+    {
+        std::scoped_lock lock{rendered_untrimmed_mutex};
+        rendered_untrimmed.insert(gpu_addr);
+    }
+    LOG_WARNING(Render_Vulkan,
+                "Render target at level {} of {:#x} ({}x{}x{}, {} levels, format {}), whose host "
+                "image keeps levels {}+; re-creating it whole",
+                level, gpu_addr, info.size.width, info.size.height, info.resources.layers,
+                info.resources.levels, static_cast<u32>(info.format), host_level_offset);
+    return true;
 }
 
 Image::~Image() {
@@ -2825,7 +2861,7 @@ bool Image::InitSparseLayers() {
     s.requirements = device.GetLogical().GetImageMemoryRequirements(handle);
     s.sparse = *it;
     u32 offset = host_level_offset;
-    const ImageInfo host = TrimmedHostInfo(device, info, offset);
+    const ImageInfo host = TrimmedHostInfo(device, info, gpu_addr, offset);
     s.width = host.size.width;
     s.height = host.size.height;
     s.levels = static_cast<u32>(host.resources.levels);

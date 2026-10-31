@@ -321,6 +321,9 @@ Outcome Check(const fs::path& path, bool lowering_only) {
         }
         outcome.phase = "spirv";
         Shader::RuntimeInfo runtime_info{};
+        // No previous stage is known offline: assume every varying is written so the emitted
+        // module keeps its inputs instead of folding them to constants.
+        runtime_info.previous_stage_stores.mask.set();
         if (program.stage == Shader::Stage::Geometry) {
             runtime_info.input_topology = Shader::InputTopology::Triangles;
         }

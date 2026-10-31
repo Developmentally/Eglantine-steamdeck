@@ -403,6 +403,10 @@ public:
     /// (TextureCacheRuntime::UploadTrimmedLevels), unlike a trimmed GPU-decoded ASTC image.
     [[nodiscard]] bool IsGenericTrimmed() const noexcept;
 
+    /// The game renders into guest `level`, which the resolution trim dropped: true when the
+    /// image has to be re-created whole (its address is then never trimmed again).
+    [[nodiscard]] bool RenderTargetBelowTrim(s32 level);
+
     VkImageView StorageImageView(s32 level) noexcept;
 
     /// A storage view of one layer of a host level (decoding only some layers of an array).
