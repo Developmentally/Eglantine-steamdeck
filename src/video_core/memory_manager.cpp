@@ -151,7 +151,10 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
         remaining_size -= page_size;
     }
     flush_modified();
-    kind_map.Map(gpu_addr, gpu_addr + size, kind);
+    {
+        std::unique_lock<std::mutex> lock(guard);
+        kind_map.Map(gpu_addr, gpu_addr + size, kind);
+    }
     return gpu_addr;
 }
 
