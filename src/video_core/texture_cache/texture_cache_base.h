@@ -133,6 +133,8 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 download_requests{};   ///< DownloadMemory calls (CPU reads of GPU-written memory)
     u64 images_written_back{}; ///< GPU-written images copied to guest memory for the CPU (DownloadMemory)
     u64 render_target_resizes{}; ///< GPU-only render targets re-created at another size (JoinImages)
+    u32 traced_writes_this_frame{}; ///< EDEN_NX2_TRACE_DST: GPU writes into images in the range this frame
+    boost::container::small_vector<ImageId, 8> traced_images_this_frame;
     u64 largest_upload{};    ///< Largest of them
     u64 layer_uploads{};     ///< Of them, uploads of only the written layers
     bool native_thresholds_applied{};

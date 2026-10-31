@@ -410,6 +410,21 @@ void TextureCache<P>::TickFrame() {
     TickAsyncUnswizzle();
 
     runtime.TickFrame();
+    if (traced_writes_this_frame != 0) {
+        static u32 traced_frames{};
+        if (traced_frames++ < 3000) {
+            std::string ids;
+            for (const ImageId id : traced_images_this_frame) {
+                const Image& image = slot_images[id];
+                ids += fmt::format(" {:#x}/{}x{}x{}/{}", image.gpu_addr, image.info.size.width,
+                                   image.info.size.height, image.info.resources.layers, id.index);
+            }
+            LOG_INFO(HW_GPU, "nx2 traced range frame {}: {} GPU writes into{}", frame_tick,
+                     traced_writes_this_frame, ids);
+        }
+        traced_writes_this_frame = 0;
+        traced_images_this_frame.clear();
+    }
     ++frame_tick;
 
     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
@@ -2784,6 +2799,15 @@ void TextureCache<P>::RegisterImage(ImageId image_id) {
     ImageBase& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
+    if (Tegra::Nx2TracedDestination(image.gpu_addr, image.guest_size_bytes)) {
+        static u32 traced{};
+        if (traced++ < 400) {
+            LOG_INFO(HW_GPU, "nx2 image created in traced range (frame {}): {:#x} {}x{}x{} layers {} levels {} format {} flags {:#x} id {}",
+                     frame_tick, image.gpu_addr, image.info.size.width, image.info.size.height,
+                     image.info.size.depth, image.info.resources.layers, image.info.resources.levels,
+                     static_cast<u32>(image.info.format), static_cast<u32>(image.flags), image_id.index);
+        }
+    }
     image.flags |= ImageFlagBits::Registered;
     total_used_memory += Common::AlignUp(HostImageSizeBytes(image), 1024);
     image.lru_index = lru_cache.Insert(image_id, frame_tick);
@@ -2955,6 +2979,15 @@ template <class P>
 void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     ImageBase& image = slot_images[image_id];
     ++images_deleted;
+    if (Tegra::Nx2TracedDestination(image.gpu_addr, image.guest_size_bytes)) {
+        static u32 traced{};
+        if (traced++ < 400) {
+            LOG_INFO(HW_GPU, "nx2 image deleted in traced range (frame {}): {:#x} {}x{}x{} layers {} flags {:#x} id {}",
+                     frame_tick, image.gpu_addr, image.info.size.width, image.info.size.height,
+                     image.info.size.depth, image.info.resources.layers,
+                     static_cast<u32>(image.flags), image_id.index);
+        }
+    }
     // Drop every decode still queued for it, whatever IsDecoding says: an image re-decoded while
     // a decode was in flight has two, and the first to finish clears the flag. A decode left
     // behind was uploaded into the next image to take this slot (another texture's data: garbage
@@ -3172,11 +3205,17 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
     if (is_modification) {
         if (Tegra::Nx2TracedDestination(image.gpu_addr, image.guest_size_bytes)) {
             static u32 traced{};
-            if (traced++ < 400) {
+            if (traced++ < 40) {
                 LOG_INFO(HW_GPU, "nx2 GPU write into image in traced range: {:#x} {}x{}x{} layers {} format {} flags {:#x}",
                          image.gpu_addr, image.info.size.width, image.info.size.height,
                          image.info.size.depth, image.info.resources.layers,
                          static_cast<u32>(image.info.format), static_cast<u32>(image.flags));
+            }
+            // Per-frame summary (TickFrame): which images in the range the GPU wrote this frame.
+            ++traced_writes_this_frame;
+            if (std::ranges::find(traced_images_this_frame, image_id) == traced_images_this_frame.end() &&
+                traced_images_this_frame.size() < 8) {
+                traced_images_this_frame.push_back(image_id);
             }
         }
         if constexpr (requires { &Image::BindLayers; }) {
