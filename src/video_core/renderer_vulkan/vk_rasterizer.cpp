@@ -1804,6 +1804,20 @@ bool RasterizerVulkan::HasDrawTransformFeedback() {
 bool RasterizerVulkan::AccelerateSurfaceCopy(const Tegra::Engines::Fermi2D::Surface& src,
                                              const Tegra::Engines::Fermi2D::Surface& dst,
                                              const Tegra::Engines::Fermi2D::Config& copy_config) {
+    // Mario Kart World fills its 8192x8192x68 ASTC terrain arrays (sparse regions) with 2D-engine
+    // copies of each layer's levels as 1024x1024 128-bit surfaces. On the host those would land
+    // in an RGBA32 image the ASTC array can neither alias nor copy from, so the array would stay
+    // black. The software blitter writes guest memory instead, which backs the sparse blocks and
+    // re-uploads the array's layer.
+    if (!copy_config.must_accelerate && Tegra::Nx2InSparseRegion(dst.Address(), 1)) {
+        static u32 logged{};
+        if (logged++ < 8) {
+            LOG_INFO(Render_Vulkan,
+                     "2D copy into sparse region {:#x} ({}x{} format {:#x}) done in guest memory",
+                     dst.Address(), dst.width, dst.height, static_cast<u32>(dst.format));
+        }
+        return false;
+    }
     std::scoped_lock lock{texture_cache.mutex};
     return texture_cache.BlitImage(dst, src, copy_config);
 }

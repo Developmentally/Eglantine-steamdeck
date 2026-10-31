@@ -552,9 +552,13 @@ private:
         const u32 slot = w[11];
         LOG_DEBUG(Service, "nx2:gpu 214 words {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x} {:#x}",
                  w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12]);
-        // Word 7 bits 8-11 = 6: an address-space reservation the game maps memory into later
-        // (title 5 asks for six of 1.4-5.8 GB, 17 GB in all); backing those drained the pool.
-        const bool reservation_only = (w[7] & 0xf00) == 0x600;
+        // Word 7 bits 8-11 = 6: an address-space reservation (title 5 asks for six of 1.4-5.8 GB,
+        // 17 GB in all; backing those drained the pool). With the sparse flag they are its
+        // 8192x8192x68 terrain texture arrays, filled by 2D-engine blits a layer at a time: those
+        // take the lazy path below, so the blits land in mapped memory and the arrays can be
+        // sampled. Without it the range stays unmapped.
+        const bool sparse = (w[7] & SparseRegionFlag) != 0 && LazySparseRegions();
+        const bool reservation_only = (w[7] & 0xf00) == 0x600 && !sparse;
         if (reservation_only) {
             LOG_INFO(Service, "nx2:gpu 214 reservation [{:#x}, {:#x}] ({} MB) left unbacked",
                      start, last, (last + 1 - start) >> 20);
@@ -562,7 +566,7 @@ private:
             const u64 size = last + 1 - start;
             std::scoped_lock lk{m_region_mutex};
             FreeReleasedRegions();
-            if ((w[7] & SparseRegionFlag) != 0 && LazySparseRegions()) {
+            if (sparse) {
                 // Title 1's terrain texture arrays and layer pools (170 MB-5.8 GB, mostly empty):
                 // backed whole, they ran the pool dry and the later ones got no memory at all.
                 // The region gets a device range of its own, unbacked pages read zero, and
