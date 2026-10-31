@@ -164,6 +164,8 @@ private:
 
     void UpdateDynamicStates();
 
+    void Nx2DumpRenderTargetAfterDraw();
+
     void HandleTransformFeedback();
 
     void UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& regs);
