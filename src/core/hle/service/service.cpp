@@ -78,11 +78,17 @@ void ServiceFrameworkBase::ReportUnimplementedFunction(HLERequestContext& ctx,
                            (caller != nullptr && caller->IsSwitch2());
     // Auto-stubbed commands are reported once each: title 1 polls nx2:camera 29 every frame
     // (~47 calls a second), and every report wrote a Critical line, which flushes the log file.
+    // EDEN_NX2_STUB_TRACE=<n> logs the first n calls of each stubbed command instead of one, with
+    // the request words, to spot the mapping/commit calls a title repeats with different operands.
     if (auto_stub) {
+        static const u32 trace_calls = [] {
+            const char* text = std::getenv("EDEN_NX2_STUB_TRACE");
+            return text ? static_cast<u32>(std::strtoul(text, nullptr, 10)) : 1U;
+        }();
         static std::mutex reported_mutex;
-        static std::set<std::pair<std::string, u32>> reported;
+        static std::map<std::pair<std::string, u32>, u32> reported;
         std::scoped_lock lk{reported_mutex};
-        if (!reported.emplace(service_name, ctx.GetCommand()).second) {
+        if (++reported[{service_name, ctx.GetCommand()}] > trace_calls) {
             IPC::ResponseBuilder rb{ctx, 2};
             rb.Push(ResultSuccess);
             return;
