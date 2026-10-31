@@ -872,8 +872,9 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
 
 // EDEN_NX2_IMAGE_DUMP=<hex gpu address>[,<hex address>...] with EDEN_NX2_IMAGE_DUMP_DIR=<dir>:
 // every EDEN_NX2_IMAGE_DUMP_EVERY frames (300), read back the images starting at those addresses
-// and write them raw (host format, linear, every level and layer) as <dir>/<address>-<frame>.bin
-// with a .txt describing the layout.
+// and write them raw (host format, linear, every level and layer) as
+// <dir>/<address>-<image id>-<frame>.bin with a .txt describing the layout, up to
+// EDEN_NX2_IMAGE_DUMP_MAX (100) files.
 template <class P>
 void TextureCache<P>::DumpRequestedImages() {
     static const char* const spec = std::getenv("EDEN_NX2_IMAGE_DUMP");
@@ -885,9 +886,13 @@ void TextureCache<P>::DumpRequestedImages() {
         const char* const every = std::getenv("EDEN_NX2_IMAGE_DUMP_EVERY");
         return every != nullptr ? (std::max)(std::strtoull(every, nullptr, 10), 1ull) : 300ull;
     }();
+    static const u32 max_dumps = [] {
+        const char* const max = std::getenv("EDEN_NX2_IMAGE_DUMP_MAX");
+        return max != nullptr ? static_cast<u32>(std::strtoul(max, nullptr, 10)) : 100u;
+    }();
     static u64 frames{};
     static u32 dumps{};
-    if (++frames % interval != 0 || dumps >= 100) {
+    if (++frames % interval != 0 || dumps >= max_dumps) {
         return;
     }
     static const std::vector<GPUVAddr> addresses = [] {
@@ -912,7 +917,8 @@ void TextureCache<P>::DumpRequestedImages() {
         const auto copies = FullDownloadCopies(image.info);
         image.DownloadMemory(map, copies);
         runtime.Finish();
-        const std::string base = fmt::format("{}/{:x}-{}", dir, image.gpu_addr, frames);
+        const std::string base =
+            fmt::format("{}/{:x}-{}-{}", dir, image.gpu_addr, image_id.index, frames);
         if (std::FILE* file = std::fopen((base + ".bin").c_str(), "wb")) {
             std::fwrite(map.mapped_span.data(), 1, image.unswizzled_size_bytes, file);
             std::fclose(file);
