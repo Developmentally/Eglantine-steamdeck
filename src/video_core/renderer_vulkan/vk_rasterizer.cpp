@@ -892,12 +892,13 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     // Draws whose depth target lies in the EDEN_NX2_TRACE_DST range: who renders a shadow atlas.
     if (const auto& regs = maxwell3d->regs;
         regs.zeta_enable && Tegra::Nx2TracedDestination(regs.zeta.Address(), 1)) {
-        static std::set<std::tuple<GPUVAddr, u64, u64>> seen;
+        static std::set<std::tuple<u64, u64, u32>> seen;
         static u32 draws{};
         const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
         const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
         ++draws;
-        if (seen.size() < 200 && seen.insert({regs.zeta.Address(), vs, ps}).second) {
+        if (seen.size() < 200 &&
+            seen.insert({vs, ps, static_cast<u32>(regs.depth_test_func)}).second) {
             LOG_INFO(HW_GPU,
                      "nx2 draw into traced zeta {:#x} {}x{} layers {} fmt {:#x} vs={:#x} ({:016x}) ps={:#x} "
                      "depth test {} write {} func {} | rt0 {:#x} fmt {:#x} rt count {} | viewport {}x{} | "
