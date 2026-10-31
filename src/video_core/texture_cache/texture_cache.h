@@ -413,17 +413,12 @@ void TextureCache<P>::TickFrame() {
     if (traced_writes_this_frame != 0) {
         static u32 traced_frames{};
         if (traced_frames++ < 3000) {
-            std::string ids;
-            for (const ImageId id : traced_images_this_frame) {
-                const Image& image = slot_images[id];
-                ids += fmt::format(" {:#x}/{}x{}x{}/{}", image.gpu_addr, image.info.size.width,
-                                   image.info.size.height, image.info.resources.layers, id.index);
-            }
             LOG_INFO(HW_GPU, "nx2 traced range frame {}: {} GPU writes into{}", frame_tick,
-                     traced_writes_this_frame, ids);
+                     traced_writes_this_frame, traced_images_text);
         }
         traced_writes_this_frame = 0;
         traced_images_this_frame.clear();
+        traced_images_text.clear();
     }
     ++frame_tick;
 
@@ -2518,6 +2513,23 @@ SamplerId TextureCache<P>::FindSampler(const TSCEntry& config, bool compute) {
     const auto [pair, is_new] = channel_state->samplers.try_emplace(config);
     if (is_new) {
         pair->second = slot_samplers.insert(runtime, config);
+        // EDEN_NX2_TSC_LOG=1: every distinct sampler descriptor as it is first seen.
+        if (static const bool log_tsc = std::getenv("EDEN_NX2_TSC_LOG") != nullptr; log_tsc) {
+            LOG_INFO(HW_GPU,
+                     "nx2 sampler {}: raw {:016x} {:016x} {:016x} {:016x} | compare {} func {} | "
+                     "filters mag {} min {} mip {} | wrap {} {} {} | lod {}..{} bias {} aniso {} | "
+                     "border {} {} {} {}",
+                     pair->second.index, config.raw[0], config.raw[1], config.raw[2], config.raw[3],
+                     config.depth_compare_enabled.Value(),
+                     static_cast<u32>(config.depth_compare_func.Value()),
+                     static_cast<u32>(config.mag_filter.Value()),
+                     static_cast<u32>(config.min_filter.Value()),
+                     static_cast<u32>(config.mipmap_filter.Value()),
+                     static_cast<u32>(config.wrap_u.Value()), static_cast<u32>(config.wrap_v.Value()),
+                     static_cast<u32>(config.wrap_p.Value()), config.MinLod(), config.MaxLod(),
+                     config.LodBias(), config.MaxAnisotropy(), config.border_color[0],
+                     config.border_color[1], config.border_color[2], config.border_color[3]);
+        }
     }
     return pair->second;
 }
@@ -3216,6 +3228,9 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             if (std::ranges::find(traced_images_this_frame, image_id) == traced_images_this_frame.end() &&
                 traced_images_this_frame.size() < 8) {
                 traced_images_this_frame.push_back(image_id);
+                traced_images_text += fmt::format(" {:#x}/{}x{}x{}/{}", image.gpu_addr,
+                                                  image.info.size.width, image.info.size.height,
+                                                  image.info.resources.layers, image_id.index);
             }
         }
         if constexpr (requires { &Image::BindLayers; }) {

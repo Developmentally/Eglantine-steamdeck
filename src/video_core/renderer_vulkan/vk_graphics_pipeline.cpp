@@ -541,6 +541,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 first += Shader::NumDescriptors(info.image_descriptors);
             }
         }
+        size_t sampler_index{};
+        for (size_t stage = 0; stage < 4; ++stage) {
+            if (Spec::enabled_stages[stage]) {
+                sampler_index += Shader::NumDescriptors(stage_infos[stage].texture_descriptors);
+            }
+        }
         const Shader::Info& ps_info{stage_infos[4]};
         first += Shader::NumDescriptors(ps_info.texture_buffer_descriptors);
         if constexpr (Spec::has_image_buffers) {
@@ -548,7 +554,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
         size_t view_index{first};
         for (const auto& desc : ps_info.texture_descriptors) {
-            for (u32 index = 0; index < desc.count; ++index, ++view_index) {
+            for (u32 index = 0; index < desc.count; ++index, ++view_index, ++sampler_index) {
                 if (view_index >= views.size()) {
                     break;
                 }
@@ -572,14 +578,15 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     std::count_if(bytes.begin(), bytes.end(), [](u8 b) { return b != 0; }))};
                 LOG_INFO(Render_Vulkan,
                          "PS {:#x} key {:016x} texture cb{}+{:#x} type {}: image {:#x} {}x{}x{} layers {} levels {} "
-                         "format {} view format {} flags {:#x} guest {} KiB, {}% of first {} KiB non-zero",
+                         "format {} view format {} flags {:#x} guest {} KiB, {}% of first {} KiB non-zero, sampler {}",
                          ps_address, Tegra::Nx2ProgramKey(ps_address), desc.cbuf_index, desc.cbuf_offset,
                          static_cast<u32>(desc.type), image.gpu_addr, image.info.size.width,
                          image.info.size.height, image.info.size.depth,
                          image.info.resources.layers, image.info.resources.levels,
                          static_cast<u32>(image.info.format), static_cast<u32>(view.format),
                          static_cast<u32>(image.flags), image.guest_size_bytes / 1024,
-                         probe != 0 ? nonzero * 100 / probe : 0, probe / 1024);
+                         probe != 0 ? nonzero * 100 / probe : 0, probe / 1024,
+                         sampler_index < samplers.size() ? samplers[sampler_index].index : ~0u);
             }
         }
     }
