@@ -913,22 +913,57 @@ void TextureCache<P>::DumpRequestedImages() {
             True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Remapped))) {
             continue;
         }
-        auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-        const auto copies = FullDownloadCopies(image.info);
+        boost::container::small_vector<BufferImageCopy, 16> copies;
+        size_t total_bytes = image.unswizzled_size_bytes;
+        const char* host_format = "guest";
+        if (True(image.flags & ImageFlagBits::Converted)) {
+            // GPU-decoded ASTC is BC1 (opaque), BC3 or RGBA8 on the host: lay the levels out
+            // tightly in that format instead of the guest's.
+            const bool recompressed = Settings::values.astc_recompression.GetValue() !=
+                                      Settings::AstcRecompression::Uncompressed;
+            const bool bc1 = recompressed && (image.info.astc_opaque ||
+                                              Settings::values.astc_recompression.GetValue() ==
+                                                  Settings::AstcRecompression::Bc1);
+            const u32 block = recompressed ? 4 : 1;
+            const size_t block_bytes = !recompressed ? 4 : bc1 ? 8 : 16;
+            host_format = !recompressed ? "rgba8" : bc1 ? "bc1" : "bc3";
+            size_t offset = 0;
+            for (s32 level = 0; level < image.info.resources.levels; ++level) {
+                const Extent3D size = MipSize(image.info.size, level);
+                const size_t bytes = size_t{Common::DivCeil(size.width, block)} *
+                                     Common::DivCeil(size.height, block) * size.depth *
+                                     block_bytes * image.info.resources.layers;
+                copies.push_back(BufferImageCopy{
+                    .buffer_offset = offset,
+                    .buffer_size = bytes,
+                    .buffer_row_length = 0,
+                    .buffer_image_height = 0,
+                    .image_subresource = {.base_level = level, .base_layer = 0,
+                                          .num_layers = image.info.resources.layers},
+                    .image_offset = {},
+                    .image_extent = size,
+                });
+                offset += Common::AlignUp(bytes, size_t{64});
+            }
+            total_bytes = offset;
+        } else {
+            copies = FullDownloadCopies(image.info);
+        }
+        auto map = runtime.DownloadStagingBuffer(total_bytes);
         image.DownloadMemory(map, copies);
         runtime.Finish();
         const std::string base =
             fmt::format("{}/{:x}-{}-{}", dir, image.gpu_addr, image_id.index, frames);
         if (std::FILE* file = std::fopen((base + ".bin").c_str(), "wb")) {
-            std::fwrite(map.mapped_span.data(), 1, image.unswizzled_size_bytes, file);
+            std::fwrite(map.mapped_span.data(), 1, total_bytes, file);
             std::fclose(file);
         }
         if (std::FILE* file = std::fopen((base + ".txt").c_str(), "w")) {
-            fmt::print(file, "{}x{}x{} layers {} levels {} format {} flags {:#x} id {}\n",
+            fmt::print(file, "{}x{}x{} layers {} levels {} format {} flags {:#x} id {} host {}\n",
                        image.info.size.width, image.info.size.height, image.info.size.depth,
                        image.info.resources.layers, image.info.resources.levels,
                        static_cast<u32>(image.info.format), static_cast<u32>(image.flags),
-                       image_id.index);
+                       image_id.index, host_format);
             for (const auto& copy : copies) {
                 fmt::print(file, "level {} offset {} size {} {}x{}x{} layers {} row {} rows {}\n",
                            copy.image_subresource.base_level, copy.buffer_offset,
@@ -939,7 +974,7 @@ void TextureCache<P>::DumpRequestedImages() {
             std::fclose(file);
         }
         ++dumps;
-        LOG_INFO(HW_GPU, "nx2 image dump: {}.bin ({} bytes)", base, image.unswizzled_size_bytes);
+        LOG_INFO(HW_GPU, "nx2 image dump: {}.bin ({} bytes)", base, total_bytes);
     }
 }
 
