@@ -908,7 +908,8 @@ void TextureCache<P>::DumpRequestedImages() {
 
 // Read an image back and write it raw (host format, linear, every level and layer) as
 // <EDEN_NX2_IMAGE_DUMP_DIR>/<tag>-<address>-<image id>-<frame>.bin with a .txt describing the
-// layout. Returns false once EDEN_NX2_IMAGE_DUMP_MAX (100) files were written.
+// layout, from frame EDEN_NX2_IMAGE_DUMP_AFTER on. Returns false once EDEN_NX2_IMAGE_DUMP_MAX
+// (100) files were written.
 template <class P>
 bool TextureCache<P>::DumpImage(ImageId image_id, std::string_view tag) {
     static const char* const dir = std::getenv("EDEN_NX2_IMAGE_DUMP_DIR");
@@ -916,9 +917,18 @@ bool TextureCache<P>::DumpImage(ImageId image_id, std::string_view tag) {
         const char* const max = std::getenv("EDEN_NX2_IMAGE_DUMP_MAX");
         return max != nullptr ? static_cast<u32>(std::strtoul(max, nullptr, 10)) : 100u;
     }();
+    // EDEN_NX2_IMAGE_DUMP_AFTER=<frame>: nothing before that frame (the title screen binds the
+    // same programs with other textures).
+    static const u64 first_frame = [] {
+        const char* const after = std::getenv("EDEN_NX2_IMAGE_DUMP_AFTER");
+        return after != nullptr ? std::strtoull(after, nullptr, 10) : 0ull;
+    }();
     static u32 dumps{};
     if (dir == nullptr || dumps >= max_dumps) {
         return false;
+    }
+    if (frame_tick < first_frame) {
+        return true;
     }
     Image& image = slot_images[image_id];
     if (True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Remapped))) {
