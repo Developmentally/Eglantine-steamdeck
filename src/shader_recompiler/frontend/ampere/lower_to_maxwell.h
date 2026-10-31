@@ -1031,6 +1031,23 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
                 (u64{15} << 20) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
             break;
         }
+        case 0x59f: { // SURED.U32.<op>.STRONG.GPU 2D/2D_ARRAY/3D, direct descriptor (title 5's
+                      // terrain streaming marks the tiles it wants this way).
+            const u32 binding = insn.Bits(54, 5), offset = insn.Bits(40, 14);
+            const u32 data = insn.Bits(32, 8), coordinate = insn.Bits(24, 8);
+            const u32 dimension = insn.Bits(61, 3);
+            const u32 op = insn.Bits(87, 3); // ADD MIN MAX INC DEC AND OR XOR, as ATOM
+            if ((insn.words[2] & ~0x0380e000U) != 0x00100000U || dimension < 3 || dimension > 5 ||
+                binding >= 18 || offset > 0x1fff || insn.Bits(59, 2) || data > 252 ||
+                coordinate > (dimension >= 4 ? 252U : 253U))
+                return fail(index, "native surface reduction mode");
+            if (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding)
+                return fail(index, "native surface descriptor buffer conflict");
+            result.required_texture_buffer = binding;
+            emit(0xeb40000000000000ULL | predicate | data | (u64{coordinate} << 8) |
+                (u64{op} << 24) | (u64{dimension} << 33) | (u64{offset} << 36) | (u64{1} << 51));
+            break;
+        }
         case 0x301: // BREV register.
             if (insn.words[2] || insn.words[1] > 255) return fail(index, "native bit reverse mode");
             emit(base(0x3828000000000000ULL) | (u64{insn.words[1]} << 8) |
