@@ -526,6 +526,13 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         static std::unordered_set<u64> logged;
         const u64 ps_address{(u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
                              regs.pipelines[5].reserved[1]};
+        // The vertex program it is paired with, once per pair (names the VS for EDEN_NX2_DUMP_VS).
+        const u64 vs_address{(u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
+                             regs.pipelines[1].reserved[1]};
+        if (logged.insert((ps_address << 24) ^ vs_address ^ (u64{1} << 63)).second) {
+            LOG_INFO(Render_Vulkan, "PS {:#x} key {:016x} drawn with VS {:#x} key {:016x}", ps_address,
+                     Tegra::Nx2ProgramKey(ps_address), vs_address, Tegra::Nx2ProgramKey(vs_address));
+        }
         size_t first{};
         for (size_t stage = 0; stage < 4; ++stage) {
             if (!Spec::enabled_stages[stage]) {
