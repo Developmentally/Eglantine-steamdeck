@@ -889,6 +889,28 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                      regs.blend.enable[0], seen.size());
         }
     }
+    // Draws whose depth target lies in the EDEN_NX2_TRACE_DST range: who renders a shadow atlas.
+    if (const auto& regs = maxwell3d->regs;
+        regs.zeta_enable && Tegra::Nx2TracedDestination(regs.zeta.Address(), 1)) {
+        static std::set<std::tuple<GPUVAddr, u64, u64>> seen;
+        static u32 draws{};
+        const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+        ++draws;
+        if (seen.size() < 200 && seen.insert({regs.zeta.Address(), vs, ps}).second) {
+            LOG_INFO(HW_GPU,
+                     "nx2 draw into traced zeta {:#x} {}x{} layers {} fmt {:#x} vs={:#x} ({:016x}) ps={:#x} "
+                     "depth test {} write {} func {} | rt0 {:#x} fmt {:#x} rt count {} | viewport {}x{} | "
+                     "draw {} so far",
+                     regs.zeta.Address(), regs.zeta_size.width, regs.zeta_size.height,
+                     regs.zeta_size.depth, static_cast<u32>(regs.zeta.format), vs,
+                     Tegra::Nx2ProgramKey(vs), ps, regs.depth_test_enable, regs.depth_write_enabled,
+                     static_cast<u32>(regs.depth_test_func), regs.rt[0].Address(),
+                     static_cast<u32>(regs.rt[0].format), regs.rt_control.count.Value(),
+                     static_cast<s32>(regs.viewport_transform[0].scale_x * 2.0f),
+                     static_cast<s32>(std::abs(regs.viewport_transform[0].scale_y) * 2.0f), draws);
+        }
+    }
     PrepareDraw(is_indexed, [this, is_indexed, instance_count] {
         const auto& draw_state = maxwell3d->draw_manager.draw_state;
         const u32 num_instances{instance_count};
@@ -1060,6 +1082,18 @@ void RasterizerVulkan::Clear(u32 layer_count) {
     const bool use_stencil = regs.clear_surface.S;
     if (!use_color && !use_depth && !use_stencil) {
         return;
+    }
+    if (use_depth && regs.zeta_enable && Tegra::Nx2TracedDestination(regs.zeta.Address(), 1)) {
+        static u32 traced{};
+        if (traced++ < 300) {
+            LOG_INFO(HW_GPU, "nx2 clear of traced zeta {:#x} {}x{} layers {}: depth {} layer {} scissor {} ({}x{} at {},{})",
+                     regs.zeta.Address(), regs.zeta_size.width, regs.zeta_size.height,
+                     regs.zeta_size.depth, regs.clear_depth, regs.clear_surface.layer.Value(),
+                     regs.clear_control.use_scissor.Value(),
+                     regs.scissor_test[0].max_x - regs.scissor_test[0].min_x,
+                     regs.scissor_test[0].max_y - regs.scissor_test[0].min_y,
+                     regs.scissor_test[0].min_x, regs.scissor_test[0].min_y);
+        }
     }
 
     std::scoped_lock lock{texture_cache.mutex};
