@@ -441,6 +441,13 @@ void TextureCache<P>::FillImageViews(std::span<ImageViewInOut> views, bool compu
         }
         for (ImageViewInOut& view : views) {
             view.id = VisitImageView(view.index, compute);
+            // `blacklist` is set on written storage images. One over an unwritten sparse region
+            // reads zero and has no memory to store into: replace it before the program runs
+            // (render targets get the same treatment in PrepareImage).
+            if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID &&
+                ReplaceUnwrittenSparseStorageImage(view.id)) {
+                break;
+            }
             if (blacklist) {
                 if (view.blacklist && view.id != NULL_IMAGE_VIEW_ID) {
                     const ImageViewBase& image_view = slot_image_views[view.id];
@@ -3123,6 +3130,33 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
         MarkModification(image);
     }
     lru_cache.Touch(image.lru_index, frame_tick);
+}
+
+template <class P>
+bool TextureCache<P>::ReplaceUnwrittenSparseStorageImage(ImageViewId image_view_id) {
+    const ImageViewBase& image_view = slot_image_views[image_view_id];
+    if (image_view.IsBuffer()) {
+        return false;
+    }
+    const ImageId image_id = image_view.image_id;
+    Image& image = slot_images[image_id];
+    if (False(image.flags & ImageFlagBits::UnwrittenSparse)) {
+        return false;
+    }
+    static u32 logged{};
+    if (logged++ < 32) {
+        LOG_WARNING(HW_GPU, "Storage write into unwritten sparse image {:#x} {}x{}x{} layers {} format {}; replacing it",
+                    image.gpu_addr, image.info.size.width, image.info.size.height,
+                    image.info.size.depth, image.info.resources.layers,
+                    static_cast<u32>(image.info.format));
+    }
+    Tegra::Nx2SparseMarkWritten(image.gpu_addr, image.guest_size_bytes);
+    if (True(image.flags & ImageFlagBits::Tracked)) {
+        UntrackImage(image, image_id);
+    }
+    UnregisterImage(image_id);
+    DeleteImage(image_id);
+    return true;
 }
 
 template <class P>

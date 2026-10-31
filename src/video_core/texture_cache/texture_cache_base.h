@@ -453,6 +453,10 @@ private:
     /// Prepare an image view to be used
     void PrepareImageView(ImageViewId image_view_id, bool is_modification, bool invalidate);
 
+    /// Deletes a written storage image over an unwritten sparse region so its next lookup
+    /// creates a backed one; true when it did.
+    bool ReplaceUnwrittenSparseStorageImage(ImageViewId image_view_id);
+
     /// Execute copies from one image to the other, even if they are incompatible
     void CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies);
 
