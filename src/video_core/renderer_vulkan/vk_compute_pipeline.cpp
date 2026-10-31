@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <unordered_set>
 #include <vector>
 
 #include <boost/container/small_vector.hpp>
@@ -18,6 +19,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/nx2.h"
 #include "video_core/shader_notify.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -219,6 +221,38 @@ bool ComputePipeline::Configure(Tegra::Engines::KeplerCompute& kepler_compute,
         add_image(desc, desc.is_written);
     }
     texture_cache.FillImageViews(std::span(views.data(), views.size()), true);
+
+    // EDEN_NX2_CS_IMG_LOG=1: once per (program, image), the storage images a compute program
+    // binds, with the native program key when there is one.
+    if (static const bool log_cs_images = std::getenv("EDEN_NX2_CS_IMG_LOG") != nullptr;
+        log_cs_images && !info.image_descriptors.empty()) {
+        static std::unordered_set<u64> logged;
+        size_t first{Shader::NumDescriptors(info.texture_buffer_descriptors) +
+                     Shader::NumDescriptors(info.image_buffer_descriptors) +
+                     Shader::NumDescriptors(info.texture_descriptors)};
+        const u64 program_base{kepler_compute.regs.code_loc.Address() + qmd.program_start};
+        for (const auto& desc : info.image_descriptors) {
+            for (u32 i = 0; i < desc.count && first < views.size(); ++i, ++first) {
+                const auto& view{texture_cache.GetImageView(views[first].id)};
+                if (!view.image_id) {
+                    continue;
+                }
+                const auto& image{texture_cache.GetImage(view.image_id)};
+                if (!logged.insert(program_base ^ (image.gpu_addr * 0x9e3779b97f4a7c15ULL)).second) {
+                    continue;
+                }
+                LOG_INFO(Render_Vulkan,
+                         "CS {:#x} key {:016x} image cb{}+{:#x} {}: image {:#x} {}x{}x{} layers {} "
+                         "levels {} format {} view format {} flags {:#x}",
+                         program_base, Tegra::Nx2ProgramKey(program_base), desc.cbuf_index,
+                         desc.cbuf_offset, desc.is_written ? "written" : "read", image.gpu_addr,
+                         image.info.size.width, image.info.size.height, image.info.size.depth,
+                         image.info.resources.layers, image.info.resources.levels,
+                         static_cast<u32>(image.info.format), static_cast<u32>(view.format),
+                         static_cast<u32>(image.flags));
+            }
+        }
+    }
 
     buffer_cache.UnbindComputeTextureBuffers();
     size_t index{};
