@@ -995,6 +995,28 @@ bool TextureCache<P>::DumpImage(ImageId image_id, std::string_view tag) {
         }
         std::fclose(file);
     }
+    // The guest's own data as well (linear, guest format), to check what was decoded.
+    if (gpu_memory != nullptr && image.guest_size_bytes <= (64_MiB)) {
+        std::vector<u8> swizzled(image.guest_size_bytes);
+        gpu_memory->ReadBlockUnsafe(image.gpu_addr, swizzled.data(), swizzled.size());
+        std::vector<u8> linear(image.unswizzled_size_bytes);
+        const auto guest_copies =
+            UnswizzleImage(*gpu_memory, image.gpu_addr, image.info, swizzled, linear);
+        if (std::FILE* file = std::fopen((base + ".guest.bin").c_str(), "wb")) {
+            std::fwrite(linear.data(), 1, linear.size(), file);
+            std::fclose(file);
+        }
+        if (std::FILE* file = std::fopen((base + ".guest.txt").c_str(), "w")) {
+            for (const auto& copy : guest_copies) {
+                fmt::print(file, "level {} offset {} size {} {}x{}x{} layers {} row {} rows {}\n",
+                           copy.image_subresource.base_level, copy.buffer_offset,
+                           copy.buffer_size, copy.image_extent.width, copy.image_extent.height,
+                           copy.image_extent.depth, copy.image_subresource.num_layers,
+                           copy.buffer_row_length, copy.buffer_image_height);
+            }
+            std::fclose(file);
+        }
+    }
     ++dumps;
     LOG_INFO(HW_GPU, "nx2 image dump: {}.bin ({} bytes)", base, total_bytes);
     return true;
