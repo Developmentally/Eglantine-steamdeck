@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <memory>
 #include <cstdio>
@@ -16,9 +17,11 @@
 
 #include <fmt/format.h>
 
+#include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 
 #include "common/assert.h"
+#include "common/string_util.h"
 #include "shader_recompiler/exception.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
@@ -425,11 +428,35 @@ void TraceWindowTarget(const Tegra::Engines::Maxwell3D& maxwell3d, Tegra::Memory
 }
 } // Anonymous namespace
 
+// EDEN_NX2_DRAW_STATS=1: every 600 frames, the vertex/pixel program pairs that drew the most
+// vertices (their addresses name the dumped programs: <key>-gfx-<address>.bin).
+void RasterizerVulkan::RecordDrawStats(u64 draws, u64 vertices, bool indirect) {
+    const auto& regs = maxwell3d->regs;
+    const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+    const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+    const u32 depth = (regs.depth_test_enable ? 0x100 : 0) | (regs.depth_write_enabled ? 0x200 : 0) |
+                      (indirect ? 0x400 : 0) | (static_cast<u32>(regs.depth_test_func) & 0xff);
+    auto& entry = draw_stats[(vs << 24) ^ ps ^ (u64{depth} << 52)];
+    entry.vs = vs;
+    entry.ps = ps;
+    entry.depth = depth;
+    entry.rt_count = regs.rt_control.count;
+    entry.zeta = regs.zeta_enable ? static_cast<u32>(regs.zeta.format) : 0;
+    entry.color0 = static_cast<u32>(regs.rt[0].format);
+    entry.draws += draws;
+    entry.vertices += vertices;
+}
+
 void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
                                  : maxwell3d->draw_manager.draw_state.vertex_buffer.count);
+    if (static const bool stats = std::getenv("EDEN_NX2_DRAW_STATS") != nullptr; stats) {
+        const u64 count = is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
+                                     : maxwell3d->draw_manager.draw_state.vertex_buffer.count;
+        RecordDrawStats(1, count * (std::max)(instance_count, 1U), false);
+    }
     // EDEN_NX2_CB24_TRACE: for draws whose vertex shader reads bank 24, show the inline
     // constant buffer upload target (CB_ADDRESS) and its first words.
     if (static const bool trace = std::getenv("EDEN_NX2_CB24_TRACE") != nullptr; trace) {
@@ -478,6 +505,245 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         if ((vs & trace_vs_mask) == (trace_vs & trace_vs_mask) && traced++ % 200 == 0 && traced < 1000) {
             Tegra::Engines::g_nx2_trace_draws_after_upscale = 1;
         }
+        // EDEN_NX2_TRACE_FRAME_AFTER=<frame>: once that vertex shader is seen in frame >= n,
+        // list every draw and clear of the following frame in order.
+        static const u32 trace_frame_after = [] {
+            const char* value = std::getenv("EDEN_NX2_TRACE_FRAME_AFTER");
+            return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        }();
+        if (trace_frame_after != 0 && frame_trace_state == 0 && frame_counter >= trace_frame_after &&
+            (vs & trace_vs_mask) == (trace_vs & trace_vs_mask)) {
+            frame_trace_state = 1;
+        }
+    }
+    if (frame_trace_state == 2) {
+        const auto& regs = maxwell3d->regs;
+        const auto& ds = maxwell3d->draw_manager.draw_state;
+        const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+        const u64 ps = (u64{regs.pipelines[5].reserved[0] & 0xff} << 32) | regs.pipelines[5].reserved[1];
+        LOG_INFO(HW_GPU,
+                 "frame trace: draw vs {:#x} ps {:#x} count {} inst {} | depth {}{}func {:#x} | rts {} rt0 "
+                 "{:#x} {}x{} fmt {:#x} | zeta {:#x} {}x{} fmt {:#x} en {} | vp {}x{} | cull {} mask {:#x}",
+                 vs, ps, is_indexed ? ds.index_buffer.count : ds.vertex_buffer.count, instance_count,
+                 regs.depth_test_enable ? "T" : "", regs.depth_write_enabled ? "W" : "",
+                 static_cast<u32>(regs.depth_test_func), regs.rt_control.count.Value(),
+                 regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
+                 static_cast<u32>(regs.rt[0].format), regs.zeta.Address(), regs.zeta_size.width,
+                 regs.zeta_size.height, static_cast<u32>(regs.zeta.format), regs.zeta_enable,
+                 regs.viewport_transform[0].scale_x * 2, regs.viewport_transform[0].scale_y * -2,
+                 regs.gl_cull_test_enabled, regs.color_mask[0].raw);
+        const auto& sc = regs.scissor_test[0];
+        LOG_INFO(HW_GPU,
+                 "frame trace:   render_enable mode {} ovr {} exec {} | scissor en {} x {}-{} y {}-{} | "
+                 "rasterize {} | depth_bounds en {} {} {} | user_clip {:#x} | vp0 z {} {} near {} far {} | "
+                 "stencil {} | clip_ctl {:#x} | ib {:#x} first {} base_v {} | va0 {:#x} | alpha_test {} "
+                 "func {:#x} ref {} | aa {} a2c {} | topology {:#x}",
+                 static_cast<u32>(regs.render_enable.mode), static_cast<u32>(regs.render_enable_override),
+                 maxwell3d->ShouldExecute(), sc.enable, sc.min_x.Value(), sc.max_x.Value(),
+                 sc.min_y.Value(), sc.max_y.Value(), regs.rasterize_enable, regs.depth_bounds_enable,
+                 regs.depth_bounds[0], regs.depth_bounds[1], regs.user_clip_enable.raw,
+                 regs.viewport_transform[0].scale_z, regs.viewport_transform[0].translate_z,
+                 regs.viewports[0].depth_range_near, regs.viewports[0].depth_range_far,
+                 regs.stencil_enable, static_cast<u32>(regs.viewport_clip_control.geometry_clip.Value()),
+                 ds.index_buffer.StartAddress(),
+                 ds.index_buffer.first, regs.global_base_vertex_index,
+                 regs.vertex_streams[0].Address(), regs.alpha_test_enabled,
+                 static_cast<u32>(regs.alpha_test_func), regs.alpha_test_ref, regs.anti_alias_enable,
+                 regs.anti_alias_alpha_control.alpha_to_coverage.Value(),
+                 static_cast<u32>(ds.topology));
+        // EDEN_NX2_TRACE_REG_DIFF_VS=<hex low20>: when the vertex program changes to or from that
+        // one, list every 3D register that differs from the previous draw (finds state the named
+        // fields above do not cover).
+        static const u32 reg_diff_vs = [] {
+            const char* value = std::getenv("EDEN_NX2_TRACE_REG_DIFF_VS");
+            return value ? static_cast<u32>(std::strtoul(value, nullptr, 16)) : 0U;
+        }();
+        if (reg_diff_vs != 0) {
+            static std::array<u32, Maxwell::NUM_REGS> previous{};
+            static bool previous_valid = false;
+            static u32 previous_vs = 0;
+            static u32 diffs_logged = 0;
+            const u32 vs_low = static_cast<u32>(vs & 0xfffff);
+            if (previous_valid && diffs_logged < 12 &&
+                static_cast<u32>(regs.viewport_transform[0].scale_x * 2) == 1920 &&
+                ((vs_low == reg_diff_vs) != (previous_vs == reg_diff_vs))) {
+                ++diffs_logged;
+                std::string diff;
+                for (u32 i = 0; i < Maxwell::NUM_REGS; ++i) {
+                    if (regs.reg_array[i] != previous[i]) {
+                        diff += fmt::format(" {:#x}:{:#x}->{:#x}", i * 4, previous[i], regs.reg_array[i]);
+                    }
+                }
+                LOG_INFO(HW_GPU, "frame trace:   reg diff {:#x} -> {:#x}:{}", previous_vs, vs_low, diff);
+            }
+            std::memcpy(previous.data(), regs.reg_array.data(), sizeof(previous));
+            previous_valid = true;
+            previous_vs = vs_low;
+        }
+    }
+    // With EDEN_NX2_VS_TEX_TRACE: once the traced image is known, summarise its guest memory as
+    // half floats (every 600 frames, to see whether it changes and whether the CPU writes it).
+    if (const u64 traced = Tegra::g_nx2_trace_dst_start.load(std::memory_order_relaxed);
+        traced != 0 && traced_image_frame + 600 <= frame_counter) {
+        traced_image_frame = frame_counter;
+        const u64 size = (std::min)(Tegra::g_nx2_trace_dst_size.load(), u64{0x10000});
+        std::vector<u16> halfs(size / 2);
+        gpu_memory->ReadBlock(traced, halfs.data(), size);
+        u32 zeros = 0, nans = 0, negatives = 0, big = 0;
+        float min = 1e30f, max = -1e30f;
+        for (const u16 h : halfs) {
+            if (h == 0) {
+                ++zeros;
+                continue;
+            }
+            const u32 exp = (h >> 10) & 0x1f;
+            if (exp == 0x1f) {
+                ++nans;
+                continue;
+            }
+            const float sign = (h & 0x8000) ? -1.0f : 1.0f;
+            const float v = exp == 0 ? sign * std::ldexp(static_cast<float>(h & 0x3ff), -24)
+                                     : sign * std::ldexp(static_cast<float>((h & 0x3ff) | 0x400),
+                                                         static_cast<int>(exp) - 25);
+            min = (std::min)(min, v);
+            max = (std::max)(max, v);
+            negatives += v < 0;
+            big += std::abs(v) > 5.0f;
+        }
+        LOG_INFO(HW_GPU,
+                 "traced image {:#x} guest memory: {} halfs, {} zero, {} nan/inf, {} negative, {} |v|>5, "
+                 "min {} max {}, first {:#06x} {:#06x} {:#06x} {:#06x} {:#06x} {:#06x} {:#06x} {:#06x}",
+                 traced, halfs.size(), zeros, nans, negatives, big, min, max, halfs[0], halfs[1],
+                 halfs[2], halfs[3], halfs[4], halfs[5], halfs[6], halfs[7]);
+    }
+    // EDEN_NX2_DUMP_VS=<hex low 20 bits>[,<hex>...]: write the index buffer, every enabled vertex
+    // stream (from base_vertex) and the VS/PS constant buffers of the first 6 draws of each listed
+    // vertex program to EDEN_NX2_DUMP_DIR (default /tmp) as
+    // vsdump-<vs>-<n>-{ib,vb<b>,cb<i>,pscb<i>}.bin plus a .txt summary.
+    static const std::vector<u64> dump_vs = [] {
+        std::vector<u64> keys;
+        if (const char* value = std::getenv("EDEN_NX2_DUMP_VS")) {
+            std::vector<std::string> parts;
+            Common::SplitString(value, ',', parts);
+            for (const auto& part : parts) {
+                keys.push_back(std::strtoull(part.c_str(), nullptr, 16));
+            }
+        }
+        return keys;
+    }();
+    static const u32 dump_after = [] {
+        const char* value = std::getenv("EDEN_NX2_DUMP_AFTER");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+    // EDEN_NX2_DUMP_VP=<width>: only draws whose viewport is that wide (same low bits, other pass).
+    static const u32 dump_viewport = [] {
+        const char* value = std::getenv("EDEN_NX2_DUMP_VP");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0u;
+    }();
+    if (!dump_vs.empty() && frame_counter >= dump_after) {
+        const auto& regs = maxwell3d->regs;
+        const u64 vs_low = regs.pipelines[1].reserved[1] & 0xfffff;
+        if (std::find(dump_vs.begin(), dump_vs.end(), vs_low) != dump_vs.end() &&
+            vs_dump_counts[vs_low] < 6 &&
+            (dump_viewport == 0 ||
+             static_cast<u32>(regs.viewport_transform[0].scale_x * 2) == dump_viewport)) {
+            const u32 n = vs_dump_counts[vs_low]++;
+            const char* dir = std::getenv("EDEN_NX2_DUMP_DIR");
+            const std::string base =
+                fmt::format("{}/vsdump-{:05x}-{}", dir ? dir : "/tmp", vs_low, n);
+            const auto& ds = maxwell3d->draw_manager.draw_state;
+            const auto dump = [&](const std::string& name, GPUVAddr addr, u64 size) {
+                std::vector<u8> data(size);
+                gpu_memory->ReadBlock(addr, data.data(), size);
+                std::ofstream out(base + "-" + name + ".bin", std::ios::binary);
+                out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(size));
+            };
+            std::ofstream txt(base + ".txt");
+            const u32 index_size = is_indexed ? static_cast<u32>(regs.index_buffer.FormatSizeInBytes()) : 0;
+            const u32 count = is_indexed ? ds.index_buffer.count : ds.vertex_buffer.count;
+            if (is_indexed) {
+                dump("ib", regs.index_buffer.StartAddress() + u64{ds.index_buffer.first} * index_size,
+                     u64{count} * index_size);
+            }
+            u32 max_index = 0;
+            if (is_indexed) {
+                std::vector<u8> idx(u64{count} * index_size);
+                gpu_memory->ReadBlock(regs.index_buffer.StartAddress() + u64{ds.index_buffer.first} * index_size,
+                                      idx.data(), idx.size());
+                for (u32 i = 0; i < count; ++i) {
+                    u32 v = 0;
+                    std::memcpy(&v, idx.data() + u64{i} * index_size, index_size);
+                    max_index = (std::max)(max_index, v);
+                }
+            } else {
+                max_index = ds.vertex_buffer.first + count - 1;
+            }
+            const u32 base_vertex = is_indexed ? ds.base_index : 0;
+            const u64 vertex_count = u64{max_index} + 1;
+            txt << fmt::format("vs {:#x} ps {:#x} indexed {} index_size {} first {} count {} base_vertex {} "
+                               "max_index {} ib {:#x}\n",
+                               regs.pipelines[1].reserved[1], regs.pipelines[5].reserved[1], is_indexed,
+                               index_size, ds.index_buffer.first, count, base_vertex, max_index,
+                               regs.index_buffer.StartAddress());
+            u32 streams_used = 0;
+            for (u32 i = 0; i < 32; ++i) {
+                const auto& attr = regs.vertex_attrib_format[i];
+                if (attr.constant || !regs.vertex_streams[attr.buffer].enable) {
+                    continue;
+                }
+                streams_used |= 1u << attr.buffer;
+                txt << fmt::format("attrib[{}] buffer {} offset {:#x} size {:#x} type {}\n", i,
+                                   attr.buffer.Value(), attr.offset.Value(),
+                                   static_cast<u32>(attr.size.Value()),
+                                   static_cast<u32>(attr.type.Value()));
+            }
+            u64 vb_size = 0;
+            for (u32 b = 0; b < 32; ++b) {
+                if (((streams_used >> b) & 1) == 0) {
+                    continue;
+                }
+                const auto& stream = regs.vertex_streams[b];
+                const u64 stride = stream.stride.Value();
+                const u64 size = vertex_count * stride;
+                dump(fmt::format("vb{}", b), stream.Address() + u64{base_vertex} * stride, size);
+                vb_size += size;
+                txt << fmt::format("stream{} {:#x} stride {} dumped from vertex {} ({} vertices)\n", b,
+                                   stream.Address(), stride, base_vertex, vertex_count);
+            }
+            for (const u32 stage : {0u, 4u}) {
+                const auto& cbufs = maxwell3d->state.shader_stages[stage].const_buffers;
+                for (u32 i = 0; i < cbufs.size(); ++i) {
+                    if (!cbufs[i].enabled || cbufs[i].size == 0) {
+                        continue;
+                    }
+                    const u64 size = (std::min)(u64{cbufs[i].size}, u64{0x10000});
+                    dump(fmt::format("{}cb{}", stage == 0 ? "" : "ps", i), cbufs[i].address, size);
+                    txt << fmt::format("{}cbuf{} {:#x} size {:#x}\n", stage == 0 ? "" : "ps ", i,
+                                       cbufs[i].address, cbufs[i].size);
+                }
+            }
+            txt << fmt::format("viewport scale {} {} {} translate {} {} {} | depth {}{} func {:#x}\n",
+                               regs.viewport_transform[0].scale_x, regs.viewport_transform[0].scale_y,
+                               regs.viewport_transform[0].scale_z, regs.viewport_transform[0].translate_x,
+                               regs.viewport_transform[0].translate_y, regs.viewport_transform[0].translate_z,
+                               regs.depth_test_enable ? "T" : "", regs.depth_write_enabled ? "W" : "",
+                               static_cast<u32>(regs.depth_test_func));
+            LOG_INFO(HW_GPU, "vs dump {} written ({} indices, vb {:#x} bytes)", base, count, vb_size);
+        }
+    }
+    // EDEN_NX2_TRACE_COUNT=<n>: describe the first draws of exactly n indices/vertices (to compare
+    // the passes that draw one mesh).
+    static const u64 trace_count = [] {
+        const char* value = std::getenv("EDEN_NX2_TRACE_COUNT");
+        return value ? std::strtoull(value, nullptr, 10) : 0ULL;
+    }();
+    if (trace_count != 0) {
+        const u64 count = is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
+                                     : maxwell3d->draw_manager.draw_state.vertex_buffer.count;
+        static u32 traced{};
+        if (count == trace_count && traced++ < 60) {
+            Tegra::Engines::g_nx2_trace_draws_after_upscale = 1;
+        }
     }
     if (Tegra::Engines::g_nx2_trace_draws_after_upscale > 0) {
         --Tegra::Engines::g_nx2_trace_draws_after_upscale;
@@ -516,6 +782,33 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
         LOG_INFO(HW_GPU, "  topology {:#x} index format {} provoking {} draw mode {}",
                  static_cast<u32>(regs.draw.topology.Value()), static_cast<u32>(regs.index_buffer.format),
                  static_cast<u32>(regs.provoking_vertex), static_cast<u32>(regs.draw.instance_id.Value()));
+        {
+            const auto& ds = maxwell3d->draw_manager.draw_state;
+            const auto& vp = regs.viewport_transform[0];
+            const auto& vs_cbufs = maxwell3d->state.shader_stages[0].const_buffers;
+            LOG_INFO(HW_GPU,
+                     "  index buffer {:#x} first {} count {} base_vertex {} | vertex first {} count {} | "
+                     "instances {} base_instance {}",
+                     regs.index_buffer.StartAddress(), ds.index_buffer.first, ds.index_buffer.count,
+                     ds.base_index, ds.vertex_buffer.first, ds.vertex_buffer.count,
+                     ds.instance_count, ds.base_instance);
+            LOG_INFO(HW_GPU,
+                     "  depth test {} write {} func {:#x} | polygon offset fill {} point {} line {} "
+                     "units {} factor {} clamp {} | cull {} face {} front {} | viewport scale {} {} {} "
+                     "translate {} {} {} | depth_mode {} clip {:#x}",
+                     regs.depth_test_enable, regs.depth_write_enabled,
+                     static_cast<u32>(regs.depth_test_func), regs.polygon_offset_fill_enable,
+                     regs.polygon_offset_point_enable, regs.polygon_offset_line_enable,
+                     regs.depth_bias, regs.slope_scale_depth_bias, regs.depth_bias_clamp,
+                     regs.gl_cull_test_enabled, static_cast<u32>(regs.gl_cull_face),
+                     static_cast<u32>(regs.gl_front_face), vp.scale_x, vp.scale_y, vp.scale_z,
+                     vp.translate_x, vp.translate_y, vp.translate_z,
+                     static_cast<u32>(regs.depth_mode), static_cast<u32>(regs.viewport_clip_control.geometry_clip.Value()));
+            LOG_INFO(HW_GPU, "  vs cbuf3 {:#x}/{:#x} cbuf5 {:#x}/{:#x} cbuf2 {:#x} | zeta {:#x} {}x{} fmt {:#x} | host depth bias enabled {}",
+                     vs_cbufs[3].address, vs_cbufs[3].size, vs_cbufs[5].address, vs_cbufs[5].size,
+                     vs_cbufs[2].address, regs.zeta.Address(), regs.zeta_size.width,
+                     regs.zeta_size.height, static_cast<u32>(regs.zeta.format), last_depth_bias_enable);
+        }
         const auto& bt = regs.blend_per_target[0];
         LOG_INFO(HW_GPU, "  blend enable {} per-target {} global op {} src {:#x} dst {:#x} | rt0 op {} src {:#x} dst {:#x} alpha {:#x}/{:#x} mask {:#x}",
                  regs.blend.enable[0], regs.blend_per_target_enabled,
@@ -590,6 +883,9 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
 void RasterizerVulkan::DrawIndirect() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Draw};
     const auto& params = maxwell3d->draw_manager.indirect_state;
+    if (static const bool stats = std::getenv("EDEN_NX2_DRAW_STATS") != nullptr; stats) {
+        RecordDrawStats(params.max_draw_counts, 0, true);
+    }
     buffer_cache.SetDrawIndirect(&params);
     PrepareDraw(params.is_indexed, [this, &params] {
         const auto indirect_buffer = buffer_cache.GetDrawIndirectBuffer();
@@ -701,6 +997,16 @@ void RasterizerVulkan::Clear(u32 layer_count) {
                  regs.rt[0].Address(), regs.rt[0].width, regs.rt[0].height,
                  static_cast<u32>(regs.rt[0].format), regs.clear_surface.raw, regs.clear_color[0],
                  regs.clear_color[1], regs.clear_color[2], regs.clear_color[3]);
+    }
+    if (frame_trace_state == 2) {
+        const auto& regs = maxwell3d->regs;
+        LOG_INFO(HW_GPU,
+                 "frame trace: clear surface {:#x} depth {} | rt0 {:#x} {}x{} fmt {:#x} | zeta {:#x} {}x{} "
+                 "fmt {:#x} en {} | scissor {}",
+                 regs.clear_surface.raw, regs.clear_depth, regs.rt[0].Address(), regs.rt[0].width,
+                 regs.rt[0].height, static_cast<u32>(regs.rt[0].format), regs.zeta.Address(),
+                 regs.zeta_size.width, regs.zeta_size.height, static_cast<u32>(regs.zeta.format),
+                 regs.zeta_enable, regs.clear_control.use_scissor.Value());
     }
     TraceWindowTarget(*maxwell3d, *gpu_memory, "clear", layer_count);
     FlushWork();
@@ -889,6 +1195,13 @@ void RasterizerVulkan::Clear(u32 layer_count) {
 
 void RasterizerVulkan::DispatchCompute() {
     VideoCommon::Nx2Profile::Scope profile_scope{VideoCommon::Nx2Profile::Zone::Compute};
+    if (frame_trace_state == 2) {
+        const auto& qmd = kepler_compute->launch_description;
+        LOG_INFO(HW_GPU, "frame trace: dispatch {}x{}x{} block {}x{}x{} program {:#x}",
+                 qmd.grid_dim_x.Value(), qmd.grid_dim_y.Value(), qmd.grid_dim_z.Value(),
+                 qmd.block_dim_x.Value(), qmd.block_dim_y.Value(), qmd.block_dim_z.Value(),
+                 qmd.program_start);
+    }
     FlushWork();
     gpu_memory->FlushCaching();
 
@@ -1212,6 +1525,36 @@ void RasterizerVulkan::FlushCommands() {
 
 void RasterizerVulkan::TickFrame() {
     draw_counter = 0;
+    ++frame_counter;
+    if (frame_trace_state == 2) {
+        LOG_INFO(HW_GPU, "frame trace: end of frame {}", frame_counter);
+        frame_trace_state = 3;
+        Tegra::g_nx2_frame_trace_active.store(false, std::memory_order_relaxed);
+    } else if (frame_trace_state == 1) {
+        LOG_INFO(HW_GPU, "frame trace: start of frame {}", frame_counter);
+        frame_trace_state = 2;
+        Tegra::g_nx2_frame_trace_active.store(true, std::memory_order_relaxed);
+    }
+    if (!draw_stats.empty() && ++draw_stats_frames == 600) {
+        std::vector<const DrawStats*> top;
+        for (const auto& [key, entry] : draw_stats) {
+            if (entry.draws >= 300 || (entry.depth & 0x400)) {
+                top.push_back(&entry);
+            }
+        }
+        std::ranges::sort(top, std::greater{}, &DrawStats::vertices);
+        for (const DrawStats* entry : top) {
+            LOG_INFO(HW_GPU,
+                     "Draw stats: vs={:#x} ps={:#x} depth {}{}func {:#x} zeta {:#x} rts {} rt0 {:#x}{}: "
+                     "{} draws, {} vertices in 600 frames",
+                     entry->vs, entry->ps, (entry->depth & 0x100) ? "test " : "",
+                     (entry->depth & 0x200) ? "write " : "", entry->depth & 0xff, entry->zeta,
+                     (entry->depth & 0x400) ? " indirect" : "",
+                     entry->rt_count, entry->color0, entry->draws, entry->vertices);
+        }
+        draw_stats.clear();
+        draw_stats_frames = 0;
+    }
     guest_descriptor_queue.TickFrame();
     compute_pass_descriptor_queue.TickFrame();
     descriptor_buffer_ring.TickFrame();
@@ -1430,6 +1773,21 @@ void RasterizerVulkan::UpdateDynamicStates() {
     if (topology_changed) {
         flags[Dirty::DepthBiasEnable] = true;
         flags[Dirty::PrimitiveRestartEnable] = true;
+    }
+
+    // EDEN_NX2_BIAS_VS=<hex low 20 bits> with EDEN_NX2_BIAS_UNITS=<n>: push the draws of that
+    // vertex program back by n depth units (diagnostic: how much nearer is its geometry?).
+    static const u64 bias_vs = [] {
+        const char* value = std::getenv("EDEN_NX2_BIAS_VS");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : ~0ULL;
+    }();
+    if (bias_vs != ~0ULL) {
+        const bool match = (regs.pipelines[1].reserved[1] & 0xfffff) == bias_vs;
+        if (match != bias_vs_active) {
+            bias_vs_active = match;
+            flags[Dirty::DepthBias] = true;
+            flags[Dirty::DepthBiasEnable] = true;
+        }
     }
 
     UpdateViewportsState(regs);
@@ -1671,8 +2029,24 @@ void RasterizerVulkan::UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
         }
     }
 
+    float factor_override = regs.slope_scale_depth_bias;
+    if (bias_vs_active) {
+        static const float bias_units = [] {
+            const char* value = std::getenv("EDEN_NX2_BIAS_UNITS");
+            return value != nullptr ? std::strtof(value, nullptr) : 4.0f;
+        }();
+        units = bias_units;
+        factor_override = 0.0f;
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG_INFO(HW_GPU, "depth bias override active: {} units on vs {:#x}", units,
+                     regs.pipelines[1].reserved[1]);
+        }
+    }
+
     scheduler.Record([constant = units, clamp = regs.depth_bias_clamp,
-                      factor = regs.slope_scale_depth_bias, this](vk::CommandBuffer cmdbuf) {
+                      factor = factor_override, this](vk::CommandBuffer cmdbuf) {
         if (device.IsExtDepthBiasControlSupported()) {
             static VkDepthBiasRepresentationInfoEXT bias_info{
                 .sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT,
@@ -1995,7 +2369,12 @@ void RasterizerVulkan::UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& re
         regs.polygon_offset_fill_enable,
     };
     const u32 topology_index = u32(maxwell3d->draw_manager.draw_state.topology);
-    const u32 enable = enabled_lut[POLYGON_OFFSET_ENABLE_LUT[topology_index]];
+    // EDEN_NX2_NO_DEPTH_BIAS=1: never enable polygon offset (diagnostic).
+    static const bool no_depth_bias = std::getenv("EDEN_NX2_NO_DEPTH_BIAS") != nullptr;
+    const u32 enable = bias_vs_active ? 1
+                       : no_depth_bias ? 0
+                                       : enabled_lut[POLYGON_OFFSET_ENABLE_LUT[topology_index]];
+    last_depth_bias_enable = enable != 0;
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthBiasEnableEXT(enable != 0); });
 }
 
@@ -2068,7 +2447,7 @@ void RasterizerVulkan::UpdateDepthCompareOp(Tegra::Engines::Maxwell3D::Regs& reg
         return;
     }
     scheduler.Record([func = regs.depth_test_func](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::ComparisonOp(func));
+        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::DepthComparisonOp(func));
     });
 }
 

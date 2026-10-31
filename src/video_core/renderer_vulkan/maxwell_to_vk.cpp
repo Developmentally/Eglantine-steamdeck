@@ -4,6 +4,8 @@
 // SPDX-FileCopyrightText: Copyright 2019 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <string_view>
 #include <iterator>
 
 #include "common/assert.h"
@@ -637,6 +639,21 @@ VkCompareOp ComparisonOp(Maxwell::ComparisonOp comparison) {
     }
     UNIMPLEMENTED_MSG("Unimplemented comparison op={}", comparison);
     return {};
+}
+
+VkCompareOp DepthComparisonOp(Maxwell::ComparisonOp comparison) {
+    // EDEN_NX2_DEPTH_EQUAL=lequal|gequal|always: what an EQUAL depth test becomes. Diagnostic for
+    // depth prepass + EQUAL main pass titles whose two passes disagree on a triangle's depth.
+    static const VkCompareOp equal = [] {
+        const char* value = std::getenv("EDEN_NX2_DEPTH_EQUAL");
+        const std::string_view mode = value != nullptr ? value : "";
+        if (mode == "lequal") return VK_COMPARE_OP_LESS_OR_EQUAL;
+        if (mode == "gequal") return VK_COMPARE_OP_GREATER_OR_EQUAL;
+        if (mode == "always") return VK_COMPARE_OP_ALWAYS;
+        return VK_COMPARE_OP_EQUAL;
+    }();
+    const VkCompareOp op = ComparisonOp(comparison);
+    return op == VK_COMPARE_OP_EQUAL ? equal : op;
 }
 
 VkIndexType IndexFormat(Maxwell::IndexFormat index_format) {

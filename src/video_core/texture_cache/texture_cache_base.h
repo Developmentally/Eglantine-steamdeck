@@ -208,6 +208,11 @@ public:
     /// Get the imageview from the graphics descriptor table in the specified index
     [[nodiscard]] ImageView& GetImageView(u32 index) noexcept;
 
+    /// Return a constant reference to the given image id
+    [[nodiscard]] const Image& GetImage(ImageId id) const noexcept {
+        return slot_images[id];
+    }
+
     /// Mark an image as modified from the GPU
     void MarkModification(ImageId id) noexcept;
 

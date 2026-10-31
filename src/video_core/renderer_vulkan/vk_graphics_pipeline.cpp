@@ -29,6 +29,7 @@
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "common/settings.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 
 #if defined(__clang__) && defined(NDEBUG)
@@ -463,6 +464,47 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         Profile::Scope scope{Profile::Zone::FillImageViews};
         texture_cache.FillImageViews(std::span(views.data(), views.size()), false,
                                      Spec::has_images);
+    }
+    // EDEN_NX2_VS_TEX_LOG=1: once per image, what the vertex stage samples (and which program).
+    if (static const bool log_vs_textures = std::getenv("EDEN_NX2_VS_TEX_LOG") != nullptr;
+        log_vs_textures && Spec::enabled_stages[0]) {
+        static std::unordered_set<u32> logged;
+        const Shader::Info& vs_info{stage_infos[0]};
+        size_t first{Shader::NumDescriptors(vs_info.texture_buffer_descriptors)};
+        if constexpr (Spec::has_image_buffers) {
+            first += Shader::NumDescriptors(vs_info.image_buffer_descriptors);
+        }
+        const size_t count{Shader::NumDescriptors(vs_info.texture_descriptors)};
+        static const bool zero_vs_textures = std::getenv("EDEN_NX2_VS_TEX_ZERO") != nullptr;
+        for (size_t i = first; i < first + count && i < views.size(); ++i) {
+            const auto& view{texture_cache.GetImageView(views[i].id)};
+            if (zero_vs_textures) {
+                views[i].id = VideoCommon::NULL_IMAGE_VIEW_ID;
+            }
+            if (!view.image_id || !logged.insert(view.image_id.index).second) {
+                continue;
+            }
+            const auto& image{texture_cache.GetImage(view.image_id)};
+            const u64 vs_address{(u64{regs.pipelines[1].reserved[0] & 0xff} << 32) |
+                                 regs.pipelines[1].reserved[1]};
+            LOG_INFO(Render_Vulkan,
+                     "VS {:#x} samples image {:#x}: {}x{}x{} levels {} format {} flags {:#x}",
+                     vs_address, image.gpu_addr, image.info.size.width, image.info.size.height,
+                     image.info.size.depth, image.info.resources.levels,
+                     static_cast<u32>(image.info.format), static_cast<u32>(image.flags));
+            // EDEN_NX2_VS_TEX_TRACE=<hex>: trace the writers (DMA, 2D, storage, uploads) of the
+            // first image sampled by the VS whose address ends in <hex> (low 20 bits).
+            static const u64 trace_vs = [] {
+                const char* value = std::getenv("EDEN_NX2_VS_TEX_TRACE");
+                return value != nullptr ? std::strtoull(value, nullptr, 16) : ~0ULL;
+            }();
+            if ((vs_address & 0xfffff) == trace_vs && Tegra::g_nx2_trace_dst_start.load() == 0) {
+                Tegra::g_nx2_trace_dst_start.store(image.gpu_addr);
+                Tegra::g_nx2_trace_dst_size.store(image.guest_size_bytes);
+                LOG_INFO(Render_Vulkan, "tracing writers of image {:#x} size {:#x}",
+                         image.gpu_addr, image.guest_size_bytes);
+            }
+        }
     }
 
     VideoCommon::ImageViewInOut* texture_buffer_it{views.data()};
@@ -938,7 +980,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         .depthTestEnable = dynamic.depth_test_enable,
         .depthWriteEnable = dynamic.depth_write_enable,
         .depthCompareOp = dynamic.depth_test_enable
-                              ? MaxwellToVK::ComparisonOp(dynamic.DepthTestFunc())
+                              ? MaxwellToVK::DepthComparisonOp(dynamic.DepthTestFunc())
                               : VK_COMPARE_OP_ALWAYS,
         .depthBoundsTestEnable = dynamic.depth_bounds_enable && device.IsDepthBoundsSupported(),
         .stencilTestEnable = dynamic.stencil_enable,

@@ -50,6 +50,7 @@ namespace {
 namespace fs = std::filesystem;
 bool verbose = false;
 bool dump_ir = false;
+fs::path spirv_output;
 using Shader::Ampere::Instruction;
 using Shader::Ampere::ProgramDumpInfo;
 
@@ -328,6 +329,10 @@ Outcome Check(const fs::path& path, bool lowering_only) {
         if (spirv.empty()) {
             throw Shader::RuntimeError("empty SPIR-V module");
         }
+        if (!spirv_output.empty()) {
+            std::ofstream out(spirv_output, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(spirv.data()), spirv.size() * sizeof(u32));
+        }
         outcome.phase.clear();
     } catch (const Shader::Exception& error) {
         outcome.message = outcome.key = StripInstructionWords(error.what());
@@ -361,10 +366,11 @@ int main(int argc, char** argv) {
         else if (arg == "-v") verbose = true;
         else if (arg == "-d") dump_ir = verbose = true;
         else if (arg == "-b" && i + 1 < argc) baseline_path = argv[++i];
+        else if (arg == "-s" && i + 1 < argc) spirv_output = argv[++i];
         else inputs.emplace_back(arg);
     }
     if (inputs.empty()) {
-        std::fputs("usage: nx2-shader-check [-l] [-q] [-v] [-b baseline] <file.bin | directory>...\n", stderr);
+        std::fputs("usage: nx2-shader-check [-l] [-q] [-v] [-d] [-s out.spv] [-b baseline] <file.bin | directory>...\n", stderr);
         return 2;
     }
     std::vector<fs::path> files;

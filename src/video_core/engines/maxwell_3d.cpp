@@ -21,6 +21,7 @@
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/textures/texture.h"
@@ -1127,6 +1128,15 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
         } else if (ram + i < native_data_ram.size()) {
             native_data_ram[ram + i] = word;
         }
+    }
+    if (Tegra::g_nx2_frame_trace_active.load(std::memory_order_relaxed)) {
+        std::array<u32, 8> head{};
+        for (u32 i = 0; i < std::min<u32>(words, 8); ++i) {
+            head[i] = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+        }
+        LOG_INFO(HW_GPU, "frame trace: mme dma read{} macro {:#x} source {:#x} count {} words {:08x}",
+                 method == 0x158 ? " fifoed" : "", fs.executing_macro, source, words,
+                 fmt::join(head, ","));
     }
 }
 

@@ -37,6 +37,7 @@
 #include "common/bit_field.h"
 #include "common/logging.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/nx2.h"
 #include "video_core/nx2_profile.h"
 
 namespace Tegra {
@@ -1440,7 +1441,8 @@ void MacroEngine::Execute(Core::System& system, Engines::Maxwell3D& maxwell3d, u
                         }
                     }
                     static u32 dma_logs{};
-                    if (dma_logs < 400) {
+                    if (dma_logs < 400 ||
+                        Tegra::g_nx2_frame_trace_active.load(std::memory_order_relaxed)) {
                         ++dma_logs;
                         std::array<u32, 8> words{};
                         for (u32 i = 0; i < std::min<u32>(value, 8); ++i) words[i] = memory.Read<u32>(source + u64{i} * 4);

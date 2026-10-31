@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <unordered_map>
 
 #include <boost/container/static_vector.hpp>
 
@@ -86,6 +87,7 @@ public:
                               StateTracker& state_tracker_, Scheduler& scheduler_);
     ~RasterizerVulkan() override;
 
+    void RecordDrawStats(u64 draws, u64 vertices, bool indirect);
     void Draw(bool is_indexed, u32 instance_count) override;
     void DrawIndirect() override;
     void DrawTexture() override;
@@ -230,6 +232,24 @@ private:
     boost::container::static_vector<VkSampler, MAX_TEXTURES> sampler_handles;
 
     u32 draw_counter = 0;
+    struct DrawStats {
+        u64 vs{};
+        u64 ps{};
+        u64 draws{};
+        u64 vertices{};
+        u32 depth{};
+        u32 rt_count{};
+        u32 zeta{};
+        u32 color0{};
+    };
+    std::unordered_map<u64, DrawStats> draw_stats; ///< EDEN_NX2_DRAW_STATS
+    u32 draw_stats_frames = 0;
+    bool last_depth_bias_enable = false;
+    u32 frame_counter = 0;
+    u32 frame_trace_state = 0;
+    u32 traced_image_frame = 0;
+    bool bias_vs_active = false;
+    std::unordered_map<u64, u32> vs_dump_counts;
 };
 
 } // namespace Vulkan

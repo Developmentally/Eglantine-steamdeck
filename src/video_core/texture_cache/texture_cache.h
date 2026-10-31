@@ -3080,12 +3080,30 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             TrackImage(image, image_id);
         }
     } else {
+        if (True(image.flags & ImageFlagBits::CpuModified) &&
+            Tegra::Nx2TracedDestination(image.gpu_addr, image.guest_size_bytes)) {
+            static u32 traced{};
+            if (traced++ < 40) {
+                LOG_INFO(HW_GPU, "nx2 CPU upload into image in traced range: {:#x} {}x{} format {}",
+                         image.gpu_addr, image.info.size.width, image.info.size.height,
+                         static_cast<u32>(image.info.format));
+            }
+        }
         RefreshContents(image, image_id);
         if (!image.aliased_images.empty()) {
             SynchronizeAliases(image_id);
         }
     }
     if (is_modification) {
+        if (Tegra::Nx2TracedDestination(image.gpu_addr, image.guest_size_bytes)) {
+            static u32 traced{};
+            if (traced++ < 40) {
+                LOG_INFO(HW_GPU, "nx2 GPU write into image in traced range: {:#x} {}x{}x{} layers {} format {} flags {:#x}",
+                         image.gpu_addr, image.info.size.width, image.info.size.height,
+                         image.info.size.depth, image.info.resources.layers,
+                         static_cast<u32>(image.info.format), static_cast<u32>(image.flags));
+            }
+        }
         if constexpr (requires { &Image::BindLayers; }) {
             if (True(image.flags & ImageFlagBits::SparseLayers)) {
                 std::vector<u32> layers(static_cast<size_t>(image.info.resources.layers));

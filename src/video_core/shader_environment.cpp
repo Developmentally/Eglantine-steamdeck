@@ -366,6 +366,27 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
         reject_list.find(fmt::format(",{:x},", program_base)) != std::string::npos) {
         throw Shader::RuntimeError("Native shader at {:#x} rejected by EDEN_NX2_REJECT", program_base);
     }
+    // EDEN_NX2_REJECT_KEY=<key hex prefix>,...: the same by program key (stable across runs).
+    if (static const std::vector<std::string> reject_keys = [] {
+            std::vector<std::string> keys;
+            if (const char* text = std::getenv("EDEN_NX2_REJECT_KEY")) {
+                for (std::string_view rest{text}; !rest.empty();) {
+                    const size_t comma = rest.find(',');
+                    keys.emplace_back(rest.substr(0, comma));
+                    rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+                }
+            }
+            return keys;
+        }();
+        !reject_keys.empty()) {
+        const std::string key = fmt::format("{:016x}", Shader::Ampere::NativeProgramKey(native));
+        for (const std::string& prefix : reject_keys) {
+            if (!prefix.empty() && key.starts_with(prefix)) {
+                throw Shader::RuntimeError("Native shader {} at {:#x} rejected by EDEN_NX2_REJECT_KEY",
+                                           key, program_base);
+            }
+        }
+    }
     // EDEN_NX2_SHADER_DUMP=<dir>: keep every captured native program (named by its key) so the
     // lowering can be tested offline against all of a game's shaders.
     if (static const char* const dump_directory = std::getenv("EDEN_NX2_SHADER_DUMP");

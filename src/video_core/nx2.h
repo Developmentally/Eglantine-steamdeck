@@ -188,6 +188,14 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
 /// EDEN_NX2_TRACE_DST=<hex> with EDEN_NX2_TRACE_DST_MIB=<n> (32): true when a write of `size`
 /// at `gpu_address` touches [dst, dst + n MiB). The DMA engines, Fermi 2D and written storage
 /// buffers log their writes there, to find out what fills a texture.
+/// Set at run time (EDEN_NX2_VS_TEX_TRACE) to trace the writers of an image a shader samples.
+inline std::atomic<u64> g_nx2_trace_dst_start{0};
+inline std::atomic<u64> g_nx2_trace_dst_size{0};
+
+/// Set by the rasterizer while EDEN_NX2_TRACE_FRAME_AFTER traces a frame, so the native MME
+/// can log its DMA reads (indirect draw arguments) in sequence with the draws.
+inline std::atomic<bool> g_nx2_frame_trace_active{false};
+
 inline bool Nx2TracedDestination(u64 gpu_address, u64 size) {
     static const u64 start = [] {
         const char* value = std::getenv("EDEN_NX2_TRACE_DST");
@@ -197,7 +205,12 @@ inline bool Nx2TracedDestination(u64 gpu_address, u64 size) {
         const char* value = std::getenv("EDEN_NX2_TRACE_DST_MIB");
         return (value != nullptr ? std::strtoull(value, nullptr, 10) : 32ULL) << 20;
     }();
-    return start != 0 && gpu_address < start + length && gpu_address + size > start;
+    if (start != 0 && gpu_address < start + length && gpu_address + size > start) {
+        return true;
+    }
+    const u64 dyn_start = g_nx2_trace_dst_start.load(std::memory_order_relaxed);
+    const u64 dyn_size = g_nx2_trace_dst_size.load(std::memory_order_relaxed);
+    return dyn_start != 0 && gpu_address < dyn_start + dyn_size && gpu_address + size > dyn_start;
 }
 
 /// GPU VA in the first page that mirrors a release at `address`, or 0.
