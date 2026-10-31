@@ -8,6 +8,8 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <unordered_set>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/container/static_vector.hpp>
@@ -503,6 +505,75 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                 Tegra::g_nx2_trace_dst_size.store(image.guest_size_bytes);
                 LOG_INFO(Render_Vulkan, "tracing writers of image {:#x} size {:#x}",
                          image.gpu_addr, image.guest_size_bytes);
+            }
+        }
+    }
+
+    // EDEN_NX2_PS_TEX_LOG=<hex low 16 bits of the pixel program address>: once per image, every
+    // texture that program samples, with its descriptor (cbuf offset), geometry, format and how
+    // much of its guest memory is non-zero (an untextured-looking surface: empty or wrong image?).
+    static const u64 log_ps_textures = [] {
+        const char* value = std::getenv("EDEN_NX2_PS_TEX_LOG");
+        return value != nullptr ? std::strtoull(value, nullptr, 16) : ~0ULL;
+    }();
+    if (log_ps_textures != ~0ULL && Spec::enabled_stages[4] &&
+        (regs.pipelines[5].reserved[1] & 0xffff) == log_ps_textures) {
+        static std::unordered_set<u64> logged;
+        const u64 ps_address{(u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                             regs.pipelines[5].reserved[1]};
+        size_t first{};
+        for (size_t stage = 0; stage < 4; ++stage) {
+            if (!Spec::enabled_stages[stage]) {
+                continue;
+            }
+            const Shader::Info& info{stage_infos[stage]};
+            first += Shader::NumDescriptors(info.texture_buffer_descriptors);
+            if constexpr (Spec::has_image_buffers) {
+                first += Shader::NumDescriptors(info.image_buffer_descriptors);
+            }
+            first += Shader::NumDescriptors(info.texture_descriptors);
+            if constexpr (Spec::has_images) {
+                first += Shader::NumDescriptors(info.image_descriptors);
+            }
+        }
+        const Shader::Info& ps_info{stage_infos[4]};
+        first += Shader::NumDescriptors(ps_info.texture_buffer_descriptors);
+        if constexpr (Spec::has_image_buffers) {
+            first += Shader::NumDescriptors(ps_info.image_buffer_descriptors);
+        }
+        size_t view_index{first};
+        for (const auto& desc : ps_info.texture_descriptors) {
+            for (u32 index = 0; index < desc.count; ++index, ++view_index) {
+                if (view_index >= views.size()) {
+                    break;
+                }
+                const auto& view{texture_cache.GetImageView(views[view_index].id)};
+                const u64 key{(u64{desc.cbuf_offset} << 32) | (view.image_id ? view.image_id.index : 0)};
+                if (!logged.insert(key).second) {
+                    continue;
+                }
+                if (!view.image_id) {
+                    LOG_INFO(Render_Vulkan, "PS {:#x} texture cb{}+{:#x} type {}: null view (handle {:#x})",
+                             ps_address, desc.cbuf_index, desc.cbuf_offset,
+                             static_cast<u32>(desc.type), views[view_index].index);
+                    continue;
+                }
+                const auto& image{texture_cache.GetImage(view.image_id)};
+                const size_t probe{(std::min)(size_t{image.guest_size_bytes}, size_t{1} << 20)};
+                std::vector<u8> bytes(probe);
+                gpu_memory->ReadBlockUnsafe(image.gpu_addr, bytes.data(), probe);
+                const size_t nonzero{static_cast<size_t>(
+                    std::count_if(bytes.begin(), bytes.end(), [](u8 b) { return b != 0; }))};
+                LOG_INFO(Render_Vulkan,
+                         "PS {:#x} texture cb{}+{:#x} type {}: image {:#x} {}x{}x{} layers {} levels {} "
+                         "format {} view format {} flags {:#x} guest {} KiB, {}% of first {} KiB non-zero",
+                         ps_address, desc.cbuf_index, desc.cbuf_offset,
+                         static_cast<u32>(desc.type), image.gpu_addr, image.info.size.width,
+                         image.info.size.height, image.info.size.depth,
+                         image.info.resources.layers, image.info.resources.levels,
+                         static_cast<u32>(image.info.format), static_cast<u32>(view.format),
+                         static_cast<u32>(image.flags), image.guest_size_bytes / 1024,
+                         probe != 0 ? nonzero * 100 / probe : 0, probe / 1024);
             }
         }
     }
