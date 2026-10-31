@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -351,6 +352,21 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         program.output_vertices = sph.common4.max_output_vertices;
         program.invocations = sph.common2.threads_per_input_primitive;
         program.is_geometry_passthrough = sph.common0.geometry_passthrough != 0;
+        // A passthrough program whose output map carries no position has nothing the rasterizer
+        // can consume: it runs only for its memory side effects (Donkey Kong Bananza collects
+        // visible terrain triangles this way). Passing the input primitive through anyway writes
+        // depth that the real hardware never produces, so translate it as a geometry shader that
+        // emits nothing.
+        static const bool honour_omap = [] {
+            const char* value = std::getenv("EDEN_NX2_GS_PASSTHROUGH_OMAP");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (program.is_geometry_passthrough && honour_omap &&
+            (sph.vtg.omap_systemb.raw & 0xf0) == 0) {
+            program.is_geometry_passthrough = false;
+            program.output_vertices = GetOutputTopologyVertices(program.output_topology);
+            LOG_INFO(Shader, "Passthrough geometry shader without position output emits nothing");
+        }
         if (program.is_geometry_passthrough) {
             const auto& mask{env.GpPassthroughMask()};
             for (size_t i = 0; i < mask.size() * 32; ++i) {
