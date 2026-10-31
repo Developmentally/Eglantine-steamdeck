@@ -478,6 +478,7 @@ private:
         const u32 kind = w[7] & 0xff;
         LOG_DEBUG(Service, "nx2:gpu 212 modify [{:#x}, {:#x}] kind={:#x} fallback={:#x} slot={}",
                   first, last, kind, w[8] & 0xff, w[10]);
+        NoteSparseRegionTouch("212 modify", first, last, w[7], w[8], w[9]);
         EventFor(w[10])->Signal(system.Kernel());
         TipcReplyWords(ctx, {kind});
     }
@@ -488,6 +489,7 @@ private:
         const u64 first = u64{w[3]} | (u64{w[4]} << 32);
         const u64 last = u64{w[5]} | (u64{w[6]} << 32);
         LOG_DEBUG(Service, "nx2:gpu 213 unmap [{:#x}, {:#x}] slot={}", first, last, w[8]);
+        NoteSparseRegionTouch("213 unmap", first, last, w[2], w[7], w[8]);
         if (last > first) {
             Nvidia::Devices::Nx2GpuMemoryRegistry::Get().Unmap(first, last - first + 1);
         }
@@ -698,6 +700,24 @@ private:
     // own (title 5's 8192² terrain pools are loaded this way, not rendered). Those blocks count as
     // written, so the images over them get device memory and upload from the mapped pages instead
     // of staying all-zero, and BackSparseWrite leaves them alone.
+    // Logs the first calls whose range lies in a sparse region (what commits pages to title 1's
+    // terrain pools is still unknown).
+    void NoteSparseRegionTouch(const char* what, u64 first, u64 last, u32 w_a, u32 w_b, u32 w_c) {
+        std::scoped_lock lk{m_region_mutex};
+        auto it = m_sparse_regions.upper_bound(first);
+        if (it == m_sparse_regions.begin()) {
+            return;
+        }
+        --it;
+        if (first >= it->first + it->second.size) {
+            return;
+        }
+        if (m_sparse_touch_logs++ < 16) {
+            LOG_INFO(Service, "nx2:gpu {} [{:#x}, {:#x}] in sparse region {:#x} (words {:#x} {:#x} {:#x})",
+                     what, first, last, it->first, w_a, w_b, w_c);
+        }
+    }
+
     void NoteMappingIntoSparseRegion(u64 gpu_address, u64 size) {
         std::scoped_lock lk{m_region_mutex};
         auto it = m_sparse_regions.upper_bound(gpu_address);
@@ -795,7 +815,8 @@ private:
         bool warned{};          ///< Logged that the pool ran out for its blocks
     };
     std::map<u64, SparseRegion> m_sparse_regions; ///< By GPU address
-    u32 m_sparse_mapped_logs{};  ///< 211 maps into sparse regions logged so far
+    u32 m_sparse_mapped_logs{};
+    u32 m_sparse_touch_logs{};  ///< 211 maps into sparse regions logged so far
     u64 m_sparse_blocks{};       ///< Sparse blocks backed so far
     u64 m_sparse_backed_bytes{}; ///< Sparse region memory given out so far
     u64 m_gpu_only_bytes{};      ///< Backing of GPU-only regions and sparse blocks right now

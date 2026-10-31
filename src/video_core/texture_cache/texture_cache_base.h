@@ -130,6 +130,7 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 images_created{};
     u64 images_uploaded{};   ///< Image contents uploaded from guest memory (last 600 frames)
     u64 uploaded_bytes{};    ///< Guest bytes those uploads read
+    u64 images_written_back{}; ///< GPU-written images copied to guest memory for the CPU (DownloadMemory)
     u64 largest_upload{};    ///< Largest of them
     u64 layer_uploads{};     ///< Of them, uploads of only the written layers
     bool native_thresholds_applied{};

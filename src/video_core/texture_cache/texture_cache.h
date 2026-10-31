@@ -379,9 +379,10 @@ void TextureCache<P>::TickFrame() {
                  stats_interval, images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer)",
-                 images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads);
-        images_uploaded = uploaded_bytes = largest_upload = layer_uploads = 0;
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer), {} written back for the CPU",
+                 images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads,
+                 images_written_back);
+        images_uploaded = uploaded_bytes = largest_upload = layer_uploads = images_written_back = 0;
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
@@ -874,6 +875,15 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
     });
     for (const ImageId image_id : images) {
         Image& image = slot_images[image_id];
+        if (Tegra::Nx2TracedDestination(image.gpu_addr, image.guest_size_bytes)) {
+            static u32 traced{};
+            if (traced++ < 40) {
+                LOG_INFO(HW_GPU, "nx2 image in traced range written back to guest memory: {:#x} {}x{} format {}",
+                         image.gpu_addr, image.info.size.width, image.info.size.height,
+                         static_cast<u32>(image.info.format));
+            }
+        }
+        ++images_written_back;
         auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
         const auto copies = FullDownloadCopies(image.info);
         image.DownloadMemory(map, copies);
