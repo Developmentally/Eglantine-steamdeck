@@ -99,12 +99,16 @@ Nx2VideoDecoder::Nx2VideoDecoder(std::string_view mime) : impl{std::make_unique<
     // DecoderContext turns frame threading off for nvdec, whose client expects each picture back
     // at once. This decoder reorders by pts and drains at the end of the stream, so it can take
     // the latency: Mario Kart World's 2560x1440 VP9 movies decode at 37 fps single-threaded on a
-    // Steam Deck, and the game aborts partway when they fall behind.
-    static const bool frame_threads = std::getenv("EDEN_NX2_VDEC_FRAME_THREADS") == nullptr ||
-                                      std::strtoul(std::getenv("EDEN_NX2_VDEC_FRAME_THREADS"), nullptr, 10) != 0;
-    if (frame_threads) {
+    // Steam Deck, and the game aborts partway when they fall behind. Four threads, not one per
+    // hardware thread: the emulated cores and the GPU threads run during the movie too.
+    // EDEN_NX2_VDEC_FRAME_THREADS=<n> sets the count, 0 turns frame threading off.
+    static const int frame_threads = [] {
+        const char* value = std::getenv("EDEN_NX2_VDEC_FRAME_THREADS");
+        return value != nullptr ? static_cast<int>(std::strtol(value, nullptr, 10)) : 4;
+    }();
+    if (frame_threads > 0) {
         impl->context->GetCodecContext()->thread_type |= FF_THREAD_FRAME;
-        impl->context->GetCodecContext()->thread_count = 0;
+        impl->context->GetCodecContext()->thread_count = frame_threads;
     }
     if (Settings::values.nvdec_emulation.GetValue() == Settings::NvdecEmulation::Gpu) {
         impl->hardware.emplace();

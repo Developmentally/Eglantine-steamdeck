@@ -1636,7 +1636,7 @@ private:
 
     static constexpr u32 NoSyncpoint = ~0U;
     static constexpr size_t MaxQueuedInputs = 8;
-    static constexpr size_t MaxDecodedAhead = 2; // decoded frames held while no image is free
+    static constexpr size_t MaxDecodedAhead = 4; // decoded frames held while no image is free
     static constexpr u32 HostSyncpoints = 192;   // Tegra::Host1x::SyncpointManager
 
     void Log(HLERequestContext& ctx, std::string_view what) {
@@ -1814,6 +1814,7 @@ private:
             std::scoped_lock lk{m_mutex};
             m_inputs.clear();
             m_flush = true;
+            m_clock_origin.reset();
             m_ready->room.store(true, std::memory_order_relaxed);
         }
         m_cv.notify_one();
@@ -1837,9 +1838,9 @@ private:
             free = m_free.size();
             outputs = m_outputs.size();
         }
-        LOG_INFO(Service, "{} 1s: submitted {} frames out {} polls {} ({} empty) | queued inputs {} decoded ahead {} free images {} finished {}",
-                 GetServiceName(), m_submitted, m_frames_out, m_polls, m_empty_polls, inputs,
-                 decoded, free, outputs);
+        LOG_INFO(Service, "{} 1s: submitted {} frames out {} skipped {} polls {} ({} empty) | queued inputs {} decoded ahead {} free images {} finished {}",
+                 GetServiceName(), m_submitted, m_frames_out, m_frames_skipped, m_polls,
+                 m_empty_polls, inputs, decoded, free, outputs);
     }
 
     void GetOutputInfo(HLERequestContext& ctx) {
@@ -1852,6 +1853,11 @@ private:
             if (!m_outputs.empty()) {
                 output = m_outputs.front();
                 m_outputs.pop_front();
+                if (!m_clock_origin) {
+                    // The client starts showing the movie with the first frame it takes.
+                    m_clock_origin = std::chrono::steady_clock::now() -
+                                     std::chrono::microseconds{output->pts};
+                }
             }
         }
         if (!output) {
@@ -1897,6 +1903,23 @@ private:
             if (!m_decoded.empty() && !m_free.empty()) {
                 Decoded frame = std::move(m_decoded.front());
                 m_decoded.pop_front();
+                // The client takes one frame per poll, one poll per game frame: when the game
+                // runs under the movie's rate the delivered pts fall behind real time, and title
+                // 5 aborts (2162-0001) after a few seconds of lag. A frame more than two frames
+                // behind the wall clock (counted from the first frame the client took) is skipped
+                // when the next is already decoded; images and sync values are untouched.
+                const auto now = std::chrono::steady_clock::now();
+                const auto due = std::chrono::microseconds{frame.pts};
+                if (m_clock_origin && !frame.end && !m_decoded.empty() &&
+                    now - (*m_clock_origin + due) > std::chrono::milliseconds{33}) {
+                    if (++m_frames_skipped == 1 || (m_frames_skipped % 100) == 0) {
+                        LOG_INFO(Service, "{} skipped {} late frames so far (pts {} us, {} ms behind)",
+                                 GetServiceName(), m_frames_skipped, frame.pts,
+                                 std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     now - (*m_clock_origin + due)).count());
+                    }
+                    continue;
+                }
                 const u32 image = m_free.front();
                 m_free.pop_front();
                 std::optional<Fence> fence;
@@ -2053,6 +2076,8 @@ private:
     u32 m_height{};
     u32 m_handed{}; ///< Output images handed out (registered or released) so far
     u64 m_frames_out{};
+    u64 m_frames_skipped{};
+    std::optional<std::chrono::steady_clock::time_point> m_clock_origin; ///< Wall time of pts 0
     std::deque<Input> m_inputs;
     std::deque<Decoded> m_decoded;     ///< Waiting for a free output image
     std::deque<u32> m_free;            ///< Output images, in the order the client acquires them
