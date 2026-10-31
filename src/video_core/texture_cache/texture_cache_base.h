@@ -208,6 +208,9 @@ public:
     /// Read back the images named by EDEN_NX2_IMAGE_DUMP to files
     void DumpRequestedImages();
 
+    /// Read one image back to EDEN_NX2_IMAGE_DUMP_DIR; false once the file budget is spent
+    bool DumpImage(ImageId image_id, std::string_view tag);
+
     /// Return a constant reference to the given image view id
     [[nodiscard]] const ImageView& GetImageView(ImageViewId id) const noexcept;
 

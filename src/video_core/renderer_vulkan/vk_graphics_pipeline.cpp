@@ -578,6 +578,27 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     continue;
                 }
                 const auto& image{texture_cache.GetImage(view.image_id)};
+                // EDEN_NX2_IMAGE_DUMP_PS=<cbuf offset hex>[,...]: also read back the images bound
+                // at those descriptors of the logged program (assets move between sessions, so
+                // EDEN_NX2_IMAGE_DUMP's addresses cannot name them).
+                static const std::vector<u32> dump_offsets = [] {
+                    std::vector<u32> result;
+                    if (const char* value = std::getenv("EDEN_NX2_IMAGE_DUMP_PS")) {
+                        for (const char* cursor = value; *cursor != '\0';) {
+                            char* end{};
+                            result.push_back(static_cast<u32>(std::strtoul(cursor, &end, 16)));
+                            cursor = *end == ',' ? end + 1 : end;
+                            if (end == cursor && *cursor != '\0') {
+                                break;
+                            }
+                        }
+                    }
+                    return result;
+                }();
+                if (std::ranges::find(dump_offsets, desc.cbuf_offset) != dump_offsets.end()) {
+                    texture_cache.DumpImage(view.image_id,
+                                            fmt::format("ps-cb{}-{:x}", desc.cbuf_index, desc.cbuf_offset));
+                }
                 const auto& ps_cbufs{maxwell3d->state.shader_stages[4].const_buffers};
                 const GPUVAddr handle_addr{ps_cbufs[desc.cbuf_index].address + desc.cbuf_offset +
                                            (index << desc.size_shift)};

@@ -872,27 +872,19 @@ bool TextureCache<P>::IsDownloadable(const ImageBase& image) const noexcept {
 
 // EDEN_NX2_IMAGE_DUMP=<hex gpu address>[,<hex address>...] with EDEN_NX2_IMAGE_DUMP_DIR=<dir>:
 // every EDEN_NX2_IMAGE_DUMP_EVERY frames (300), read back the images starting at those addresses
-// and write them raw (host format, linear, every level and layer) as
-// <dir>/<address>-<image id>-<frame>.bin with a .txt describing the layout, up to
-// EDEN_NX2_IMAGE_DUMP_MAX (100) files.
+// (DumpImage), up to EDEN_NX2_IMAGE_DUMP_MAX (100) files.
 template <class P>
 void TextureCache<P>::DumpRequestedImages() {
     static const char* const spec = std::getenv("EDEN_NX2_IMAGE_DUMP");
-    static const char* const dir = std::getenv("EDEN_NX2_IMAGE_DUMP_DIR");
-    if (spec == nullptr || dir == nullptr) {
+    if (spec == nullptr || std::getenv("EDEN_NX2_IMAGE_DUMP_DIR") == nullptr) {
         return;
     }
     static const u64 interval = [] {
         const char* const every = std::getenv("EDEN_NX2_IMAGE_DUMP_EVERY");
         return every != nullptr ? (std::max)(std::strtoull(every, nullptr, 10), 1ull) : 300ull;
     }();
-    static const u32 max_dumps = [] {
-        const char* const max = std::getenv("EDEN_NX2_IMAGE_DUMP_MAX");
-        return max != nullptr ? static_cast<u32>(std::strtoul(max, nullptr, 10)) : 100u;
-    }();
     static u64 frames{};
-    static u32 dumps{};
-    if (++frames % interval != 0 || dumps >= max_dumps) {
+    if (++frames % interval != 0) {
         return;
     }
     static const std::vector<GPUVAddr> addresses = [] {
@@ -907,75 +899,95 @@ void TextureCache<P>::DumpRequestedImages() {
         }
         return result;
     }();
-    for (const auto [image_id, image_ptr] : slot_images) {
-        Image& image = *image_ptr;
-        if (std::ranges::find(addresses, image.gpu_addr) == addresses.end() ||
-            True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Remapped))) {
-            continue;
+    for (const auto [image_id, image] : slot_images) {
+        if (std::ranges::find(addresses, image->gpu_addr) != addresses.end()) {
+            DumpImage(image_id, "image");
         }
-        boost::container::small_vector<BufferImageCopy, 16> copies;
-        size_t total_bytes = image.unswizzled_size_bytes;
-        const char* host_format = "guest";
-        if (True(image.flags & ImageFlagBits::Converted)) {
-            // GPU-decoded ASTC is BC1 (opaque), BC3 or RGBA8 on the host: lay the levels out
-            // tightly in that format instead of the guest's.
-            const bool recompressed = Settings::values.astc_recompression.GetValue() !=
-                                      Settings::AstcRecompression::Uncompressed;
-            const bool bc1 = recompressed && (image.info.astc_opaque ||
-                                              Settings::values.astc_recompression.GetValue() ==
-                                                  Settings::AstcRecompression::Bc1);
-            const u32 block = recompressed ? 4 : 1;
-            const size_t block_bytes = !recompressed ? 4 : bc1 ? 8 : 16;
-            host_format = !recompressed ? "rgba8" : bc1 ? "bc1" : "bc3";
-            size_t offset = 0;
-            for (s32 level = 0; level < image.info.resources.levels; ++level) {
-                const Extent3D size = MipSize(image.info.size, level);
-                const size_t bytes = size_t{Common::DivCeil(size.width, block)} *
-                                     Common::DivCeil(size.height, block) * size.depth *
-                                     block_bytes * image.info.resources.layers;
-                copies.push_back(BufferImageCopy{
-                    .buffer_offset = offset,
-                    .buffer_size = bytes,
-                    .buffer_row_length = 0,
-                    .buffer_image_height = 0,
-                    .image_subresource = {.base_level = level, .base_layer = 0,
-                                          .num_layers = image.info.resources.layers},
-                    .image_offset = {},
-                    .image_extent = size,
-                });
-                offset += Common::AlignUp(bytes, size_t{64});
-            }
-            total_bytes = offset;
-        } else {
-            copies = FullDownloadCopies(image.info);
-        }
-        auto map = runtime.DownloadStagingBuffer(total_bytes);
-        image.DownloadMemory(map, copies);
-        runtime.Finish();
-        const std::string base =
-            fmt::format("{}/{:x}-{}-{}", dir, image.gpu_addr, image_id.index, frames);
-        if (std::FILE* file = std::fopen((base + ".bin").c_str(), "wb")) {
-            std::fwrite(map.mapped_span.data(), 1, total_bytes, file);
-            std::fclose(file);
-        }
-        if (std::FILE* file = std::fopen((base + ".txt").c_str(), "w")) {
-            fmt::print(file, "{}x{}x{} layers {} levels {} format {} flags {:#x} id {} host {}\n",
-                       image.info.size.width, image.info.size.height, image.info.size.depth,
-                       image.info.resources.layers, image.info.resources.levels,
-                       static_cast<u32>(image.info.format), static_cast<u32>(image.flags),
-                       image_id.index, host_format);
-            for (const auto& copy : copies) {
-                fmt::print(file, "level {} offset {} size {} {}x{}x{} layers {} row {} rows {}\n",
-                           copy.image_subresource.base_level, copy.buffer_offset,
-                           copy.buffer_size, copy.image_extent.width, copy.image_extent.height,
-                           copy.image_extent.depth, copy.image_subresource.num_layers,
-                           copy.buffer_row_length, copy.buffer_image_height);
-            }
-            std::fclose(file);
-        }
-        ++dumps;
-        LOG_INFO(HW_GPU, "nx2 image dump: {}.bin ({} bytes)", base, total_bytes);
     }
+}
+
+// Read an image back and write it raw (host format, linear, every level and layer) as
+// <EDEN_NX2_IMAGE_DUMP_DIR>/<tag>-<address>-<image id>-<frame>.bin with a .txt describing the
+// layout. Returns false once EDEN_NX2_IMAGE_DUMP_MAX (100) files were written.
+template <class P>
+bool TextureCache<P>::DumpImage(ImageId image_id, std::string_view tag) {
+    static const char* const dir = std::getenv("EDEN_NX2_IMAGE_DUMP_DIR");
+    static const u32 max_dumps = [] {
+        const char* const max = std::getenv("EDEN_NX2_IMAGE_DUMP_MAX");
+        return max != nullptr ? static_cast<u32>(std::strtoul(max, nullptr, 10)) : 100u;
+    }();
+    static u32 dumps{};
+    if (dir == nullptr || dumps >= max_dumps) {
+        return false;
+    }
+    Image& image = slot_images[image_id];
+    if (True(image.flags & (ImageFlagBits::Unbacked | ImageFlagBits::Remapped))) {
+        return true;
+    }
+    boost::container::small_vector<BufferImageCopy, 16> copies;
+    size_t total_bytes = image.unswizzled_size_bytes;
+    const char* host_format = "guest";
+    if (True(image.flags & ImageFlagBits::Converted)) {
+        // GPU-decoded ASTC is BC1 (opaque), BC3 or RGBA8 on the host: lay the levels out
+        // tightly in that format instead of the guest's.
+        const bool recompressed = Settings::values.astc_recompression.GetValue() !=
+                                  Settings::AstcRecompression::Uncompressed;
+        const bool bc1 = recompressed && (image.info.astc_opaque ||
+                                          Settings::values.astc_recompression.GetValue() ==
+                                              Settings::AstcRecompression::Bc1);
+        const u32 block = recompressed ? 4 : 1;
+        const size_t block_bytes = !recompressed ? 4 : bc1 ? 8 : 16;
+        host_format = !recompressed ? "rgba8" : bc1 ? "bc1" : "bc3";
+        size_t offset = 0;
+        for (s32 level = 0; level < image.info.resources.levels; ++level) {
+            const Extent3D size = MipSize(image.info.size, level);
+            const size_t bytes = size_t{Common::DivCeil(size.width, block)} *
+                                 Common::DivCeil(size.height, block) * size.depth * block_bytes *
+                                 image.info.resources.layers;
+            copies.push_back(BufferImageCopy{
+                .buffer_offset = offset,
+                .buffer_size = bytes,
+                .buffer_row_length = 0,
+                .buffer_image_height = 0,
+                .image_subresource = {.base_level = level,
+                                      .base_layer = 0,
+                                      .num_layers = image.info.resources.layers},
+                .image_offset = {},
+                .image_extent = size,
+            });
+            offset += Common::AlignUp(bytes, size_t{64});
+        }
+        total_bytes = offset;
+    } else {
+        copies = FullDownloadCopies(image.info);
+    }
+    auto map = runtime.DownloadStagingBuffer(total_bytes);
+    image.DownloadMemory(map, copies);
+    runtime.Finish();
+    const std::string base = fmt::format("{}/{}-{:x}-{}-{}", dir, tag, image.gpu_addr,
+                                         image_id.index, frame_tick);
+    if (std::FILE* file = std::fopen((base + ".bin").c_str(), "wb")) {
+        std::fwrite(map.mapped_span.data(), 1, total_bytes, file);
+        std::fclose(file);
+    }
+    if (std::FILE* file = std::fopen((base + ".txt").c_str(), "w")) {
+        fmt::print(file, "{}x{}x{} layers {} levels {} format {} flags {:#x} id {} host {}\n",
+                   image.info.size.width, image.info.size.height, image.info.size.depth,
+                   image.info.resources.layers, image.info.resources.levels,
+                   static_cast<u32>(image.info.format), static_cast<u32>(image.flags),
+                   image_id.index, host_format);
+        for (const auto& copy : copies) {
+            fmt::print(file, "level {} offset {} size {} {}x{}x{} layers {} row {} rows {}\n",
+                       copy.image_subresource.base_level, copy.buffer_offset, copy.buffer_size,
+                       copy.image_extent.width, copy.image_extent.height,
+                       copy.image_extent.depth, copy.image_subresource.num_layers,
+                       copy.buffer_row_length, copy.buffer_image_height);
+        }
+        std::fclose(file);
+    }
+    ++dumps;
+    LOG_INFO(HW_GPU, "nx2 image dump: {}.bin ({} bytes)", base, total_bytes);
+    return true;
 }
 
 template <class P>
