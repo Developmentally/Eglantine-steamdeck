@@ -25,6 +25,7 @@
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
 
 namespace Service::Nvidia::Devices {
@@ -154,6 +155,18 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
               cpu_address);
+    // Game memory mapped over a sparse region's zero pages: those blocks hold data now.
+    if (auto it = nx2_sparse_ranges.upper_bound(gpu_address); it != nx2_sparse_ranges.begin()) {
+        --it;
+        if (gpu_address < it->first + it->second.first) {
+            Tegra::Nx2SparseMarkWritten(gpu_address, size);
+            static u32 logged{};
+            if (logged++ < 16) {
+                LOG_INFO(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} (CPU {:#x}) lands in sparse region {:#x}",
+                         gpu_address, size, cpu_address, it->first);
+            }
+        }
+    }
 }
 
 void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {

@@ -11,6 +11,7 @@
 #include <ranges>
 #include "common/settings.h"
 #include "core/core.h"
+#include "core/hle/service/nvdrv/devices/nx2_gpu_memory.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/guest_memory.h"
@@ -87,6 +88,30 @@ void MaxwellDMA::Launch() {
             LOG_INFO(HW_GPU, "nx2 DMA {:#x} -> {:#x} lines={} length={} launch={:#x}",
                      static_cast<GPUVAddr>(regs.offset_in), GPUVAddr(regs.offset_out),
                      regs.line_count, regs.line_length_in, regs.reg_array[0xc0]);
+        }
+    }
+    // EDEN_NX2_DMA_STATS=1: every 4096 copies, how many went into Switch 2 sparse regions and
+    // GPU-only regions (which of the terrain pools the copy engine ever fills), and the first few
+    // into a sparse region.
+    if (static const bool dma_stats = std::getenv("EDEN_NX2_DMA_STATS") != nullptr; dma_stats) {
+        static u64 launches{}, bytes{}, to_sparse{}, to_gpu_only{}, sparse_logged{};
+        const GPUVAddr dst = GPUVAddr(regs.offset_out);
+        ++launches;
+        bytes += out_span;
+        if (Tegra::Nx2InSparseRegion(dst, 1)) {
+            ++to_sparse;
+            if (sparse_logged++ < 16) {
+                LOG_INFO(HW_GPU, "nx2 DMA into sparse region: {:#x} -> {:#x} lines={} length={} pitch out={:#x} dst_layout={}",
+                         static_cast<GPUVAddr>(regs.offset_in), dst, regs.line_count,
+                         regs.line_length_in, regs.pitch_out,
+                         regs.launch_dma.dst_memory_layout.Value() == LaunchDMA::MemoryLayout::PITCH ? "pitch" : "block");
+            }
+        } else if (Service::Nvidia::Devices::IsNx2GpuOnlyAddress(dst)) {
+            ++to_gpu_only;
+        }
+        if (launches % 4096 == 0) {
+            LOG_INFO(HW_GPU, "nx2 DMA stats: {} copies, {} MiB, {} into sparse regions, {} into GPU-only regions",
+                     launches, bytes >> 20, to_sparse, to_gpu_only);
         }
     }
 
