@@ -34,6 +34,7 @@
 #include "shader_recompiler/frontend/ampere/program_dump.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
+#include "video_core/nx2.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
@@ -356,6 +357,10 @@ void GenericEnvironment::InitializeNativeCode(u32 source_header_size) {
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
     auto lowered = Shader::Ampere::LowerToMaxwell(native);
+    {
+        std::scoped_lock lock{Tegra::g_nx2_program_keys_lock};
+        Tegra::g_nx2_program_keys[program_base] = Shader::Ampere::NativeProgramKey(native);
+    }
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
     // lowered program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {

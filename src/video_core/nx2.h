@@ -10,6 +10,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include "common/common_types.h"
@@ -191,6 +192,17 @@ inline bool Nx2SparseUnwritten(u64 gpu_address, u64 size) {
 /// Set at run time (EDEN_NX2_VS_TEX_TRACE) to trace the writers of an image a shader samples.
 inline std::atomic<u64> g_nx2_trace_dst_start{0};
 inline std::atomic<u64> g_nx2_trace_dst_size{0};
+
+/// Native program key (the name of its dump file) by program address, filled as programs are
+/// captured, so draw-time diagnostics can be keyed stably across sessions.
+inline std::mutex g_nx2_program_keys_lock;
+inline std::unordered_map<u64, u64> g_nx2_program_keys;
+
+inline u64 Nx2ProgramKey(u64 program_base) {
+    std::scoped_lock lock{g_nx2_program_keys_lock};
+    const auto it = g_nx2_program_keys.find(program_base);
+    return it != g_nx2_program_keys.end() ? it->second : 0;
+}
 
 /// Set by the rasterizer while EDEN_NX2_TRACE_FRAME_AFTER traces a frame, so the native MME
 /// can log its DMA reads (indirect draw arguments) in sequence with the draws.

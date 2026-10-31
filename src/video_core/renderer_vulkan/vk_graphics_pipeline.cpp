@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <span>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -509,15 +510,18 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
 
-    // EDEN_NX2_PS_TEX_LOG=<hex low 16 bits of the pixel program address>: once per image, every
-    // texture that program samples, with its descriptor (cbuf offset), geometry, format and how
-    // much of its guest memory is non-zero (an untextured-looking surface: empty or wrong image?).
-    static const u64 log_ps_textures = [] {
+    // EDEN_NX2_PS_TEX_LOG=<program key hex prefix>: once per image, every texture that pixel
+    // program samples, with its descriptor (cbuf offset), geometry, format and how much of its
+    // guest memory is non-zero (an untextured-looking surface: empty or wrong image?). The key
+    // names the program's dump file and is stable across sessions.
+    static const std::string log_ps_textures = [] {
         const char* value = std::getenv("EDEN_NX2_PS_TEX_LOG");
-        return value != nullptr ? std::strtoull(value, nullptr, 16) : ~0ULL;
+        return value != nullptr ? std::string{value} : std::string{};
     }();
-    if (log_ps_textures != ~0ULL && Spec::enabled_stages[4] &&
-        (regs.pipelines[5].reserved[1] & 0xffff) == log_ps_textures) {
+    if (!log_ps_textures.empty() && Spec::enabled_stages[4] &&
+        fmt::format("{:016x}", Tegra::Nx2ProgramKey((u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
+                                                    regs.pipelines[5].reserved[1]))
+            .starts_with(log_ps_textures)) {
         static std::unordered_set<u64> logged;
         const u64 ps_address{(u64{regs.pipelines[5].reserved[0] & 0xff} << 32) |
                              regs.pipelines[5].reserved[1]};
