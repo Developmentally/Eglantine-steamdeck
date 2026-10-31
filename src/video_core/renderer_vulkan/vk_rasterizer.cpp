@@ -747,6 +747,22 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                                        cbufs[i].address, cbufs[i].size);
                 }
             }
+            // EDEN_NX2_DUMP_SSBO=<hex offset in PS cb0>: also dump the storage buffer whose
+            // address/size descriptor lives there (first 1 MiB).
+            if (const char* ssbo_text = std::getenv("EDEN_NX2_DUMP_SSBO")) {
+                const auto& cb0 = maxwell3d->state.shader_stages[4].const_buffers[0];
+                const u64 offset = std::strtoull(ssbo_text, nullptr, 16);
+                if (cb0.enabled && offset + 12 <= cb0.size) {
+                    u64 ssbo_addr = 0;
+                    u32 ssbo_size = 0;
+                    gpu_memory->ReadBlock(cb0.address + offset, &ssbo_addr, sizeof(ssbo_addr));
+                    gpu_memory->ReadBlock(cb0.address + offset + 8, &ssbo_size, sizeof(ssbo_size));
+                    txt << fmt::format("ps ssbo cb0+{:#x}: {:#x} size {:#x}\n", offset, ssbo_addr, ssbo_size);
+                    if (ssbo_addr != 0 && ssbo_size != 0) {
+                        dump("psssbo", ssbo_addr, (std::min)(u64{ssbo_size}, u64{1} << 20));
+                    }
+                }
+            }
             txt << fmt::format("viewport scale {} {} {} translate {} {} {} | depth {}{} func {:#x}\n",
                                regs.viewport_transform[0].scale_x, regs.viewport_transform[0].scale_y,
                                regs.viewport_transform[0].scale_z, regs.viewport_transform[0].translate_x,
