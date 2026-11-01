@@ -209,13 +209,18 @@ bool DmaPusher::Step() {
                 // triangles into a 5-word indirect draw record and the colour pass points the
                 // draw macro's parameter entry at it. Read without a flush the macro sees a zero
                 // count and the terrain is never drawn. The records are flushed together once
-                // per reset the front sent (Nx2IndirectRecords); other parameter entries drain
-                // the back and flush their words when they are dirty. EDEN_NX2_PBFLUSH=0 turns
-                // this off. (Approach from zortos293/Eglantine.)
+                // per reset the front sent (Nx2IndirectRecords). EDEN_NX2_PBFLUSH=0 turns this
+                // off. (Approach from zortos293/Eglantine.)
                 static const bool flush_parameters = [] {
                     const char* value = std::getenv("EDEN_NX2_PBFLUSH");
                     return value == nullptr || value[0] != '0';
                 }();
+                // Draining and flushing every other (non-record) macro parameter entry it finds
+                // dirty: off by default. Mario Kart World renders correctly without it and it
+                // drained the back ~1000-3000 times a second for no visible change.
+                // EDEN_NX2_PBFLUSH_ALL=1 turns it on.
+                static const bool flush_all_parameters =
+                    std::getenv("EDEN_NX2_PBFLUSH_ALL") != nullptr;
                 bool flushed_parameters = false;
                 if (flush_parameters && macro_payload && words <= 64) {
                     namespace Profile = VideoCommon::Nx2Profile;
@@ -227,24 +232,28 @@ bool DmaPusher::Step() {
                         // Flushed after every reset sent so far: nothing queued rewrites them.
                         Profile::Add(Profile::Counter::ParameterFlushesSkipped, 1);
                         flushed_parameters = true;
-                    } else {
+                    } else if (record) {
                         Profile::Add(Profile::Counter::DrainParameters, 1);
                         if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                             split.Drain();
                         }
-                        // Only the words themselves: a page may also hold command lists and
+                        // Only the records themselves: a page may also hold command lists and
                         // semaphores the CPU writes, which a wider download would overwrite.
-                        if (record) {
-                            // The back ran every reset and culling pass sent before this entry.
-                            records.resets_flushed = records.resets_sent.load(std::memory_order_relaxed);
-                            constexpr u64 record_bytes = Tegra::Nx2IndirectRecords::RecordBytes;
-                            for (const u64 pointer : records.Records()) {
-                                if (memory_manager.IsMemoryDirty(pointer, record_bytes, VideoCommon::CacheType::BufferCache)) {
-                                    memory_manager.FlushRegion(pointer, record_bytes, VideoCommon::CacheType::BufferCache);
-                                }
+                        // The back ran every reset and culling pass sent before this entry.
+                        records.resets_flushed = records.resets_sent.load(std::memory_order_relaxed);
+                        constexpr u64 record_bytes = Tegra::Nx2IndirectRecords::RecordBytes;
+                        for (const u64 pointer : records.Records()) {
+                            if (memory_manager.IsMemoryDirty(pointer, record_bytes, VideoCommon::CacheType::BufferCache)) {
+                                memory_manager.FlushRegion(pointer, record_bytes, VideoCommon::CacheType::BufferCache);
                             }
-                            flushed_parameters = true;
-                        } else if (memory_manager.IsMemoryDirty(address, bytes, VideoCommon::CacheType::BufferCache)) {
+                        }
+                        flushed_parameters = true;
+                    } else if (flush_all_parameters) {
+                        Profile::Add(Profile::Counter::DrainParameters, 1);
+                        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                            split.Drain();
+                        }
+                        if (memory_manager.IsMemoryDirty(address, bytes, VideoCommon::CacheType::BufferCache)) {
                             memory_manager.FlushRegion(address, bytes, VideoCommon::CacheType::BufferCache);
                             flushed_parameters = true;
                             static std::atomic<u32> flush_logs{};
