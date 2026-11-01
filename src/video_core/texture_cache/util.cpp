@@ -555,8 +555,7 @@ void SwizzleBlockLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr
     const std::array sizes = CalculateLevelSizes(level_info, num_levels);
     size_t guest_offset = CalculateLevelBytes(sizes, level);
     const size_t layer_stride =
-        AlignLayerSize(CalculateLevelBytes(sizes, num_levels), size, level_info.block,
-                       tile_size.height, info.tile_width_spacing);
+        info.layer_stride != 0 ? info.layer_stride : CalculateLayerStride(info);
     const size_t subresource_size = sizes[level];
 
     for (s32 layer = 0; layer < info.resources.layers; ++layer) {
@@ -567,7 +566,10 @@ void SwizzleBlockLinearImage(Tegra::MemoryManager& gpu_memory, GPUVAddr gpu_addr
                 dst(gpu_memory, gpu_addr + guest_offset, subresource_size, &tmp_buffer);
 
             SwizzleTexture(dst, src, bytes_per_block, num_tiles.width, num_tiles.height,
-                           num_tiles.depth, block.height, block.depth, 1, gpu_memory.UsesNativeTiling());
+                           num_tiles.depth, block.height, block.depth,
+                           StrideAlignment(num_tiles, info.block, BytesPerBlockLog2(info.format),
+                                           info.tile_width_spacing),
+                           gpu_memory.UsesNativeTiling());
         }
 
         host_offset += host_bytes_per_layer;
@@ -885,9 +887,8 @@ boost::container::small_vector<BufferImageCopy, 16> UnswizzleImage(Tegra::Memory
     const s32 num_levels = info.resources.levels;
     const std::array level_sizes = CalculateLevelSizes(level_info, num_levels);
     const Extent2D gob = GobSize(bpp_log2, info.block.height, info.tile_width_spacing);
-    const u32 layer_size = CalculateLevelBytes(level_sizes, num_levels);
-    const u32 layer_stride = AlignLayerSize(layer_size, size, level_info.block, tile_size.height,
-                                            info.tile_width_spacing);
+    const u32 layer_stride =
+        info.layer_stride != 0 ? info.layer_stride : CalculateLayerStride(info);
     size_t guest_offset = 0;
     u32 host_offset = 0;
     boost::container::small_vector<BufferImageCopy, 16> copies(num_levels);
@@ -1051,8 +1052,6 @@ boost::container::small_vector<BufferImageCopy, 16> FullDownloadCopies(const Ima
             .image_extent = size,
         }};
     }
-    UNIMPLEMENTED_IF(info.tile_width_spacing > 0);
-
     const s32 num_layers = info.resources.layers;
     const s32 num_levels = info.resources.levels;
     const Extent2D tile_size = DefaultBlockSize(info.format);

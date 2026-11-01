@@ -1160,6 +1160,13 @@ bool Maxwell3D::IsIndirectResetProgram(GPUVAddr program) {
         0x000fe800, 0x00007386, 0x000010ff, 0x0010a900, 0x000fe200, 0x0000794d, 0x00000000,
         0x03800000, 0x000fea00,
     };
+    // Called for every draw from both halves of the GPU: a draw mostly repeats the last program.
+    thread_local GPUVAddr last_program = ~GPUVAddr{0};
+    thread_local bool last_result = false;
+    if (program == last_program) {
+        return last_result;
+    }
+    last_program = program;
     static std::mutex mutex;
     static std::unordered_map<GPUVAddr, bool> programs;
     std::scoped_lock lock{mutex};
@@ -1175,7 +1182,8 @@ bool Maxwell3D::IsIndirectResetProgram(GPUVAddr program) {
             LOG_INFO(HW_GPU, "Indirect draw reset program at {:#x}: its stores are done on the CPU", program);
         }
     }
-    return entry->second;
+    last_result = entry->second;
+    return last_result;
 }
 
 void Maxwell3D::FrontNoteUpload(VideoCommon::GpuSplit& split, const FrontState& fs) {
