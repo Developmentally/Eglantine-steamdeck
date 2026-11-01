@@ -66,10 +66,13 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     // mode reads every command list through the caches (safe reads); here only the ones on pages
     // the GPU has written are, or their draws run with an older frame's words (trees vanish).
     // The page bits are sticky and read without a drain, so the back only has to be drained for
-    // lists on pages it has ever written. EDEN_NX2_CMDFLUSH=0 turns this off.
+    // lists on pages it has ever written. Off by default: Donkey Kong Bananza and Mario Kart
+    // World both render correctly without it (DK's terrain uses the indirect-record path, not
+    // this), and the page bits catch unrelated buffers sharing a command ring's pages, so it
+    // drained ~17000 times a second in DK for nothing. EDEN_NX2_CMDFLUSH=1 turns it back on.
     static const bool flush_commands = [] {
         const char* value = std::getenv("EDEN_NX2_CMDFLUSH");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] != '0';
     }();
     if (!flush_commands || size == 0 || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
         return;
