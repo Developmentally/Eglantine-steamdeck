@@ -133,6 +133,17 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     u64 download_requests{};   ///< DownloadMemory calls (CPU reads of GPU-written memory)
     u64 images_written_back{}; ///< GPU-written images copied to guest memory for the CPU (DownloadMemory)
     u64 render_target_resizes{}; ///< GPU-only render targets re-created at another size (JoinImages)
+    u64 render_target_revivals{}; ///< Of them, served by a dormant image of that size
+    // A GPU-only render target replaced at its address by another size is kept, unregistered,
+    // and comes back when that size is bound there again (Mario Kart World's bloom chain goes
+    // through five sizes of one address every frame; creating and deleting them was a third of
+    // the GPU thread's time, and each new one uploaded its guest memory).
+    struct DormantImage {
+        ImageId id;
+        u64 tick;
+    };
+    ::Common::unordered_map<GPUVAddr, boost::container::small_vector<DormantImage, 4>> dormant_images;
+    u64 dormant_bytes{};
     u32 traced_writes_this_frame{}; ///< EDEN_NX2_TRACE_DST: GPU writes into images in the range this frame
     boost::container::small_vector<ImageId, 8> traced_images_this_frame;
     std::string traced_images_text;
@@ -462,6 +473,20 @@ private:
 
     /// Delete image from the cache
     void DeleteImage(ImageId image, bool immediate_delete = false);
+
+    /// Keep an unregistered render target for a later revival instead of deleting it
+    void MakeDormant(ImageId image_id);
+
+    /// A dormant image at this address with exactly this shape, taken out of the pool (the
+    /// caller registers it), or null
+    [[nodiscard]] ImageId ReviveDormantImage(const ImageInfo& info, GPUVAddr gpu_addr,
+                                             DAddr cpu_addr);
+
+    /// Delete dormant images nobody revived for a while, or over the pool's budget
+    void EvictDormantImages();
+
+    /// True for a view of an image that is alive but not registered (dormant)
+    [[nodiscard]] bool IsDormantView(ImageViewId id) const noexcept;
 
     /// Remove image views references from the cache
     void RemoveImageViewReferences(std::span<const ImageViewId> removed_views);

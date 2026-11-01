@@ -385,11 +385,12 @@ void TextureCache<P>::TickFrame() {
                  stats_interval, images_created, images_deleted, gc_deletes + gc_costly_deletes, gc_costly_deletes,
                  gc_download_deletes,
                  async_decodes_queued, astc_opaque_images, astc_alpha_images);
-        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer), {} written back for the CPU in {} flushes, {} render targets re-created at another size",
+        LOG_INFO(HW_GPU, "Texture cache last 600 frames: {} uploads from guest memory, {} MiB (largest {} MiB, {} by layer), {} written back for the CPU in {} flushes, {} render targets re-created at another size ({} revived, {} MiB dormant)",
                  images_uploaded, uploaded_bytes >> 20, largest_upload >> 20, layer_uploads,
-                 images_written_back, download_requests, render_target_resizes);
+                 images_written_back, download_requests, render_target_resizes,
+                 render_target_revivals, dormant_bytes >> 20);
         images_uploaded = uploaded_bytes = largest_upload = layer_uploads = images_written_back =
-            download_requests = render_target_resizes = 0;
+            download_requests = render_target_resizes = render_target_revivals = 0;
         astc_opaque_images = astc_alpha_images = 0;
         std::vector<std::pair<u32, u64>> shapes;
         for (const auto& [key, value] : created_shapes) shapes.emplace_back(value.first, key);
@@ -408,6 +409,7 @@ void TextureCache<P>::TickFrame() {
     if (total_used_memory > minimum_memory) {
         RunGarbageCollector();
     }
+    EvictDormantImages();
     RetryUnbackedImages();
     sentenced_images.Tick();
     sentenced_framebuffers.Tick();
@@ -796,23 +798,27 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
     auto const map_index = index | (compute ? Common::SlotId::TAGGED_VALUE : 0);
     // Is new (on the tegra engine side)?
     auto const [descriptor, is_new] = table.Read(*gpu_memory, index);
-    if (is_new) {
-        if (IsValidEntry(*gpu_memory, descriptor)) {
-            // Is new (registered view) on the texture cache side?
-            const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
-            if (is_new_tc)
-                pair->second = CreateImageView(descriptor);
-            PrepareImageView(pair->second, false, false);
-            channel_state->image_view_ids.insert_or_assign(map_index, pair->second);
-            return pair->second;
+    if (!is_new) {
+        auto const it = channel_state->image_view_ids.find(map_index);
+        // A view of a dormant image is resolved again below: that revives the image (or
+        // builds the one that owns the address now).
+        if (!IsDormantView(it->second)) {
+            if (it->second != NULL_IMAGE_VIEW_ID)
+                PrepareImageView(it->second, false, false);
+            return it->second;
         }
-        channel_state->image_view_ids.insert_or_assign(map_index, NULL_IMAGE_VIEW_ID);
-        return NULL_IMAGE_VIEW_ID;
     }
-    auto const it = channel_state->image_view_ids.find(map_index);
-    if (it->second != NULL_IMAGE_VIEW_ID)
-        PrepareImageView(it->second, false, false);
-    return it->second;
+    if (IsValidEntry(*gpu_memory, descriptor)) {
+        // Is new (registered view) on the texture cache side?
+        const auto [pair, is_new_tc] = channel_state->image_views.try_emplace(descriptor);
+        if (is_new_tc || IsDormantView(pair->second))
+            pair->second = CreateImageView(descriptor);
+        PrepareImageView(pair->second, false, false);
+        channel_state->image_view_ids.insert_or_assign(map_index, pair->second);
+        return pair->second;
+    }
+    channel_state->image_view_ids.insert_or_assign(map_index, NULL_IMAGE_VIEW_ID);
+    return NULL_IMAGE_VIEW_ID;
 }
 
 template <class P>
@@ -2376,11 +2382,17 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             }
         }
     }
-    const ImageId new_image_id = slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
+    // A size this address already went through (the resize path below) comes back as it was.
+    const bool resizing = std::ranges::any_of(join_copies_to_do, [](const JoinCopy& copy) {
+        return copy.resize;
+    });
+    const ImageId revived_id = resizing ? ReviveDormantImage(new_info, gpu_addr, cpu_addr) : ImageId{};
+    const ImageId new_image_id =
+        revived_id ? revived_id : slot_images.insert(runtime, new_info, gpu_addr, cpu_addr);
     Image& new_image = slot_images[new_image_id];
 
     new_image.allocation_tick = frame_tick;
-    {
+    if (!revived_id) {
         // Which shapes are being created (periodic log): format, type, levels, layers, size.
         const u64 key = (u64{static_cast<u32>(new_info.format)} << 56) |
                         (u64{static_cast<u32>(new_info.type)} << 52) |
@@ -2520,11 +2532,139 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
             UntrackImage(overlap, copy_object.id);
         }
         UnregisterImage(copy_object.id);
-        DeleteImage(copy_object.id);
+        if (copy_object.resize) {
+            MakeDormant(copy_object.id);
+        } else {
+            DeleteImage(copy_object.id);
+        }
     }
 
     RegisterImage(new_image_id);
     return new_image_id;
+}
+
+template <class P>
+void TextureCache<P>::MakeDormant(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    ASSERT(False(image.flags & (ImageFlagBits::Registered | ImageFlagBits::Tracked)));
+    // The views stay valid (and the framebuffers built on them), so only what must not be
+    // reached through them changes: bound render targets are resolved again, and alias and
+    // overlap links go, as they would for a deleted image. Views still cached for texture
+    // descriptors are caught by IsDormantView when a lookup hits one.
+    auto& dirty = maxwell3d->dirty.flags;
+    dirty[Dirty::RenderTargets] = true;
+    dirty[Dirty::ZetaBuffer] = true;
+    for (size_t rt = 0; rt < NUM_RT; ++rt) {
+        dirty[Dirty::ColorBuffer0 + rt] = true;
+    }
+    for (const ImageViewId image_view_id : image.image_view_ids) {
+        std::ranges::replace(render_targets.color_buffer_ids, image_view_id, ImageViewId{});
+        if (render_targets.depth_buffer_id == image_view_id) {
+            render_targets.depth_buffer_id = ImageViewId{};
+        }
+    }
+    for (const AliasedImage& alias : image.aliased_images) {
+        ImageBase& other_image = slot_images[alias.id];
+        std::erase_if(other_image.aliased_images, [image_id](const AliasedImage& other_alias) {
+            return other_alias.id == image_id;
+        });
+        other_image.CheckAliasState();
+    }
+    image.aliased_images.clear();
+    for (const ImageId overlap_id : image.overlapping_images) {
+        ImageBase& other_image = slot_images[overlap_id];
+        std::erase(other_image.overlapping_images, image_id);
+        other_image.CheckBadOverlapState();
+    }
+    image.overlapping_images.clear();
+    image.flags &= ~(ImageFlagBits::Alias | ImageFlagBits::BadOverlap);
+
+    const u64 bytes = Common::AlignUp(HostImageSizeBytes(image), 1024);
+    total_used_memory -= bytes;
+    dormant_bytes += bytes;
+    dormant_images[image.gpu_addr].push_back(DormantImage{image_id, frame_tick});
+}
+
+template <class P>
+ImageId TextureCache<P>::ReviveDormantImage(const ImageInfo& info, GPUVAddr gpu_addr,
+                                            DAddr cpu_addr) {
+    const auto it = dormant_images.find(gpu_addr);
+    if (it == dormant_images.end()) {
+        return ImageId{};
+    }
+    auto& candidates = it->second;
+    const auto match = std::ranges::find_if(candidates, [&](const DormantImage& dormant) {
+        const Image& image = slot_images[dormant.id];
+        const ImageInfo& old = image.info;
+        return image.cpu_addr == cpu_addr && old.format == info.format && old.type == info.type &&
+               old.size == info.size && old.resources == info.resources &&
+               old.block == info.block && old.num_samples == info.num_samples &&
+               old.native_tiling == info.native_tiling && old.is_sparse == info.is_sparse;
+    });
+    if (match == candidates.end()) {
+        return ImageId{};
+    }
+    const ImageId image_id = match->id;
+    candidates.erase(match);
+    if (candidates.empty()) {
+        dormant_images.erase(it);
+    }
+    Image& image = slot_images[image_id];
+    const u64 bytes = Common::AlignUp(HostImageSizeBytes(image), 1024);
+    dormant_bytes -= bytes;
+    // RegisterImage adds it to total_used_memory again.
+    ++render_target_revivals;
+    return image_id;
+}
+
+template <class P>
+void TextureCache<P>::EvictDormantImages() {
+    // A size not bound for two seconds is not coming back soon; and the pool is bounded.
+    constexpr u64 MaxIdleTicks = 120;
+    constexpr u64 MaxBytes = 256_MiB;
+    if (dormant_images.empty()) {
+        return;
+    }
+    u64 oldest_tick = frame_tick;
+    if (dormant_bytes > MaxBytes) {
+        // Over budget: the oldest ones go, whatever their age.
+        for (const auto& [gpu_addr, candidates] : dormant_images) {
+            for (const DormantImage& dormant : candidates) {
+                oldest_tick = (std::min)(oldest_tick, dormant.tick);
+            }
+        }
+    }
+    for (auto it = dormant_images.begin(); it != dormant_images.end();) {
+        auto& candidates = it->second;
+        const auto removed = std::remove_if(candidates.begin(), candidates.end(),
+                                            [&](const DormantImage& dormant) {
+            const bool idle = frame_tick - dormant.tick > MaxIdleTicks;
+            const bool over_budget = dormant_bytes > MaxBytes && dormant.tick == oldest_tick;
+            if (!idle && !over_budget) {
+                return false;
+            }
+            Image& image = slot_images[dormant.id];
+            const u64 bytes = Common::AlignUp(HostImageSizeBytes(image), 1024);
+            dormant_bytes -= bytes;
+            total_used_memory += bytes; // DeleteImage takes it off again
+            DeleteImage(dormant.id);
+            return true;
+        });
+        candidates.erase(removed, candidates.end());
+        it = candidates.empty() ? dormant_images.erase(it) : std::next(it);
+    }
+}
+
+template <class P>
+bool TextureCache<P>::IsDormantView(ImageViewId id) const noexcept {
+    if (!id || id == NULL_IMAGE_VIEW_ID) {
+        return false;
+    }
+    const ImageViewBase& view = slot_image_views[id];
+    if (view.IsBuffer() || !view.image_id) {
+        return false;
+    }
+    return False(slot_images[view.image_id].flags & ImageFlagBits::Registered);
 }
 
 template <class P>
@@ -3374,6 +3514,16 @@ void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
 template <class P>
 void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool invalidate) {
     Image& image = slot_images[image_id];
+    if (False(image.flags & ImageFlagBits::Registered)) {
+        // Dormant: not in the LRU list (touching its freed slot would corrupt the list). The
+        // lookups that can still reach one re-resolve it instead of getting here.
+        static u32 logged{};
+        if (logged++ < 8) {
+            LOG_WARNING(HW_GPU, "PrepareImage on a dormant image {:#x} {}x{}", image.gpu_addr,
+                        image.info.size.width, image.info.size.height);
+        }
+        return;
+    }
     if (invalidate) {
         image.flags &= ~(ImageFlagBits::CpuModified | ImageFlagBits::GpuModified);
         if (False(image.flags & ImageFlagBits::Tracked)) {
