@@ -64,8 +64,26 @@ void MaxwellDMA::FrontNoteMethod(u64 split_position, u32 method, u32 argument) {
         front_semaphore[method - semaphore_base] = argument;
         return;
     }
+    constexpr u32 output_base = offsetof(Regs, offset_out) / sizeof(u32);
+    if (method >= output_base && method < output_base + front_output.size()) {
+        front_output[method - output_base] = argument;
+        return;
+    }
     if (method != offsetof(Regs, launch_dma) / sizeof(u32)) {
         return;
+    }
+    // What the copy writes: the back runs it, and its CPU side too, later (Nx2PendingGpuWrites).
+    {
+        const GPUVAddr output = (GPUVAddr{front_output[0] & 0xff} << 32) | front_output[1];
+        const u32 pitch_out = front_output[3];
+        const u32 length = front_output[4];
+        const u32 lines = front_output[5];
+        const bool multi_line = ((argument >> 9) & 1) != 0;
+        const u64 span = multi_line ? u64{lines} * (std::max)(static_cast<u32>(std::abs(static_cast<s32>(pitch_out))), length)
+                                    : u64{length};
+        if (const auto device = memory_manager.GpuToCpuAddress(output); device && span != 0) {
+            Nx2PendingGpuWrites::Get().Note(*device, span, split_position);
+        }
     }
     if (static_cast<LaunchDMA::SemaphoreType>((argument >> 3) & 3) ==
         LaunchDMA::SemaphoreType::NONE) {

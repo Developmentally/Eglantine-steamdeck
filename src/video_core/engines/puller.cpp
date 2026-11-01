@@ -22,6 +22,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
+#include "video_core/host1x/syncpoint_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 #include "video_core/rasterizer_interface.h"
@@ -262,6 +263,9 @@ void Puller::ProcessBindMethod(DmaPusher& dma_pusher, const MethodCall& method_c
         break;
     default:
         UNIMPLEMENTED_MSG("Unimplemented engine {:04X}", engine_id);
+        // No class binds this: the words are not a command stream (a stale or torn entry read
+        // out of step). Drop the rest of the entry rather than run it as methods.
+        dma_pusher.AbortEntry();
         break;
     }
 }
@@ -273,11 +277,16 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
         break;
-    case Puller::FenceOperation::Increment:
-        OnBack([rasterizer = dma_pusher.rasterizer, id = static_cast<u32>(regs.fence_action.syncpoint_id.Value())] {
-            rasterizer->SignalSyncPoint(id);
-        });
+    case Puller::FenceOperation::Increment: {
+        const u32 id = static_cast<u32>(regs.fence_action.syncpoint_id.Value());
+        if (id >= Host1x::SyncpointManager::NUM_MAX_SYNCPOINTS) {
+            LOG_ERROR(HW_GPU, "Fence increment of syncpoint {} (only {} exist): ignored", id,
+                      Host1x::SyncpointManager::NUM_MAX_SYNCPOINTS);
+            break;
+        }
+        OnBack([rasterizer = dma_pusher.rasterizer, id] { rasterizer->SignalSyncPoint(id); });
         break;
+    }
     default:
         UNIMPLEMENTED_MSG("Unimplemented operation {}", regs.fence_action.op.Value());
         break;

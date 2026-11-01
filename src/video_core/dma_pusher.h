@@ -159,12 +159,20 @@ public:
 
     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
 
+    /// Stops the current GP entry after the method being processed and forgets any method left
+    /// open, so the next entry starts clean (the words were not a command stream).
+    void AbortEntry() {
+        abort_entry = true;
+    }
+
 private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
     bool Step();
     /// Re-reads a command list the GPU has written through the caches (Switch 2 titles).
     void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// Drains the back before an entry a copy or upload sent to it writes (Switch 2 titles).
+    void WaitForPendingWrites(GPUVAddr address, size_t size);
     /// Returns how many words were processed: fewer than given when a semaphore acquire
     /// suspended the channel.
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
@@ -245,6 +253,7 @@ public:
 
     const bool ib_enable : 1 = true; ///< IB mode enabled
     bool dma_increment_once : 1 = false;
+    bool abort_entry : 1 = false;
     bool signal_sync : 1 = false;
     bool synced : 1 = false;
 };

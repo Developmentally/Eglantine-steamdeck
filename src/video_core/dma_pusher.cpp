@@ -16,6 +16,7 @@
 #include "video_core/dma_pusher.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
+#include "video_core/engines/kepler_memory.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
@@ -92,23 +93,60 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     }
     if (memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
         static std::atomic<u32> logs{};
-        const bool log = logs.load(std::memory_order_relaxed) < 20 && size <= 64;
-        std::array<u32, 16> before{};
+        std::array<u32, 32> before{};
+        const bool log = logs.load(std::memory_order_relaxed) < 20 && size <= sizeof(before);
         if (log) {
             memory_manager.ReadBlockUnsafe(address, before.data(), size);
         }
         memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
         if (log) {
-            std::array<u32, 16> after{};
+            std::array<u32, 32> after{};
             memory_manager.ReadBlockUnsafe(address, after.data(), size);
             if (before != after) {
                 logs.fetch_add(1, std::memory_order_relaxed);
                 const std::span<const u32> old_words{before.data(), size / sizeof(u32)};
                 const std::span<const u32> new_words{after.data(), size / sizeof(u32)};
-                LOG_INFO(HW_GPU, "Command list at {:#x} ({} bytes) was written by the GPU: flushed; guest words {:08x} -> {:08x}",
-                         address, size, fmt::join(old_words, ","), fmt::join(new_words, ","));
+                LOG_INFO(HW_GPU, "Command list at {:#x} ({} bytes) was written by the GPU: flushed; guest words {:08x} -> {:08x}; pending method {:#x} count {} subchannel {} non-incrementing {}",
+                         address, size, fmt::join(old_words, ","), fmt::join(new_words, ","),
+                         dma_state.method, dma_state.method_count, dma_state.subchannel,
+                         dma_state.non_incrementing);
             }
         }
+    }
+}
+
+// An entry a copy or upload sent to the back writes (Nx2PendingGpuWrites) is read after the back
+// ran it, as the hardware's in-order copy engines would have by the time it fetches the entry.
+void DmaPusher::WaitForPendingWrites(GPUVAddr address, size_t size) {
+    if (!g_nx2_ampere.load(std::memory_order_relaxed)) {
+        return;
+    }
+    auto& split = VideoCommon::GpuSplit::Get();
+    if (!split.Active()) {
+        return;
+    }
+    const auto device = memory_manager.GpuToCpuAddress(address);
+    if (!device) {
+        return;
+    }
+    auto& pending = Tegra::Nx2PendingGpuWrites::Get();
+    bool wait = pending.Pending(*device, size, split.ConsumedPosition());
+    // The entry's last page may map elsewhere.
+    const GPUVAddr last_page = (address + size - 1) & ~GPUVAddr{Core::Memory::YUZU_PAGEMASK};
+    if (!wait && last_page != (address & ~GPUVAddr{Core::Memory::YUZU_PAGEMASK})) {
+        if (const auto last_device = memory_manager.GpuToCpuAddress(last_page)) {
+            wait = pending.Pending(*last_device, address + size - last_page, split.ConsumedPosition());
+        }
+    }
+    if (!wait) {
+        return;
+    }
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DrainEngineWrites, 1);
+    split.Drain();
+    static std::atomic<u32> logs{};
+    if (logs.fetch_add(1, std::memory_order_relaxed) < 20) {
+        LOG_INFO(HW_GPU, "Command list at {:#x} ({} bytes) is written by a copy queued for the back: drained first",
+                 address, size);
     }
 }
 
@@ -155,6 +193,7 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
+        WaitForPendingWrites(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
@@ -372,6 +411,14 @@ size_t DmaPusher::ProcessCommands(std::span<const CommandHeader> commands, size_
             }
             index++;
         }
+        if (abort_entry) {
+            abort_entry = false;
+            dma_state.method_count = 0;
+            dma_increment_once = false;
+            LOG_WARNING(HW_GPU, "Entry at {:#x} dropped after word {} of {}", dma_state.dma_get,
+                        word_offset + index, word_offset + commands.size());
+            return commands.size();
+        }
         if (puller.HasPendingAcquire()) {
             return index;
         }
@@ -492,6 +539,9 @@ void DmaPusher::CallMethod(u32 argument) {
                     }
                 } else if (type == Engines::EngineTypes::MaxwellDMA) {
                     static_cast<Engines::MaxwellDMA*>(subchannel)->FrontNoteMethod(
+                        split.SentPosition(), dma_state.method, argument);
+                } else if (type == Engines::EngineTypes::KeplerMemory) {
+                    static_cast<Engines::KeplerMemory*>(subchannel)->FrontNoteMethod(
                         split.SentPosition(), dma_state.method, argument);
                 }
             }

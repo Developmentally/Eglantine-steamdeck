@@ -248,7 +248,8 @@ public:
     void CallMethod(Core::System& system, u32 method, u32 method_argument, bool is_last_call) override;
 
     /// Split GPU thread front: notes the semaphore release a launch will make (nx2.h,
-    /// Nx2QueuedReleases) from its own copy of the three registers involved.
+    /// Nx2QueuedReleases) and the memory it will write (Nx2PendingGpuWrites) from its own copy
+    /// of the registers involved.
     void FrontNoteMethod(u64 split_position, u32 method, u32 argument);
 
     /// Write multiple values to the register identified by method.
@@ -276,6 +277,7 @@ private:
     Common::ScratchBuffer<u8> write_buffer;
     Common::ScratchBuffer<u8> intermediate_buffer;
     std::array<u32, 3> front_semaphore{}; ///< FrontNoteMethod: address upper, lower, payload
+    std::array<u32, 6> front_output{}; ///< FrontNoteMethod: offset_out (2), pitches, length, lines
 
     static constexpr std::size_t NUM_REGS = 0x800;
     struct Regs {

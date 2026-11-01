@@ -337,6 +337,55 @@ private:
     std::vector<u64> records;
 };
 
+/// Guest memory the split's back half (gpu_split.h) will write when it runs an engine copy the
+/// front has already sent: copy engine launches and inline-to-memory uploads, by device address.
+/// The back writes the CPU side of these copies itself (DMACopy's mirror, Upload::State), so a
+/// command list the game builds with one (Donkey Kong Bananza's menus) holds the previous
+/// contents until then; parsed early it is a stale, differently sized list, and the pusher
+/// falls out of step (`034813`: a bogus syncpoint id in SignalSyncPoint, a SEGV; `040345`: a
+/// swallowed semaphore, a deadlock). Noted and read on the front GPU thread only.
+class Nx2PendingGpuWrites {
+public:
+    static Nx2PendingGpuWrites& Get() {
+        static Nx2PendingGpuWrites writes;
+        return writes;
+    }
+
+    void Note(u64 device_address, u64 size, u64 split_position) {
+        if (size == 0) {
+            return;
+        }
+        std::scoped_lock lk{mutex};
+        if (writes.size() >= MaxWrites) {
+            writes.erase(writes.begin());
+        }
+        writes.push_back({device_address, device_address + size, split_position});
+    }
+
+    /// Whether a copy the back has not run yet writes into the range. `back_position` is what
+    /// the back has executed up to; a copy sent at a position before it has run and is forgotten.
+    [[nodiscard]] bool Pending(u64 device_address, u64 size, u64 back_position) {
+        std::scoped_lock lk{mutex};
+        std::erase_if(writes, [back_position](const Write& write) {
+            return write.position < back_position;
+        });
+        const u64 end = device_address + size;
+        return std::ranges::any_of(writes, [device_address, end](const Write& write) {
+            return write.begin < end && device_address < write.end;
+        });
+    }
+
+private:
+    struct Write {
+        u64 begin;
+        u64 end;
+        u64 position;
+    };
+    static constexpr size_t MaxWrites = 65536;
+    std::mutex mutex;
+    std::vector<Write> writes;
+};
+
 class Nx2SemaphoreHistory {
 public:
     enum Source : u32 {

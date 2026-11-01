@@ -950,6 +950,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
             FrontNoteDrawEnd(fs);
             fs.draw_pending = true;
             break;
+        case MAXWELL3D_REG_INDEX(launch_dma):
+            FrontNoteUpload(split, fs);
+            break;
         case MAXWELL3D_REG_INDEX(report_semaphore.query): {
             // A payload release the back will run in order: an acquire of it on the front
             // (puller.cpp) counts as met without a drain.
@@ -1081,6 +1084,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
                 FrontNoteDrawEnd(fs);
                 fs.draw_pending = true;
                 break;
+            case MAXWELL3D_REG_INDEX(launch_dma):
+                FrontNoteUpload(split, fs);
+                break;
             default:
                 if (!FrontHandledOutsideDrawManager(method)) {
                     fs.draw_pending = true;
@@ -1124,8 +1130,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
             });
         if (!result.success) {
             engine.native_execution_failed = true;
-            LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}",
-                      start, result.consumed, fs.parameters.size(), result.error);
+            LOG_ERROR(HW_GPU, "Native MME (JIT, split front) failed: start={:#x}, consumed={}/{}, error={}, parameters {:08x}",
+                      start, result.consumed, fs.parameters.size(), result.error,
+                      fmt::join(fs.parameters, ","));
         }
     }
     fs.parameters.clear();
@@ -1169,6 +1176,19 @@ bool Maxwell3D::IsIndirectResetProgram(GPUVAddr program) {
         }
     }
     return entry->second;
+}
+
+void Maxwell3D::FrontNoteUpload(VideoCommon::GpuSplit& split, const FrontState& fs) {
+    constexpr u32 upload = MAXWELL3D_REG_INDEX(upload);
+    const u32 length = fs.regs[upload];
+    const u32 lines = fs.regs[upload + 1];
+    const GPUVAddr address = (GPUVAddr{fs.regs[upload + 2]} << 32) | fs.regs[upload + 3];
+    const u32 pitch = fs.regs[upload + 4];
+    const bool linear = (fs.regs[MAXWELL3D_REG_INDEX(launch_dma)] & 1) != 0;
+    const u64 span = u64{lines} * (std::max)(length, linear ? length : pitch);
+    if (const auto device = memory_manager.GpuToCpuAddress(address); device && span != 0) {
+        Nx2PendingGpuWrites::Get().Note(*device, span, split.SentPosition());
+    }
 }
 
 void Maxwell3D::FrontNoteDrawEnd(const FrontState& fs) {

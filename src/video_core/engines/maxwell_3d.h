@@ -3358,6 +3358,8 @@ private:
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
     /// Front: a draw ended; a reset program's draw is counted (Nx2IndirectRecords).
     void FrontNoteDrawEnd(const FrontState& fs);
+    /// Notes the memory an inline upload the front sends will write (Nx2PendingGpuWrites).
+    void FrontNoteUpload(VideoCommon::GpuSplit& split, const FrontState& fs);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;

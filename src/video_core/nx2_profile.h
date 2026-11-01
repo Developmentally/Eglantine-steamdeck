@@ -81,7 +81,7 @@ inline u64 Now() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 26> counters{}; ///< See Counter
+    std::array<u64, 27> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
 };
@@ -149,6 +149,7 @@ enum class Counter : u32 {
     DrainParameters,    ///< Front drains for macro parameters the GPU may have written (dma_pusher)
     ParameterFlushesSkipped, ///< Parameter entries on indirect draw records flushed since the last reset
     DrainCommandLists,  ///< Front drains for command lists on pages the GPU has written (dma_pusher)
+    DrainEngineWrites,  ///< Front drains for command lists a queued copy or upload writes (dma_pusher)
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -228,10 +229,11 @@ inline void Report(const char* thread_name = "GPU thread") {
                         static_cast<double>(data.counters[17]) * 1e9 / window,
                         static_cast<double>(data.counters[18]) * 1e9 / window,
                         static_cast<double>(data.counters[19]) * 1e9 / window);
-    line += fmt::format(" | parameter drains {:.0f} (record flushes skipped {:.0f}), command list drains {:.0f}",
+    line += fmt::format(" | parameter drains {:.0f} (record flushes skipped {:.0f}), command list drains {:.0f}, engine write drains {:.0f}",
                         static_cast<double>(data.counters[23]) * 1e9 / window,
                         static_cast<double>(data.counters[24]) * 1e9 / window,
-                        static_cast<double>(data.counters[25]) * 1e9 / window);
+                        static_cast<double>(data.counters[25]) * 1e9 / window,
+                        static_cast<double>(data.counters[26]) * 1e9 / window);
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     data = {};
     data.window_start = now;

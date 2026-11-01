@@ -51,6 +51,10 @@ public:
     /// Write multiple values to the register identified by method.
     void CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) override;
 
+    /// Split GPU thread front: notes the memory an upload will write (nx2.h,
+    /// Nx2PendingGpuWrites) from its own copy of the upload registers.
+    void FrontNoteMethod(u64 split_position, u32 method, u32 argument);
+
     struct Regs {
         static constexpr size_t NUM_REGS = 0x7F;
 
@@ -77,6 +81,8 @@ public:
 private:
     void ConsumeSinkImpl(Core::System& system) override;
     Upload::State upload_state;
+    MemoryManager& memory_manager;
+    std::array<u32, 5> front_upload{}; ///< FrontNoteMethod: length, lines, address high/low, pitch
 };
 
 #define ASSERT_REG_POSITION(field_name, position)                                                  \
