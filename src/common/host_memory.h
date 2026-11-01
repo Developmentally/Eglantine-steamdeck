@@ -60,6 +60,11 @@ public:
     /// Pages the kernel hands out (cleared or not).
     void MarkUsed(size_t physical_offset, size_t length);
 
+    /// Pages the kernel freed: large ranges give their host memory back (they read as zero
+    /// afterwards, as a fresh allocation would clear them anyway) instead of staying resident
+    /// or in swap with contents nobody will read. Returns true when released.
+    bool ReleaseBackingRegion(size_t physical_offset, size_t length);
+
     /// Pages given back to the kernel: their contents are no longer known to be zero.
     void MarkDirty(size_t physical_offset, size_t length);
 

@@ -3,6 +3,9 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <optional>
+#include <vector>
+
 #include "common/logging.h"
 #include "core/arm/arm_interface.h"
 #include "core/arm/debug.h"
@@ -40,6 +43,45 @@ void ArmInterface::LogBacktrace(Kernel::KProcess* process) const {
     auto const backtrace = GetBacktraceFromContext(process, ctx);
     for (auto const& entry : backtrace)
         msg += fmt::format("{:20}{:016X}    {:016X}    {:016X}    {}\n", entry.module, entry.address, entry.original_address, entry.offset, entry.name);
+    // Strings the stack and the argument registers point at: a retail SDK assert leaves its
+    // expression, file and message there, nothing else names the failed check.
+    if (process != nullptr) {
+        auto& memory = process->GetMemory();
+        const auto string_at = [&](u64 address) -> std::optional<std::string> {
+            if (address < 0x1000 || !memory.IsValidVirtualAddressRange(address, 8)) {
+                return std::nullopt;
+            }
+            std::string text;
+            for (u64 i = 0; i < 160 && memory.IsValidVirtualAddress(address + i); ++i) {
+                const u8 c = memory.Read8(address + i);
+                if (c == 0) {
+                    break;
+                }
+                if (c != '\n' && c != '\t' && (c < 0x20 || c >= 0x7f)) {
+                    return std::nullopt;
+                }
+                text.push_back(static_cast<char>(c));
+            }
+            if (text.size() < 6) {
+                return std::nullopt;
+            }
+            return text;
+        };
+        std::vector<u64> candidates(xreg.begin(), xreg.end());
+        for (u64 slot = ctx.sp & ~u64{7}; slot < (ctx.sp & ~u64{7}) + 0x800; slot += 8) {
+            if (!memory.IsValidVirtualAddressRange(slot, 8)) {
+                break;
+            }
+            candidates.push_back(memory.Read64(slot));
+        }
+        size_t listed = 0;
+        for (const u64 candidate : candidates) {
+            if (const auto text = string_at(candidate); text && listed < 24) {
+                msg += fmt::format("string @{:016X}: {}\n", candidate, *text);
+                ++listed;
+            }
+        }
+    }
     LOG_ERROR(Core_ARM, "{}", msg);
 }
 

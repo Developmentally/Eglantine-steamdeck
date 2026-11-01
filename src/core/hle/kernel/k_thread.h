@@ -10,6 +10,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <map>
 #include <span>
 #include <string>
 #include <utility>
@@ -574,6 +575,34 @@ public:
         return m_wait_reason_for_debugging;
     }
 
+    // Time waited, by reason, and for synchronization waits by the object that ended them (the
+    // guest CPU report in nx2:vi2). Updated under the scheduler lock; read under it.
+    static constexpr size_t WaitReasonCount = 7;
+    struct WaitAccounting {
+        /// Object type name and, for readable events, the KEvent (an address only: it may be
+        /// gone by the time the report names it).
+        using ObjectKey = std::pair<const char*, const void*>;
+        std::array<s64, WaitReasonCount> ticks_by_reason{};
+        std::array<u32, WaitReasonCount> wakes_by_reason{};
+        std::map<ObjectKey, s64> ticks_by_object;
+        ObjectKey last_object{};
+        s64 wait_begin{};
+        /// From becoming runnable to running on its core: the wake-up latency the guest sees.
+        s64 runnable_since{};
+        s64 dispatch_latency{};
+        u32 dispatches{};
+    };
+    const WaitAccounting& GetWaitAccounting() const {
+        return m_wait_accounting;
+    }
+    void NoteDispatched(s64 now) {
+        if (m_wait_accounting.runnable_since != 0) {
+            m_wait_accounting.dispatch_latency += now - m_wait_accounting.runnable_since;
+            m_wait_accounting.runnable_since = 0;
+            ++m_wait_accounting.dispatches;
+        }
+    }
+
     ThreadType GetThreadType() const {
         return m_thread_type;
     }
@@ -933,6 +962,7 @@ private:
     std::vector<KSynchronizationObject*> m_wait_objects_for_debugging{};
     KProcessAddress m_mutex_wait_address_for_debugging{};
     ThreadWaitReasonForDebugging m_wait_reason_for_debugging{};
+    WaitAccounting m_wait_accounting{};
     uintptr_t m_argument{};
     KProcessAddress m_stack_top{};
     NativeExecutionParameters m_native_execution_parameters{};

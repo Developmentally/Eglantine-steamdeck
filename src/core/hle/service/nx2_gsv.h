@@ -37,7 +37,10 @@
 #include "video_core/framebuffer_config.h"
 #include "core/core_timing.h"
 #include "core/hle/kernel/k_client_session.h"
+#include "core/hardware_properties.h"
+#include "core/hle/kernel/k_light_lock.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/k_system_resource.h"
 #include "core/hle/kernel/k_memory_manager.h"
@@ -1199,6 +1202,7 @@ private:
                          m_stats.fence_us / 600, m_stats.max_fence_us, m_stats.composite_us / 600,
                          m_stats.pace_us / 600);
                 m_stats = {.last_present = entered};
+                LogGuestCpu();
             }
         }
         constexpr u64 AvailableSlots = 0x7fff;
@@ -1220,6 +1224,139 @@ private:
     } m_stats{};
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
+
+    // Guest CPU load since the last report: how busy each emulated core was (its idle thread's
+    // time) and the busiest guest threads, to tell a game that is CPU-bound in the emulated cores
+    // from one waiting on the GPU. Thread times only advance at context switches.
+    struct GuestCpuSample {
+        u64 ticks{};
+        std::array<s64, Core::Hardware::NUM_CPU_CORES> idle{};
+        std::map<u64, s64> threads;
+        std::map<u64, Kernel::KThread::WaitAccounting> waits;
+    } m_guest_cpu{};
+
+    static std::string DescribeWaitObject(const Kernel::KThread::WaitAccounting::ObjectKey& key) {
+        std::string name = key.first != nullptr ? key.first : "?";
+        if (key.second != nullptr) {
+            const auto event = KernelHelpers::ServiceContext::GetEventName(
+                static_cast<const Kernel::KEvent*>(key.second));
+            if (!event.empty()) {
+                name += ' ' + event;
+            }
+        }
+        return name;
+    }
+
+    /// "sleep 10% sync 50% (nx2:syncpt:Slot3 30%, KReadableEvent 12%) condvar 5%" for one thread.
+    static std::string DescribeWaits(const Kernel::KThread::WaitAccounting& now,
+                                     const Kernel::KThread::WaitAccounting* before, s64 elapsed) {
+        static constexpr std::array<const char*, Kernel::KThread::WaitReasonCount> Names{
+            "none", "sleep", "ipc", "sync", "condvar", "arbiter", "suspended"};
+        // Ticks are CNTPCT (19.2 MHz): 19.2 ticks per microsecond.
+        const auto to_us = [](s64 ticks) { return ticks * 10 / 192; };
+        std::string out;
+        {
+            const s64 latency = now.dispatch_latency - (before != nullptr ? before->dispatch_latency : 0);
+            const u32 dispatches = now.dispatches - (before != nullptr ? before->dispatches : 0);
+            if (dispatches != 0) {
+                out = fmt::format("wake->run {} us over {} dispatches;", to_us(latency / dispatches), dispatches);
+            }
+        }
+        for (size_t reason = 0; reason < Names.size(); ++reason) {
+            const s64 delta = now.ticks_by_reason[reason] - (before != nullptr ? before->ticks_by_reason[reason] : 0);
+            const u32 wakes = now.wakes_by_reason[reason] - (before != nullptr ? before->wakes_by_reason[reason] : 0);
+            const s64 percent = delta * 100 / elapsed;
+            if (percent < 1) {
+                continue;
+            }
+            out += fmt::format("{}{} {}% ({} waits, {} us each)", out.empty() ? "" : " ", Names[reason], percent,
+                               wakes, wakes != 0 ? to_us(delta / wakes) : 0);
+            if (reason != static_cast<size_t>(Kernel::ThreadWaitReasonForDebugging::Synchronization)) {
+                continue;
+            }
+            // Grouped by description: the game's own (unnamed) events add up under one entry.
+            std::map<std::string, s64> by_name;
+            for (const auto& [key, ticks] : now.ticks_by_object) {
+                s64 previous = 0;
+                if (before != nullptr) {
+                    if (const auto it = before->ticks_by_object.find(key); it != before->ticks_by_object.end()) {
+                        previous = it->second;
+                    }
+                }
+                if (ticks - previous > 0) {
+                    by_name[DescribeWaitObject(key)] += ticks - previous;
+                }
+            }
+            std::vector<std::pair<s64, std::string>> objects;
+            for (auto& [name, ticks] : by_name) {
+                objects.emplace_back(ticks, name);
+            }
+            std::sort(objects.begin(), objects.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::string list;
+            for (size_t i = 0; i < objects.size() && i < 4; ++i) {
+                list += fmt::format("{}{} {}%", i == 0 ? "" : ", ", objects[i].second,
+                                    objects[i].first * 100 / elapsed);
+            }
+            if (!list.empty()) {
+                out += fmt::format(" ({})", list);
+            }
+        }
+        return out;
+    }
+
+    void LogGuestCpu() {
+        auto& kernel = system.Kernel();
+        auto* const process = kernel.ApplicationProcess();
+        if (process == nullptr) {
+            return;
+        }
+        GuestCpuSample sample{.ticks = system.CoreTiming().GetClockTicks()};
+        const u64 elapsed = sample.ticks - m_guest_cpu.ticks;
+        std::string cores;
+        for (u32 core = 0; core < Core::Hardware::NUM_CPU_CORES; ++core) {
+            sample.idle[core] = kernel.Scheduler(core).GetIdleThread()->GetCpuTime();
+            if (elapsed != 0) {
+                const s64 idle = sample.idle[core] - m_guest_cpu.idle[core];
+                cores += fmt::format("{}{}%", core == 0 ? "" : " ",
+                                     100 - std::clamp<s64>(idle * 100 / static_cast<s64>(elapsed), 0, 100));
+            }
+        }
+        struct Busy {
+            u64 id;
+            s64 ticks;
+            s32 priority;
+            s32 core;
+        };
+        std::vector<Busy> busy;
+        {
+            Kernel::KScopedLightLock lk{process->GetListLock()};
+            Kernel::KScopedSchedulerLock sl{kernel};
+            for (auto& thread : process->GetThreadList()) {
+                const s64 ticks = thread.GetCpuTime();
+                sample.threads[thread.GetThreadId()] = ticks;
+                sample.waits[thread.GetThreadId()] = thread.GetWaitAccounting();
+                const auto previous = m_guest_cpu.threads.find(thread.GetThreadId());
+                const s64 delta = ticks - (previous != m_guest_cpu.threads.end() ? previous->second : 0);
+                if (delta > 0) {
+                    busy.push_back({thread.GetThreadId(), delta, thread.GetPriority(), thread.GetActiveCore()});
+                }
+            }
+        }
+        if (elapsed != 0) {
+            std::sort(busy.begin(), busy.end(), [](const Busy& a, const Busy& b) { return a.ticks > b.ticks; });
+            std::string threads;
+            for (size_t i = 0; i < busy.size() && i < 8; ++i) {
+                const auto before = m_guest_cpu.waits.find(busy[i].id);
+                threads += fmt::format("\n  #{} run {}% (prio {}, core {}): {}", busy[i].id,
+                                       busy[i].ticks * 100 / static_cast<s64>(elapsed), busy[i].priority, busy[i].core,
+                                       DescribeWaits(sample.waits[busy[i].id],
+                                                     before != m_guest_cpu.waits.end() ? &before->second : nullptr,
+                                                     static_cast<s64>(elapsed)));
+            }
+            LOG_INFO(Service, "nx2:vi2 guest cores busy: {}; busiest threads:{}", cores, threads);
+        }
+        m_guest_cpu = std::move(sample);
+    }
 
     // The console flips one frame per 60 Hz vblank and keeps the rest queued, so a game can't
     // present faster than that. Every slot is reported free here: hold each present until the

@@ -10,6 +10,8 @@
 #include <tuple>
 
 #include "common/common_funcs.h"
+#include "common/host_memory.h"
+#include "core/device_memory.h"
 #include "core/hle/kernel/k_light_lock.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_page_heap.h"
@@ -216,6 +218,16 @@ private:
         }
         void Free(KPhysicalAddress addr, size_t num_pages) {
             m_heap.Free(addr, num_pages);
+            if (m_host_memory != nullptr) {
+                // Large freed blocks give their host memory back (host_memory.h); Mario Kart
+                // World's scene pools stayed resident or in swap for the rest of the session.
+                m_host_memory->ReleaseBackingRegion(GetInteger(addr) - Core::DramMemoryMap::Base,
+                                                    num_pages * PageSize);
+            }
+        }
+
+        void SetHostMemory(Common::HostMemory* host_memory) {
+            m_host_memory = host_memory;
         }
 
         void SetInitialUsedHeapSize(size_t reserved_size) {
@@ -333,6 +345,7 @@ private:
         Pool m_pool{};
         Impl* m_next{};
         Impl* m_prev{};
+        Common::HostMemory* m_host_memory{};
     };
 
 private:

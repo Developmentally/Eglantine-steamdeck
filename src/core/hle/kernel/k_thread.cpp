@@ -22,12 +22,14 @@
 #include "common/settings.h"
 #include "common/random.h"
 #include "core/core.h"
+#include "core/core_timing.h"
 #include "core/cpu_manager.h"
 #include "core/hardware_properties.h"
 #include "core/hle/kernel/k_condition_variable.h"
 #include "core/hle/kernel/k_handle_table.h"
 #include "core/hle/kernel/k_memory_layout.h"
 #include "core/hle/kernel/k_process.h"
+#include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/k_resource_limit.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
@@ -1356,6 +1358,9 @@ namespace Kernel {
         KScopedSchedulerLock sl(kernel);
         // If we're waiting, notify our queue that we're available.
         if (this->GetState() == ThreadState::Waiting) {
+            const auto* readable = signaled_object->DynamicCast<KReadableEvent*>();
+            m_wait_accounting.last_object = {signaled_object->GetTypeObj().GetName(),
+                                             readable != nullptr ? readable->GetParent() : nullptr};
             m_wait_queue->NotifyAvailable(kernel, this, signaled_object, wait_result);
         }
     }
@@ -1386,9 +1391,35 @@ namespace Kernel {
 
     void KThread::SetState(KernelCore& kernel, ThreadState state) {
         KScopedSchedulerLock sl{kernel};
+        const ThreadState old_state = m_thread_state.load(std::memory_order_relaxed);
+        if (m_thread_type == ThreadType::User) {
+            const bool was_waiting = (old_state & ThreadState::Mask) == ThreadState::Waiting;
+            const bool waits = (state & ThreadState::Mask) == ThreadState::Waiting;
+            if (was_waiting != waits) {
+                const s64 now = kernel.System().CoreTiming().GetClockTicks();
+                if (was_waiting) {
+                    const s64 waited = now - m_wait_accounting.wait_begin;
+                    const auto reason = static_cast<size_t>(m_wait_reason_for_debugging);
+                    m_wait_accounting.ticks_by_reason[reason < WaitReasonCount ? reason : 0] += waited;
+                    ++m_wait_accounting.wakes_by_reason[reason < WaitReasonCount ? reason : 0];
+                    if (m_wait_reason_for_debugging == ThreadWaitReasonForDebugging::Synchronization) {
+                        // No signalled object: the wait timed out or was cancelled.
+                        const auto key = m_wait_accounting.last_object.first != nullptr
+                                             ? m_wait_accounting.last_object
+                                             : WaitAccounting::ObjectKey{"timeout/cancel", nullptr};
+                        m_wait_accounting.ticks_by_object[key] += waited;
+                    }
+                    m_wait_accounting.last_object = {};
+                    if ((state & ThreadState::Mask) == ThreadState::Runnable) {
+                        m_wait_accounting.runnable_since = now;
+                    }
+                } else {
+                    m_wait_accounting.wait_begin = now;
+                }
+            }
+        }
         // Clear debugging state
         this->SetWaitReasonForDebugging({});
-        const ThreadState old_state = m_thread_state.load(std::memory_order_relaxed);
         m_thread_state.store(
             static_cast<ThreadState>((old_state & ~ThreadState::Mask) | (state & ThreadState::Mask)),
             std::memory_order_relaxed);

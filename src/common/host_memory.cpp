@@ -865,6 +865,29 @@ void HostMemory::ClearBackingRegion(size_t physical_offset, size_t length, u32 f
     }
 }
 
+bool HostMemory::ReleaseBackingRegion(size_t physical_offset, size_t length) {
+#if !(defined(__OPENORBIS__) || defined(__managarm__))
+    constexpr size_t ReleaseThreshold = HugePageSize;
+    if (length < ReleaseThreshold || !impl || physical_offset + length > backing_size) {
+        return false;
+    }
+    if (!impl->ReleaseBackingRegion(physical_offset, length)) {
+        return false;
+    }
+    const size_t end = physical_offset + length;
+    for (size_t index = physical_offset >> GranuleShift; index <= (end - 1) >> GranuleShift; ++index) {
+        const size_t granule_begin = index << GranuleShift;
+        const size_t granule_end = granule_begin + (size_t{1} << GranuleShift);
+        if (granule_begin >= physical_offset && granule_end <= end) {
+            granules[index].fetch_and(static_cast<u8>(~GranuleDirty), std::memory_order_release);
+        }
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 void HostMemory::MarkUsed(size_t physical_offset, size_t length) {
     if (length == 0) {
         return;

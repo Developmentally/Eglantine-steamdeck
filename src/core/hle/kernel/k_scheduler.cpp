@@ -354,6 +354,7 @@ void KScheduler::SwitchThread(KernelCore& kernel, KThread* next_thread) {
         cur_process->AddCpuTime(tick_diff);
     }
     m_last_context_switch_time = cur_tick;
+    next_thread->NoteDispatched(cur_tick);
 
     // Update our previous thread.
     if (cur_process != nullptr) {

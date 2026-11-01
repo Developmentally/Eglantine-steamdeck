@@ -108,6 +108,7 @@ void KMemoryManager::Initialize(KVirtualAddress management_region, size_t manage
 
         const size_t cur_size = manager->Initialize(region_address, region_size, management_region,
                                                     management_region_end, region_pool);
+        manager->SetHostMemory(std::addressof(m_system.DeviceMemory().buffer));
         management_region += cur_size;
         ASSERT(management_region <= management_region_end);
 
