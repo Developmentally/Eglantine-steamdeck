@@ -581,13 +581,16 @@ public:
         return releases;
     }
 
-    void Note(u64 device_address, u32 payload, u64 split_position) {
+    /// `with_timestamp`: a 16-byte release (payload, 0, 64-bit timestamp), as far as the caller
+    /// knows (Maxwell3D::FrontDmaRead treats the timestamp words as unpredictable).
+    void Note(u64 device_address, u32 payload, u64 split_position, bool with_timestamp = false) {
         Nx2SemaphoreHistory::Get().Record(device_address, payload, Nx2SemaphoreHistory::Queued);
         std::scoped_lock lk{mutex};
         auto& release = releases[device_address];
         release.payload = payload;
         release.position = split_position;
         release.passed_since = {};
+        release.with_timestamp = with_timestamp;
         ++release.outstanding;
         count.store(releases.size(), std::memory_order_release);
     }
@@ -600,7 +603,7 @@ public:
     /// value memory will never hold lets an acquire pass early, and a channel that runs ahead
     /// of its releases deadlocks the game (`011932`).
     [[nodiscard]] std::optional<u32> Pending(u64 device_address, u64 split_position,
-                                             u64 back_position) {
+                                             u64 back_position, bool* with_timestamp = nullptr) {
         if (count.load(std::memory_order_acquire) == 0) {
             return std::nullopt;
         }
@@ -625,6 +628,9 @@ public:
                 expired.fetch_add(1, std::memory_order_relaxed);
                 return std::nullopt;
             }
+        }
+        if (with_timestamp != nullptr) {
+            *with_timestamp = release.with_timestamp;
         }
         return release.payload;
     }
@@ -664,6 +670,7 @@ private:
         u32 payload{};
         u64 position{};
         u32 outstanding{};
+        bool with_timestamp{};
         std::chrono::steady_clock::time_point passed_since{}; ///< First seen behind the back
     };
     std::mutex mutex;

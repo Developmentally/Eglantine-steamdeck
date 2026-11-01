@@ -81,7 +81,7 @@ inline u64 Now() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 27> counters{}; ///< See Counter
+    std::array<u64, 28> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
 };
@@ -150,6 +150,7 @@ enum class Counter : u32 {
     ParameterFlushesSkipped, ///< Parameter entries on indirect draw records flushed since the last reset
     DrainCommandLists,  ///< Front drains for command lists on pages the GPU has written (dma_pusher)
     DrainEngineWrites,  ///< Front drains for command lists a queued copy or upload writes (dma_pusher)
+    DmaReadPredicted,   ///< Native MME DMA reads answered without a drain (queued releases applied)
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -210,10 +211,11 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
-    line += fmt::format(" | drains: acquire {:.0f} poll {:.0f} dma read {:.0f} sync {:.0f} other {:.0f}",
+    line += fmt::format(" | drains: acquire {:.0f} poll {:.0f} dma read {:.0f} (predicted {:.0f}) sync {:.0f} other {:.0f}",
                         static_cast<double>(data.counters[8]) * 1e9 / window,
                         static_cast<double>(data.counters[9]) * 1e9 / window,
                         static_cast<double>(data.counters[10]) * 1e9 / window,
+                        static_cast<double>(data.counters[27]) * 1e9 / window,
                         static_cast<double>(data.counters[11]) * 1e9 / window,
                         static_cast<double>(data.counters[12]) * 1e9 / window);
     line += fmt::format(" | acquires met by drain {:.0f} (flush {:.0f}), by fences {:.0f}",

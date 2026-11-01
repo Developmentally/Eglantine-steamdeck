@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <unordered_map>
 #include "common/assert.h"
 #include "common/bit_util.h"
 #include "common/scope_exit.h"
@@ -812,6 +813,16 @@ struct Maxwell3D::FrontState {
     /// then can it have a deferred instanced draw to issue at the end of a macro.
     bool draw_pending{true};
     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+    /// A device page native MME DMA reads come from, and whether reads of it may skip the drain
+    /// (FrontDmaRead): trusted after 64 drained reads in a row that guest memory plus the queued
+    /// releases predicted, re-checked every 256th read after.
+    struct DmaPage {
+        u32 predicted_reads{};
+        u32 mispredictions{};
+        u32 reads{};
+        bool trusted{};
+    };
+    std::unordered_map<u64, DmaPage> dma_pages;
 };
 
 namespace {
@@ -965,7 +976,8 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
                 report.query.report == Regs::ReportSemaphore::Report::Payload &&
                 report.query.reduction_enable == 0) {
                 if (const auto device = memory_manager.GpuToCpuAddress(report.Address())) {
-                    Nx2QueuedReleases::Get().Note(*device, report.payload, split.SentPosition());
+                    Nx2QueuedReleases::Get().Note(*device, report.payload, split.SentPosition(),
+                                                  report.query.short_query == 0);
                 }
             }
             break;
@@ -1102,7 +1114,6 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                               FrontState& fs) {
 #ifdef ARCHITECTURE_x86_64
     const u32 method = fs.executing_macro;
-    fs.executing_macro = 0;
     auto& engine = GetNativeMacroEngine();
     const auto positions = GetNativeMacroPositions();
     const u32 start = positions[((method - MacroRegistersStart) >> 1) % positions.size()];
@@ -1135,6 +1146,7 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
                       fmt::join(fs.parameters, ","));
         }
     }
+    fs.executing_macro = 0;
     fs.parameters.clear();
     if (fs.draw_pending) {
         fs.draw_pending = false;
@@ -1214,10 +1226,13 @@ void Maxwell3D::FrontNoteDrawEnd(const FrontState& fs) {
 
 void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
                              u32 count) {
-    // The words may be written by methods still queued for the back (indirect draw arguments
-    // from a culling dispatch), and the caches that may hold newer ones belong to it.
-    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DrainDmaRead, 1);
-    split.Drain();
+    // The words may be written by work still queued for the back: a culling pass's indirect
+    // arguments through the buffer cache (title 1), or an engine semaphore release (title 2's
+    // render-enable flags: the CPU sets a slot to 1, a 3D payload release clears it, and the
+    // macro reads it to choose SET_RENDER_ENABLE_OVERRIDE). The first is only known after the
+    // back ran, so a drain and a flush; the second the front tracks (Nx2QueuedReleases), so once
+    // a page has shown, over enough drained reads, that only such releases change it, the words
+    // are read from guest memory with the queued payloads applied, and the back keeps running.
     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
     const u32 ram = fs.regs[0x156];
     const u32 words = std::min<u32>(count, 0x1000);
@@ -1225,11 +1240,89 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (VideoCommon::Nx2Profile::Enabled()) {
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
     }
-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
-        memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+    static const bool predict = [] {
+        const char* value = std::getenv("EDEN_NX2_DMA_READ_PREDICT");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const bool stats = std::getenv("EDEN_NX2_DMA_READ_STATS") != nullptr;
+    const std::optional<DAddr> device = memory_manager.GpuToCpuAddress(source);
+    const bool one_page = device && ((*device ^ (*device + read_bytes - 1)) >> 12) == 0;
+    FrontState::DmaPage* page = nullptr;
+    if (predict && one_page) {
+        page = &fs.dma_pages[*device >> 12];
+        ++page->reads;
     }
     std::array<u32, 0x1000> dma_words;
-    memory_manager.ReadWordsUnsafe(source, dma_words.data(), words);
+    // The words as they will be once the releases queued for them land: the payload, and for a
+    // long release its high word (0) and a timestamp nobody can predict (left unknown).
+    std::array<bool, 0x1000> unknown{};
+    const auto apply_releases = [&](std::span<u32> values) {
+        auto& releases = Nx2QueuedReleases::Get();
+        const u64 sent = split.SentPosition();
+        const u64 consumed = split.ConsumedPosition();
+        for (u32 i = 0; i < words; ++i) {
+            bool with_timestamp = false;
+            if (const auto payload = releases.Pending(*device + u64{i} * sizeof(u32), sent, consumed,
+                                                      &with_timestamp)) {
+                values[i] = *payload;
+                if (with_timestamp) {
+                    if (i + 1 < words) {
+                        values[i + 1] = 0;
+                    }
+                    for (u32 t = i + 2; t < std::min(i + 4, words); ++t) {
+                        unknown[t] = true;
+                    }
+                }
+            }
+        }
+    };
+    const bool copy_pending =
+        device && Nx2PendingGpuWrites::Get().Pending(*device, read_bytes, split.ConsumedPosition());
+    if (page && page->trusted && !copy_pending && (page->reads & 255) != 0) {
+        memory_manager.ReadWordsUnsafe(source, dma_words.data(), words);
+        apply_releases(std::span{dma_words.data(), words});
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadPredicted, 1);
+    } else {
+        // What the read would have returned without the drain: the page earns trust when the
+        // drain never changes it beyond what the queued releases said.
+        std::array<u32, 0x1000> predicted;
+        if (page) {
+            memory_manager.ReadWordsUnsafe(source, predicted.data(), words);
+            apply_releases(std::span{predicted.data(), words});
+        }
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DrainDmaRead, 1);
+        split.Drain();
+        const bool dirty =
+            memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache);
+        if (dirty) {
+            memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+        }
+        memory_manager.ReadWordsUnsafe(source, dma_words.data(), words);
+        if (page) {
+            bool as_predicted = !copy_pending && !dirty;
+            for (u32 i = 0; i < words && as_predicted; ++i) {
+                as_predicted = unknown[i] || dma_words[i] == predicted[i];
+            }
+            if (as_predicted) {
+                page->trusted = ++page->predicted_reads >= 64;
+            } else {
+                page->predicted_reads = 0;
+                page->trusted = false;
+                ++page->mispredictions;
+            }
+            if (stats && (!as_predicted || page->trusted)) {
+                static u64 logs{};
+                if (++logs <= 40 || logs % 500 == 0) {
+                    LOG_INFO(HW_GPU, "MME DMA read page {:#x}: {} (dirty {}, copy pending {}, {} good reads, {} mispredictions); macro {:#x} source {:#x} count {} predicted {} read {}",
+                             *device >> 12, as_predicted ? "trusted" : "mispredicted", dirty,
+                             copy_pending, page->predicted_reads, page->mispredictions,
+                             fs.executing_macro, source, words,
+                             fmt::join(std::span{predicted.data(), std::min<u32>(words, 6)}, ","),
+                             fmt::join(std::span{dma_words.data(), std::min<u32>(words, 6)}, ","));
+                }
+            }
+        }
+    }
     for (u32 i = 0; i < words; ++i) {
         const u32 word = dma_words[i];
         if (method == 0x158) {

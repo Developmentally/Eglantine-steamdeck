@@ -62,13 +62,14 @@ void DrainBack(VideoCommon::Nx2Profile::Counter site = VideoCommon::Nx2Profile::
 }
 
 // Called right after a release was queued for the back (see Nx2QueuedReleases).
-void NoteQueuedRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload) {
+void NoteQueuedRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload,
+                       bool with_timestamp = false) {
     auto& split = VideoCommon::GpuSplit::Get();
     if (!split.Active()) {
         return;
     }
     if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
-        Nx2QueuedReleases::Get().Note(*device, payload, split.SentPosition());
+        Nx2QueuedReleases::Get().Note(*device, payload, split.SentPosition(), with_timestamp);
     }
 }
 
@@ -327,9 +328,10 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                 rasterizer->Query(mirror, VideoCommon::QueryType::Payload, properties, payload, 0);
             }
         });
-        NoteQueuedRelease(dma_pusher, sequence_address, payload);
+        const bool with_timestamp = properties == VideoCommon::QueryPropertiesFlags::HasTimeout;
+        NoteQueuedRelease(dma_pusher, sequence_address, payload, with_timestamp);
         if (mirror != 0) {
-            NoteQueuedRelease(dma_pusher, mirror, payload);
+            NoteQueuedRelease(dma_pusher, mirror, payload, with_timestamp);
         }
     } else if (g_nx2_ampere) {
         // Switch 2 waits on semaphores the CPU (or another channel) releases, e.g. once it has
