@@ -110,6 +110,25 @@ inline bool PsDebugMatches(const PsDebugKnob& knob, u64 key) {
     return false;
 }
 
+// Whether bits 16..24 of a supported native opcode name a destination GPR. Predicate setters,
+// stores, reductions, barriers and control flow leave the field clear, which reads as R0.
+inline bool WritesGeneralRegister(u32 opcode) {
+    switch (opcode) {
+    case 0x20b: case 0x80b: case 0xa0b: // FSETP
+    case 0x20c: case 0x80c: case 0xa0c: case 0xc0c: // ISETP
+    case 0x234: case 0x434: // HSETP2
+    case 0x81c: // PLOP3
+    case 0x386: case 0x986: case 0x387: case 0x388: // STG, STL, STS
+    case 0xb9b: case 0x59f: case 0x98e: // SUST, SURED, RED
+    case 0x918: case 0x91a: case 0x992: case 0x9ab: case 0xb1d: case 0x95b: // NOP, DEPBAR, MEMBAR, ERRBAR, BAR, KILL
+    case 0x941: case 0x942: case 0x944: case 0x945: case 0x947: case 0x948: case 0x949: case 0x958:
+    case 0x94d: case 0x950: // BSYNC, BREAK, CALL, BSSY, BRA, WARPSYNC, BRX, BRXU, EXIT, RET
+        return false;
+    default:
+        return true;
+    }
+}
+
 // Lower only operations whose semantics are representable by the existing
 // Maxwell frontend. These are new instructions, not reinterpretations of the
 // native bytes. Scheduling/control words are added by the environment adapter.
@@ -164,7 +183,7 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
                     active_link = call_links[call];
                 }
             }
-            if (active_link && insn.Bits(16, 8) == *active_link)
+            if (active_link && insn.Bits(16, 8) == *active_link && WritesGeneralRegister(opcode))
                 return fail(index, "native callee overwrites link register");
         }
         // Scratch values and emulated uniform state occupy reserved high GPRs.
