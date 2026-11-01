@@ -1306,19 +1306,13 @@ inline LoweredProgram LowerToMaxwell(std::span<const Instruction> code) {
             break;
         }
         case 0x923: { // ISBERD: geometry shader vertex slot to vertex index.
-            // Geometry shaders address input vertex i as slot base + i * count, both taken from
-            // SR_INVOCATION_INFO (bytes 0 and 2). The Maxwell frontend reports base 0 and
-            // passes ISBERD through, so divide the slot by the count (exact for these small
-            // integers even through the approximate reciprocal).
+            // Geometry shaders address input vertex i as slot base * count + i, both taken from
+            // SR_INVOCATION_INFO (bytes 0 and 2). The Maxwell frontend reports base 0, so the
+            // slot already is the vertex index: pass it through. (Dividing it by the count, as
+            // this once did, read vertices 0, 1, 0 of every triangle.)
             const u32 slot = insn.Bits(24, 8);
             if (insn.words[1] || insn.words[2]) return fail(index, "native stage buffer read mode");
-            emit(0xf0c8000000000000ULL | predicate | 250 | (u64{29} << 20));
-            emit(0x3800000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{0x810} << 20));
-            emit(0x5cb8000000000000ULL | predicate | 250 | (u64{2} << 8) | (u64{2} << 10) | (u64{250} << 20));
-            emit(0x5080000000000000ULL | predicate | 250 | (u64{250} << 8) | (u64{4} << 20));
-            emit(0x5cb8000000000000ULL | predicate | 251 | (u64{2} << 8) | (u64{2} << 10) | (u64{slot} << 20));
-            emit(0x5c68000000000000ULL | predicate | 251 | (u64{251} << 8) | (u64{250} << 20));
-            emit(base(0x5cb0000000000000ULL) | (u64{2} << 8) | (u64{2} << 10) | (u64{251} << 20));
+            emit(base(0x5c98000000000000ULL) | (u64{slot} << 20) | (u64{15} << 39));
             break;
         }
         case 0x28c: case 0x88c: { // UISETP, signed (bit 73) or unsigned, with UPT accumulation.

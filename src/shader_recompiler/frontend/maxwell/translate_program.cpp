@@ -352,14 +352,15 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
         program.output_vertices = sph.common4.max_output_vertices;
         program.invocations = sph.common2.threads_per_input_primitive;
         program.is_geometry_passthrough = sph.common0.geometry_passthrough != 0;
-        // A passthrough program whose output map carries no position has nothing the rasterizer
-        // can consume: it runs only for its memory side effects (Donkey Kong Bananza collects
-        // visible terrain triangles this way). Passing the input primitive through anyway writes
-        // depth that the real hardware never produces, so translate it as a geometry shader that
-        // emits nothing.
+        // A passthrough program's output map can be empty: the rasterizer takes the vertex
+        // stage's outputs, and the program only decides per primitive whether it is drawn
+        // (ViewportMask 0 culls it). Donkey Kong Bananza's terrain pre-pass is one: it culls,
+        // collects the surviving triangles for the EQUAL colour pass, and still writes their
+        // depth. EDEN_NX2_GS_PASSTHROUGH_OMAP=1 restores the old reading (no emits at all),
+        // which left the terrain without depth and so invisible.
         static const bool honour_omap = [] {
             const char* value = std::getenv("EDEN_NX2_GS_PASSTHROUGH_OMAP");
-            return value == nullptr || value[0] != '0';
+            return value != nullptr && value[0] == '1';
         }();
         if (program.is_geometry_passthrough && honour_omap &&
             (sph.vtg.omap_systemb.raw & 0xf0) == 0) {
