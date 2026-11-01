@@ -1228,8 +1228,10 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
     if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
         memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
     }
+    std::array<u32, 0x1000> dma_words;
+    memory_manager.ReadWordsUnsafe(source, dma_words.data(), words);
     for (u32 i = 0; i < words; ++i) {
-        const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+        const u32 word = dma_words[i];
         if (method == 0x158) {
             fs.fifo.push_back(word);
         } else if (ram + i < native_data_ram.size()) {

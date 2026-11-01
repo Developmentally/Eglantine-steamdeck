@@ -767,6 +767,13 @@ void BufferCache<P>::PopAsyncBuffers() {
                                            end - start);
         });
         async_downloads.Subtract(device_addr, copy.size, [&](DAddr start, DAddr end) {
+            // Written again by the GPU since this download was queued: still modified.
+            if (uncommitted_gpu_modified_ranges.Intersects(start, end - start) ||
+                std::ranges::any_of(committed_gpu_modified_ranges, [&](const auto& ranges) {
+                    return ranges.Intersects(start, end - start);
+                })) {
+                return;
+            }
             gpu_modified_ranges.Subtract(start, end - start);
         });
     }
@@ -1126,9 +1133,7 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
             const MultiRangeSegment& segment = pool[binding.segment_first + index];
             Buffer& buffer = slot_buffers[segment.buffer_id];
             TouchBuffer(buffer, segment.buffer_id);
-            if (SynchronizeBuffer(buffer, segment.device_addr, segment.size)) {
-                runtime.InvalidateMultiRange(key);
-            }
+            SynchronizeBuffer(buffer, segment.device_addr, segment.size);
             const u32 offset = buffer.Offset(segment.device_addr);
             buffer.MarkUsage(offset, segment.size);
             if (is_written) {
@@ -1136,6 +1141,9 @@ bool BufferCache<P>::BindMultiRangeStorage(const Binding& binding, bool is_writt
             }
             runtime.PushMultiRangeSource(buffer, offset, segment.size);
         }
+        // The sources may have been written by the GPU since the last gather, which
+        // SynchronizeBuffer (CPU uploads) does not report.
+        runtime.InvalidateMultiRange(key);
         return runtime.BindMultiRangeStorageBuffer(key, is_written);
     } else {
         return false;

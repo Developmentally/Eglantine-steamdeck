@@ -188,7 +188,7 @@ bool DmaPusher::Step() {
     const CommandListHeader& header = current_command;
     dma_state.dma_get = header.addr;
 
-    if (signal_sync && !synced) {
+    if (signal_sync) {
         std::unique_lock lk(sync_mutex);
         sync_cv.wait(lk, [this]() { return synced; });
         signal_sync = false;

@@ -255,7 +255,9 @@ public:
     bool dma_increment_once : 1 = false;
     bool abort_entry : 1 = false;
     bool signal_sync : 1 = false;
-    bool synced : 1 = false;
+    /// Set by the fence callback on another thread: not a bitfield, or that store would race
+    /// with the flags above.
+    bool synced = false;
 };
 
 } // namespace Tegra
