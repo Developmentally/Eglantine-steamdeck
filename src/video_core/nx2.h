@@ -6,12 +6,18 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <unordered_map>
 #include <vector>
+
+#include <fmt/format.h>
 
 #include "common/common_types.h"
 
@@ -55,6 +61,45 @@ inline void Nx2ClearSemaphoreRegions() {
     for (auto& region : g_nx2_semaphore_regions) {
         region.store(0);
     }
+}
+
+// Device pages the GPU has written through the buffer cache (shader stores, copies), ever. Title 1
+// runs command lists the GPU writes each frame (20-byte entries its culling fills in); read
+// without a flush they are stale and the draws behind them (trees) go missing. The bits never
+// clear: the dispatch that rewrites a page may still be queued on the split's back when its front
+// reads the command list. One bit per 4 KiB of the 36-bit device address space (2 MiB).
+// (From zortos293/Eglantine.)
+inline constexpr u64 Nx2WrittenPageBits = 12;
+inline std::array<std::atomic<u64>, (u64{1} << (36 - Nx2WrittenPageBits)) / 64> g_nx2_gpu_written_pages{};
+
+inline void Nx2MarkGpuWritten(u64 device_address, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    const u64 last = std::min<u64>((device_address + size - 1) >> Nx2WrittenPageBits,
+                                   g_nx2_gpu_written_pages.size() * 64 - 1);
+    for (u64 page = device_address >> Nx2WrittenPageBits; page <= last; ++page) {
+        auto& word = g_nx2_gpu_written_pages[page / 64];
+        const u64 bit = u64{1} << (page % 64);
+        if ((word.load(std::memory_order_relaxed) & bit) == 0) {
+            word.fetch_or(bit, std::memory_order_relaxed);
+        }
+    }
+}
+
+/// A new emulation session starts: no page has been written by its GPU yet.
+inline void Nx2ClearGpuWrittenPages() {
+    for (auto& word : g_nx2_gpu_written_pages) {
+        word.store(0, std::memory_order_relaxed);
+    }
+}
+
+[[nodiscard]] inline bool Nx2IsGpuWritten(u64 device_address) {
+    const u64 page = device_address >> Nx2WrittenPageBits;
+    if (page >= g_nx2_gpu_written_pages.size() * 64) {
+        return false;
+    }
+    return (g_nx2_gpu_written_pages[page / 64].load(std::memory_order_relaxed) & (u64{1} << (page % 64))) != 0;
 }
 
 // Switch 2 sparse regions (nx2:gpu 214, word 7 bit 0x200: title 1's terrain texture arrays and
@@ -239,6 +284,117 @@ inline u64 Nx2SemaphoreMirror(u64 address) {
     return 0;
 }
 
+/// The last few thousand semaphore events by device address, for the report a channel makes
+/// after waiting 2 s on an acquire: what was queued for, landed on, or dropped at the words
+/// around it (a release that never lands is a deadlock on the console's side of things).
+/// Title 4's terrain indirect draw records: a reset program zeroes them (run on the CPU, see
+/// RasterizerVulkan::ResetIndirectRecordsOnCpu), a culling pass counts triangles into them on the
+/// GPU, and the colour pass reads them as macro parameters (DmaPusher::Step). They are flushed
+/// together once after each reset the front sent, instead of draining the back at each of the
+/// ~1,000 parameter entries a frame.
+class Nx2IndirectRecords {
+public:
+    static Nx2IndirectRecords& Get() {
+        static Nx2IndirectRecords records;
+        return records;
+    }
+
+    static constexpr u64 RecordBytes = 20;
+
+    /// Back: the records the reset program just rewrote (GPU addresses).
+    void SetPointers(const std::vector<u64>& pointers) {
+        std::vector<u64> sorted;
+        sorted.reserve(pointers.size());
+        for (const u64 pointer : pointers) {
+            if (pointer != 0) {
+                sorted.push_back(pointer);
+            }
+        }
+        std::sort(sorted.begin(), sorted.end());
+        sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+        std::scoped_lock lock{mutex};
+        records = std::move(sorted);
+    }
+
+    /// Whether gpu_addr lies in one of the records.
+    [[nodiscard]] bool Contains(u64 gpu_addr) const {
+        std::scoped_lock lock{mutex};
+        const auto next = std::upper_bound(records.begin(), records.end(), gpu_addr);
+        return next != records.begin() && gpu_addr < *(next - 1) + RecordBytes;
+    }
+
+    [[nodiscard]] std::vector<u64> Records() const {
+        std::scoped_lock lock{mutex};
+        return records;
+    }
+
+    /// Front: reset draws sent to the back, and the count at the last flush of the records.
+    std::atomic<u64> resets_sent{};
+    u64 resets_flushed{};
+
+private:
+    mutable std::mutex mutex;
+    std::vector<u64> records;
+};
+
+class Nx2SemaphoreHistory {
+public:
+    enum Source : u32 {
+        QueryLanded = 1,  ///< Query-cache release written (puller, 3D, DMA)
+        QmdLanded = 2,    ///< Compute QMD release written
+        Queued = 10,      ///< Front noted a release for the back (prediction)
+        Invalidated = 20, ///< Query-cache release dropped: the query was invalidated
+        Unsynced = 21,    ///< Query-cache release dropped: value never synced
+        GpuWrite = 30,    ///< Engine write of up to 64 bytes (first word kept)
+    };
+
+    static Nx2SemaphoreHistory& Get() {
+        static Nx2SemaphoreHistory history;
+        return history;
+    }
+
+    void Record(u64 device_address, u32 value, u32 source) {
+        const u64 now = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
+        std::scoped_lock lk{mutex};
+        entries[next++ % entries.size()] = {device_address, now, value, source};
+    }
+
+    /// Events on the 64 bytes at `block` (newest last), as "+offset=value source age".
+    [[nodiscard]] std::string Describe(u64 block) {
+        static constexpr std::array<const char*, 31> names{
+            "?", "landed", "qmd", "?", "?", "?", "?", "?", "?", "?", "queued", "?", "?", "?",
+            "?", "?", "?", "?", "?", "?", "dropped:invalidated", "dropped:unsynced", "?", "?",
+            "?", "?", "?", "?", "?", "?", "gpu-write"};
+        const u64 now = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
+        std::string text;
+        std::scoped_lock lk{mutex};
+        const size_t total = (std::min)(next, entries.size());
+        u32 shown{};
+        for (size_t i = 0; i < total && shown < 48; ++i) {
+            const auto& e = entries[(next - total + i) % entries.size()];
+            if ((e.address & ~u64{0x3f}) != block) {
+                continue;
+            }
+            ++shown;
+            text += fmt::format(" +{:#x}={:#x} {} {}ms", e.address - block, e.value,
+                                e.source < names.size() ? names[e.source] : "?",
+                                (now - e.time) / 1'000'000);
+        }
+        return text.empty() ? " (none)" : text;
+    }
+
+private:
+    struct Entry {
+        u64 address;
+        u64 time;
+        u32 value;
+        u32 source;
+    };
+    std::mutex mutex;
+    std::array<Entry, 16384> entries{};
+    size_t next{};
+};
+
 /// Channels suspended on a semaphore acquire. A console channel polls and sees every release;
 /// Eden writes releases in bursts when fences signal and resumes waiters only between command
 /// lists, so an acquire-equal could miss its value. Writes latch the waiters they satisfy.
@@ -279,17 +435,53 @@ public:
                                    [owner](const Waiter& w) { return w.owner == owner && w.latched; });
     }
 
+    /// Who wrote the value a latched waiter saw (0 none): 1 a query-cache release (puller or
+    /// 3D engine), 2 a compute QMD release. Profiling only.
+    [[nodiscard]] u32 LatchedBy(const void* owner) {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return 0;
+        }
+        std::scoped_lock lk{mutex};
+        for (const auto& w : waiters) {
+            if (w.owner == owner && w.latched) {
+                return w.source;
+            }
+        }
+        return 0;
+    }
+
     /// A GPU write of `value` to the u32 at `device_address`.
-    void OnWrite(u64 device_address, u32 value) {
+    void OnWrite(u64 device_address, u32 value, u32 source = 1) {
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
-        std::scoped_lock lk{mutex};
-        for (auto& w : waiters) {
-            if (w.address == device_address && !w.latched && Matches(w, value)) {
-                w.latched = true;
+        bool latched_any = false;
+        {
+            std::scoped_lock lk{mutex};
+            for (auto& w : waiters) {
+                if (w.address == device_address && !w.latched && Matches(w, value)) {
+                    w.latched = true;
+                    w.source = source;
+                    latched_any = true;
+                }
             }
         }
+        if (latched_any) {
+            {
+                std::scoped_lock lk{latch_mutex};
+                ++latch_generation;
+            }
+            latch_cv.notify_all();
+        }
+    }
+
+    /// Sleeps until a waiter latches or `timeout` passes: the GPU thread's poll loop, so a
+    /// release landing resumes its channel at once rather than after a host sleep.
+    template <typename Rep, typename Period>
+    void WaitForLatch(std::chrono::duration<Rep, Period> timeout) {
+        std::unique_lock lk{latch_mutex};
+        const u64 seen = latch_generation;
+        latch_cv.wait_for(lk, timeout, [&] { return latch_generation != seen; });
     }
 
 private:
@@ -299,6 +491,7 @@ private:
         u32 value;
         u32 operation;
         bool latched;
+        u32 source{};
     };
 
     static bool Matches(const Waiter& w, u32 current) {
@@ -317,6 +510,121 @@ private:
     std::mutex mutex;
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
+    std::mutex latch_mutex;
+    std::condition_variable latch_cv;
+    u64 latch_generation{};
 };
+
+/// Semaphore releases queued for the split GPU thread's back half (gpu_split.h) whose payload
+/// has not been written to guest memory yet, by device address: the puller's releases and the
+/// 3D engine's REPORT_SEMAPHORE releases the front parses. The value an acquire sees in order
+/// is the last of them, not the stale word in memory; and one it meets needs no drain of the
+/// back, which runs that release before anything queued after the acquire, as the hardware
+/// does in order. Noted and read on the front GPU thread; writes land from the back or the
+/// fencing thread (Nx2SemaphoreWaiters::OnWrite).
+class Nx2QueuedReleases {
+public:
+    static Nx2QueuedReleases& Get() {
+        static Nx2QueuedReleases releases;
+        return releases;
+    }
+
+    void Note(u64 device_address, u32 payload, u64 split_position) {
+        Nx2SemaphoreHistory::Get().Record(device_address, payload, Nx2SemaphoreHistory::Queued);
+        std::scoped_lock lk{mutex};
+        auto& release = releases[device_address];
+        release.payload = payload;
+        release.position = split_position;
+        release.passed_since = {};
+        ++release.outstanding;
+        count.store(releases.size(), std::memory_order_release);
+    }
+
+    /// The payload the word will hold once the releases queued for it have landed, if any
+    /// are still outstanding. `split_position` is the split's send position (entries from
+    /// before a restart go); `back_position` what the back has executed. A release the back
+    /// has run only waits for its host fence, so one still outstanding long after that never
+    /// lands (the query cache drops invalidated reports) and its prediction goes: predicting a
+    /// value memory will never hold lets an acquire pass early, and a channel that runs ahead
+    /// of its releases deadlocks the game (`011932`).
+    [[nodiscard]] std::optional<u32> Pending(u64 device_address, u64 split_position,
+                                             u64 back_position) {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return std::nullopt;
+        }
+        std::scoped_lock lk{mutex};
+        const auto it = releases.find(device_address);
+        if (it == releases.end()) {
+            return std::nullopt;
+        }
+        auto& release = it->second;
+        if (release.position > split_position) {
+            releases.erase(it);
+            count.store(releases.size(), std::memory_order_release);
+            return std::nullopt;
+        }
+        if (release.position <= back_position) {
+            const auto now = std::chrono::steady_clock::now();
+            if (release.passed_since == std::chrono::steady_clock::time_point{}) {
+                release.passed_since = now;
+            } else if (now - release.passed_since > std::chrono::milliseconds{100}) {
+                releases.erase(it);
+                count.store(releases.size(), std::memory_order_release);
+                expired.fetch_add(1, std::memory_order_relaxed);
+                return std::nullopt;
+            }
+        }
+        return release.payload;
+    }
+
+    /// Predictions dropped for outliving the back by 100 ms (diagnostics).
+    [[nodiscard]] u64 Expired() const noexcept {
+        return expired.load(std::memory_order_relaxed);
+    }
+
+    /// A GPU write to the u32 at `device_address` landed: one fewer release outstanding; the
+    /// last one landing retires the prediction whatever it wrote (a wrong one must not stay).
+    void OnWrite(u64 device_address) {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        std::scoped_lock lk{mutex};
+        const auto it = releases.find(device_address);
+        if (it != releases.end() && --it->second.outstanding == 0) {
+            releases.erase(it);
+            count.store(releases.size(), std::memory_order_release);
+        }
+    }
+
+    /// Drops a prediction memory has contradicted for a while (a release the back never made).
+    void Forget(u64 device_address) {
+        std::scoped_lock lk{mutex};
+        releases.erase(device_address);
+        count.store(releases.size(), std::memory_order_release);
+    }
+
+    [[nodiscard]] bool Empty() const noexcept {
+        return count.load(std::memory_order_acquire) == 0;
+    }
+
+private:
+    struct Release {
+        u32 payload{};
+        u64 position{};
+        u32 outstanding{};
+        std::chrono::steady_clock::time_point passed_since{}; ///< First seen behind the back
+    };
+    std::mutex mutex;
+    std::unordered_map<u64, Release> releases;
+    std::atomic<size_t> count{};
+    std::atomic<u64> expired{};
+};
+
+/// A GPU semaphore write landed in guest memory: wakes waiters, retires the queued release.
+inline void Nx2OnSemaphoreWrite(u64 device_address, u32 value, u32 source = 1) {
+    Nx2SemaphoreHistory::Get().Record(device_address, value, source);
+    Nx2SemaphoreWaiters::Get().OnWrite(device_address, value, source);
+    Nx2QueuedReleases::Get().OnWrite(device_address);
+}
 
 } // namespace Tegra

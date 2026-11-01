@@ -58,6 +58,26 @@ void MaxwellDMA::CallMethod(Core::System& system, u32 method, u32 method_argumen
     }
 }
 
+void MaxwellDMA::FrontNoteMethod(u64 split_position, u32 method, u32 argument) {
+    constexpr u32 semaphore_base = offsetof(Regs, semaphore) / sizeof(u32);
+    if (method >= semaphore_base && method < semaphore_base + 3) {
+        front_semaphore[method - semaphore_base] = argument;
+        return;
+    }
+    if (method != offsetof(Regs, launch_dma) / sizeof(u32)) {
+        return;
+    }
+    if (static_cast<LaunchDMA::SemaphoreType>((argument >> 3) & 3) ==
+        LaunchDMA::SemaphoreType::NONE) {
+        return;
+    }
+    const GPUVAddr address =
+        (GPUVAddr{front_semaphore[0] & 0xff} << 32) | front_semaphore[1];
+    if (const auto device = memory_manager.GpuToCpuAddress(address)) {
+        Nx2QueuedReleases::Get().Note(*device, front_semaphore[2], split_position);
+    }
+}
+
 void MaxwellDMA::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {
     for (u32 i = 0; i < amount; ++i) {
         CallMethod(system, method, base_start[i], methods_pending - i <= 1);

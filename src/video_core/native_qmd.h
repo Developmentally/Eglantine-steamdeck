@@ -14,6 +14,8 @@ namespace Tegra {
 class NativeQmdScheduler {
 public:
     using Word = std::uint32_t;
+    /// `mirror`: a second table, for a front half predicting the back's releases (nx2.h).
+    explicit NativeQmdScheduler(bool mirror = false) : states{mirror ? MirrorTable() : BackTable()} {}
     using Address = std::uint64_t;
     using Descriptor = std::array<Word, 64>;
     struct RejectShaderDispatch { bool operator()(const Descriptor&) const { return false; } };
@@ -134,6 +136,15 @@ private:
     // One table for every channel: a QMD's dependency counter is state of the QMD itself, and
     // title 1 schedules a QMD on one channel while another decrements it (a decrement that
     // arrived first was kept by the other channel's scheduler and the QMD never launched).
-    static inline std::unordered_map<Address, State> states;
+    using Table = std::unordered_map<Address, State>;
+    static Table& BackTable() {
+        static Table table;
+        return table;
+    }
+    static Table& MirrorTable() {
+        static Table table;
+        return table;
+    }
+    Table& states;
 };
 } // namespace Tegra

@@ -4,9 +4,12 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <type_traits>
 
@@ -100,6 +103,15 @@ public:
     /// Waits until the back executed everything sent so far.
     void Drain();
 
+    /// Position after everything sent so far (front only); restarts from 0 with the split.
+    [[nodiscard]] u64 SentPosition() const noexcept {
+        return write_position;
+    }
+    /// Position the back has executed up to.
+    [[nodiscard]] u64 ConsumedPosition() const noexcept {
+        return consumed.load(std::memory_order_acquire);
+    }
+
 private:
     enum class Kind : u64 {
         Wrap,   ///< The rest of the ring is unused: continue at its start
@@ -139,6 +151,8 @@ private:
         }
     }
     void WaitForSpace(size_t words);
+    /// Spins briefly, then sleeps until the back advances `consumed` past `seen`.
+    void WaitForConsumed(u64 seen, u32 spins);
     void SelectEngine(Tegra::Engines::EngineInterface* engine) {
         if (engine != front_engine) [[unlikely]] {
             SwitchEngine(engine);
@@ -148,6 +162,7 @@ private:
 
     void BackLoop(std::stop_token stop_token);
     size_t Execute(const u64* entry);
+    void StoreConsumed(u64 position);
 
     Core::System* system{};
     bool active{};
@@ -171,6 +186,11 @@ private:
     alignas(64) std::atomic<u64> consumed{};
     alignas(64) std::atomic<bool> back_waiting{};
     std::atomic<u32> wake{};
+    /// The front sleeps for `consumed` to advance (drain or full ring): the back notifies when
+    /// it stores while the flag is set.
+    std::atomic<bool> front_waiting{};
+    std::mutex front_mutex;
+    std::condition_variable front_cv;
     std::jthread back_thread;
 };
 

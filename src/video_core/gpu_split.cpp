@@ -168,18 +168,33 @@ void GpuSplit::WaitForSpace(size_t words) {
         return;
     }
     Publish();
-    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
-    for (u32 spins = 0;; ++spins) {
+    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitFull};
+    for (;;) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (write_position + words - consumed_cache <= RingWords) {
             return;
         }
-        if (spins < 4096) {
-            Pause();
-        } else {
-            std::this_thread::yield();
+        WaitForConsumed(consumed_cache, 2048);
+    }
+}
+
+void GpuSplit::WaitForConsumed(u64 seen, u32 spins) {
+    for (u32 spin = 0; spin < spins; ++spin) {
+        Pause();
+        if (consumed.load(std::memory_order_acquire) != seen) {
+            return;
         }
     }
+    // Yielding here kept a core busy for the whole wait, which on four hardware threads is time
+    // taken from the back and the guest cores. The back stores `consumed` and then looks at
+    // `front_waiting` (seq_cst on both sides): it either sees the flag and notifies under the
+    // mutex, or its store is visible to the predicate. The timeout bounds the cost of a missed
+    // wake-up (the callers re-check and come back); std::atomic<u64>::wait stalled for seconds.
+    std::unique_lock lk{front_mutex};
+    front_waiting.store(true, std::memory_order_seq_cst);
+    front_cv.wait_for(lk, std::chrono::microseconds{500},
+                      [&] { return consumed.load(std::memory_order_seq_cst) != seen; });
+    front_waiting.store(false, std::memory_order_relaxed);
 }
 
 void GpuSplit::Publish() {
@@ -202,17 +217,13 @@ void GpuSplit::Drain() {
     }
     Publish();
     Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
-    for (u32 spins = 0;; ++spins) {
+    for (;;) {
         consumed_cache = consumed.load(std::memory_order_acquire);
         if (consumed_cache == write_position) {
             publish_every = 8;
             return;
         }
-        if (spins < 16384) {
-            Pause();
-        } else {
-            std::this_thread::yield();
-        }
+        WaitForConsumed(consumed_cache, 2048);
     }
 }
 
@@ -270,13 +281,11 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 argument = static_cast<u32>(head >> 32);
         auto* const engine = back_engine;
         if ((head & Direct) != 0) {
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
             engine->CallMethod(*system, method, argument, true);
         } else if (!engine->execution_mask[method]) {
             engine->method_sink.emplace_back(method, argument);
         } else {
-            Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
             engine->ConsumeSink(*system);
             if ((head & HasSegment) != 0) {
                 engine->current_dma_segment = entry[1];
@@ -290,7 +299,6 @@ size_t GpuSplit::Execute(const u64* entry) {
         const u32 amount = static_cast<u32>(head >> 32);
         const size_t data = (head & HasSegment) != 0 ? 3 : 2;
         auto* const engine = back_engine;
-        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         engine->ConsumeSink(*system);
         if ((head & HasSegment) != 0) {
             engine->current_dma_segment = entry[2];
@@ -342,18 +350,29 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         }
         u64 last_store = read_position;
         g_back_busy.store(true, std::memory_order_relaxed);
+        // One zone per batch: two clock reads per method (1.5 M a second) were a fifth of
+        // this thread. Draws, clears and dispatches nest inside and keep their own zones.
+        Nx2Profile::Scope method_scope{Nx2Profile::Zone::Method};
         while (read_position != available) {
             const size_t index = read_position & RingMask;
             const size_t size = Execute(&ring[index]);
             read_position += size != 0 ? size : RingWords - index;
             // Hand ring space back now and then while working through a long batch.
             if (read_position - last_store >= 4096 && read_position != available) {
-                consumed.store(read_position, std::memory_order_release);
+                StoreConsumed(read_position);
                 last_store = read_position;
             }
         }
         g_back_busy.store(false, std::memory_order_release);
-        consumed.store(read_position, std::memory_order_release);
+        StoreConsumed(read_position);
+    }
+}
+
+void GpuSplit::StoreConsumed(u64 position) {
+    consumed.store(position, std::memory_order_seq_cst);
+    if (front_waiting.load(std::memory_order_seq_cst)) {
+        std::scoped_lock lk{front_mutex};
+        front_cv.notify_one();
     }
 }
 

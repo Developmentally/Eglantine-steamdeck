@@ -256,7 +256,9 @@ public:
 private:
     struct FrontState;
     FrontState& Front(VideoCommon::GpuSplit& split);
-    void FrontApply(FrontState& state, u32 method, u32 argument);
+    void FrontApply(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument);
+    void FrontQmdSignal(VideoCommon::GpuSplit& split, FrontState& state, GPUVAddr address,
+                        u32 argument);
     MacroEngine& FrontMacroEngine(FrontState& state);
     std::span<u32> FrontMacroPositions(FrontState& state);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);

@@ -160,6 +160,10 @@ private:
     template <typename Func>
     void PrepareDraw(bool is_indexed, Func&&);
 
+    /// Title 4's indirect draw record reset program, run here instead of on the GPU. True when
+    /// the current draw was it (nothing left to draw).
+    bool ResetIndirectRecordsOnCpu(bool is_indexed);
+
     void FlushWork();
 
     void UpdateDynamicStates();

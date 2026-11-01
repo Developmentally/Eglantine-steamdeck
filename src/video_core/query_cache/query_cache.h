@@ -276,6 +276,10 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
     std::function<void()> operation([this, is_synced, streamer, query_base = query, query_location,
                                      pointer, pointer_timestamp, cpu_addr] {
         if (True(query_base->flags & QueryFlagBits::IsInvalidated)) {
+            // Nothing lands, but the queued release is spent (its prediction must not stay).
+            Tegra::Nx2SemaphoreHistory::Get().Record(cpu_addr, static_cast<u32>(query_base->value),
+                                                     Tegra::Nx2SemaphoreHistory::Invalidated);
+            Tegra::Nx2QueuedReleases::Get().OnWrite(cpu_addr);
             if (!is_synced) [[likely]] {
                 impl->pending_unregister.push_back(query_location);
             }
@@ -284,6 +288,9 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
         if (False(query_base->flags & QueryFlagBits::IsFinalValueSynced)) [[unlikely]] {
             LOG_ERROR(HW_GPU,
                       "Query report value not synchronized. Consider increasing GPU accuracy.");
+            Tegra::Nx2SemaphoreHistory::Get().Record(cpu_addr, static_cast<u32>(query_base->value),
+                                                     Tegra::Nx2SemaphoreHistory::Unsynced);
+            Tegra::Nx2QueuedReleases::Get().OnWrite(cpu_addr);
             if (!is_synced) [[likely]] {
                 impl->pending_unregister.push_back(query_location);
             }
@@ -299,7 +306,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             u32 value = static_cast<u32>(query_base->value);
             std::memcpy(pointer, &value, sizeof(value));
         }
-        Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, static_cast<u32>(query_base->value));
+        Tegra::Nx2OnSemaphoreWrite(cpu_addr, static_cast<u32>(query_base->value));
         if (!is_synced) [[likely]] {
             impl->pending_unregister.push_back(query_location);
         }
@@ -316,7 +323,7 @@ void QueryCacheBase<Traits>::CounterReport(GPUVAddr addr, QueryType counter_type
             } else {
                 std::memcpy(pointer, &payload, sizeof(payload));
             }
-            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(cpu_addr, payload);
+            Tegra::Nx2OnSemaphoreWrite(cpu_addr, payload);
             streamer->Free(new_query_id);
             return;
         }

@@ -244,6 +244,59 @@ RasterizerVulkan::~RasterizerVulkan() {
     scheduler.Finish();
 }
 
+bool RasterizerVulkan::ResetIndirectRecordsOnCpu(bool is_indexed) {
+    // Donkey Kong Bananza's terrain: a vertex program run over points resets each chunk's 5-word
+    // indirect draw record to {triangles 0, copies 1, 0, 0, 0} through the pointers of a list
+    // (c0[0x110]). Stores through addresses loaded from memory can't be mapped onto a storage
+    // buffer, so the recompiler's global-memory fallback drops them: every record keeps 0 copies
+    // and the colour pass draws nothing (the terrain is "invisible"). Do that program's stores
+    // here instead. EDEN_NX2_RESETFIX=0 leaves them to the GPU. (Approach from zortos293/Eglantine.)
+    static const bool reset_fix = [] {
+        const char* value = std::getenv("EDEN_NX2_RESETFIX");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!reset_fix || is_indexed || !maxwell3d->GetNativeMacroEngine().native_turing) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    const GPUVAddr program =
+        (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+    if (!maxwell3d->IsIndirectResetProgram(program)) {
+        return false;
+    }
+    const auto& draw_state = maxwell3d->draw_manager.draw_state;
+    const auto& cbuf0 = maxwell3d->state.shader_stages[0].const_buffers[0];
+    const GPUVAddr list = gpu_memory->Read<u64>(cbuf0.address + 0x110);
+    const u32 count = std::min(draw_state.vertex_buffer.count, 1u << 20);
+    const GPUVAddr list_begin = list + u64{draw_state.vertex_buffer.first} * sizeof(u64);
+    const size_t list_bytes = size_t{count} * sizeof(u64);
+    if (count != 0 && gpu_memory->IsFullyMappedRange(list_begin, list_bytes)) {
+        if (gpu_memory->IsMemoryDirty(list_begin, list_bytes, VideoCommon::CacheType::BufferCache)) {
+            gpu_memory->FlushRegion(list_begin, list_bytes, VideoCommon::CacheType::BufferCache);
+        }
+        std::vector<u64> pointers(count);
+        gpu_memory->ReadBlockUnsafe(list_begin, pointers.data(), list_bytes);
+        Tegra::Nx2IndirectRecords::Get().SetPointers(pointers);
+        static constexpr std::array<u32, 5> record{0, 1, 0, 0, 0};
+        const std::span<const u8> bytes{reinterpret_cast<const u8*>(record.data()), sizeof(record)};
+        u32 written = 0;
+        for (const u64 pointer : pointers) {
+            if (pointer == 0 || !gpu_memory->IsFullyMappedRange(pointer, sizeof(record))) {
+                continue;
+            }
+            AccelerateInlineToMemory(pointer, sizeof(record), bytes);
+            ++written;
+        }
+        static u32 reset_logs{};
+        if (reset_logs < 5) {
+            ++reset_logs;
+            LOG_INFO(HW_GPU, "Indirect draw reset: list {:#x}, {} records ({} written)", list_begin,
+                     count, written);
+        }
+    }
+    return true;
+}
+
 template <typename Func>
 void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
 
@@ -296,6 +349,10 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
         return;
     }
     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+    if (ResetIndirectRecordsOnCpu(is_indexed)) {
+        submitted = true;
+        return;
+    }
     // update engine as channel may be different.
     pipeline->SetEngine(maxwell3d, gpu_memory);
     if (Profile::Scope scope{Profile::Zone::Configure}; !pipeline->Configure(is_indexed)) {

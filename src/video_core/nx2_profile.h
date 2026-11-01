@@ -51,6 +51,7 @@ enum class Zone : u32 {
     Method,       ///< Engine method calls (what a split GPU thread's back half would run)
     SplitDrain,   ///< Split GPU thread: the front waits for the back (gpu_split.h)
     SplitWait,    ///< Split GPU thread: the back waits for work
+    SplitFull,    ///< Split GPU thread: the front waits for ring space
     Count,
 };
 
@@ -61,7 +62,7 @@ inline constexpr std::array<const char*, static_cast<size_t>(Zone::Count)> zone_
     "sync descriptors", "read handles", "fill image views", "texture buffers", "update buffers",
     "descriptor acquire", "bind stage buffers", "push descriptors", "render targets",
     "configure draw", "dynamic state", "draw record", "texture upload", "fence",
-    "fence skipped", "method", "split drain", "split wait",
+    "fence skipped", "method", "split drain", "split wait", "split full",
 };
 
 // Read once at startup: Enabled() runs several times per method write (no guard to check).
@@ -80,7 +81,7 @@ inline u64 Now() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 8> counters{}; ///< See Counter
+    std::array<u64, 26> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
 };
@@ -130,6 +131,24 @@ enum class Counter : u32 {
     SameValueWrites, ///< Of MethodWrites: the register already held the value
     AcquireChecks,  ///< Semaphore acquires evaluated
     AcquireWaits,   ///< Of AcquireChecks: not met yet (the channel waits)
+    DrainAcquire,   ///< Back drains for a semaphore acquire (puller)
+    DrainPoll,      ///< Back drains polling a suspended channel's acquire
+    DrainDmaRead,   ///< Back drains for a native MME DMA read
+    DrainSync,      ///< Back drains for a synced command list (dma_pusher)
+    DrainOther,     ///< Back drains elsewhere (front state hand-over, verify, compute)
+    AcquireMetByDrain,  ///< Acquires met only once the back had run (its queued releases)
+    AcquireMetByFlush,  ///< Of those: the buffer cache held the word (memory was stale)
+    AcquireMetByFences, ///< Acquires met only after ReleaseFences()
+    WaitEndedByMemory,  ///< Suspended channels resumed by: the word in guest memory
+    WaitEndedByQuery,   ///< a puller/3D release landing (fence)
+    WaitEndedByQmd,     ///< a compute QMD release landing (fence)
+    WaitEndedByDrain,   ///< the periodic drain (buffer cache copy or prediction)
+    AcquirePredicted,   ///< Acquire checks answered by a queued release's predicted value
+    PredictionConflicts, ///< Predictions dropped because memory contradicted them for 50 ms
+    PredictionExpired,  ///< Predictions dropped for outliving the back's execution by 100 ms
+    DrainParameters,    ///< Front drains for macro parameters the GPU may have written (dma_pusher)
+    ParameterFlushesSkipped, ///< Parameter entries on indirect draw records flushed since the last reset
+    DrainCommandLists,  ///< Front drains for command lists on pages the GPU has written (dma_pusher)
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -190,6 +209,29 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
+    line += fmt::format(" | drains: acquire {:.0f} poll {:.0f} dma read {:.0f} sync {:.0f} other {:.0f}",
+                        static_cast<double>(data.counters[8]) * 1e9 / window,
+                        static_cast<double>(data.counters[9]) * 1e9 / window,
+                        static_cast<double>(data.counters[10]) * 1e9 / window,
+                        static_cast<double>(data.counters[11]) * 1e9 / window,
+                        static_cast<double>(data.counters[12]) * 1e9 / window);
+    line += fmt::format(" | acquires met by drain {:.0f} (flush {:.0f}), by fences {:.0f}",
+                        static_cast<double>(data.counters[13]) * 1e9 / window,
+                        static_cast<double>(data.counters[14]) * 1e9 / window,
+                        static_cast<double>(data.counters[15]) * 1e9 / window);
+    line += fmt::format(" | predicted {:.0f} ({:.0f} dropped, {:.0f} expired)",
+                        static_cast<double>(data.counters[20]) * 1e9 / window,
+                        static_cast<double>(data.counters[21]) * 1e9 / window,
+                        static_cast<double>(data.counters[22]) * 1e9 / window);
+    line += fmt::format(" | waits ended by: memory {:.0f} query release {:.0f} QMD release {:.0f} drain {:.0f}",
+                        static_cast<double>(data.counters[16]) * 1e9 / window,
+                        static_cast<double>(data.counters[17]) * 1e9 / window,
+                        static_cast<double>(data.counters[18]) * 1e9 / window,
+                        static_cast<double>(data.counters[19]) * 1e9 / window);
+    line += fmt::format(" | parameter drains {:.0f} (record flushes skipped {:.0f}), command list drains {:.0f}",
+                        static_cast<double>(data.counters[23]) * 1e9 / window,
+                        static_cast<double>(data.counters[24]) * 1e9 / window,
+                        static_cast<double>(data.counters[25]) * 1e9 / window);
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     data = {};
     data.window_start = now;

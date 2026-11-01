@@ -17,6 +17,7 @@
 #include "video_core/control/channel_state.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/engines/maxwell_3d.h"
+#include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
 #include "video_core/gpu_split.h"
 #include "video_core/guest_memory.h"
@@ -57,6 +58,58 @@ void DmaPusher::DispatchCalls() {
     }
     system.GPU().FlushCommands();
     system.GPU().OnCommandListEnd();
+}
+
+void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+    // Title 1 runs small command lists its culling dispatches fill in each frame. Accurate GPU
+    // mode reads every command list through the caches (safe reads); here only the ones on pages
+    // the GPU has written are, or their draws run with an older frame's words (trees vanish).
+    // The page bits are sticky and read without a drain, so the back only has to be drained for
+    // lists on pages it has ever written. EDEN_NX2_CMDFLUSH=0 turns this off.
+    static const bool flush_commands = [] {
+        const char* value = std::getenv("EDEN_NX2_CMDFLUSH");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!flush_commands || size == 0 || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        return;
+    }
+    bool written = false;
+    for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
+        if (const auto device = memory_manager.GpuToCpuAddress(page);
+            device && Tegra::Nx2IsGpuWritten(*device)) {
+            written = true;
+            break;
+        }
+    }
+    if (!written) {
+        return;
+    }
+    // The caches belong to the split's back, and the words may be written by work the front queued
+    // that the back has not run yet: it runs all of it first.
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DrainCommandLists, 1);
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.Drain();
+    }
+    if (memory_manager.IsMemoryDirty(address, size, VideoCommon::CacheType::BufferCache)) {
+        static std::atomic<u32> logs{};
+        const bool log = logs.load(std::memory_order_relaxed) < 20 && size <= 64;
+        std::array<u32, 16> before{};
+        if (log) {
+            memory_manager.ReadBlockUnsafe(address, before.data(), size);
+        }
+        memory_manager.FlushRegion(address, size, VideoCommon::CacheType::BufferCache);
+        if (log) {
+            std::array<u32, 16> after{};
+            memory_manager.ReadBlockUnsafe(address, after.data(), size);
+            if (before != after) {
+                logs.fetch_add(1, std::memory_order_relaxed);
+                const std::span<const u32> old_words{before.data(), size / sizeof(u32)};
+                const std::span<const u32> new_words{after.data(), size / sizeof(u32)};
+                LOG_INFO(HW_GPU, "Command list at {:#x} ({} bytes) was written by the GPU: flushed; guest words {:08x} -> {:08x}",
+                         address, size, fmt::join(old_words, ","), fmt::join(new_words, ","));
+            }
+        }
+    }
 }
 
 bool DmaPusher::Step() {
@@ -109,7 +162,60 @@ bool DmaPusher::Step() {
             if (kepler_payload || macro_payload) {
                 const size_t words = std::min<size_t>(dma_state.method_count, header.size);
                 auto* const engine_state = subchannels[dma_state.subchannel];
-                if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                // Macro parameters continued in an entry of their own can be words the GPU
+                // wrote: Donkey Kong Bananza's terrain culling pass counts each chunk's visible
+                // triangles into a 5-word indirect draw record and the colour pass points the
+                // draw macro's parameter entry at it. Read without a flush the macro sees a zero
+                // count and the terrain is never drawn. The records are flushed together once
+                // per reset the front sent (Nx2IndirectRecords); other parameter entries drain
+                // the back and flush their words when they are dirty. EDEN_NX2_PBFLUSH=0 turns
+                // this off. (Approach from zortos293/Eglantine.)
+                static const bool flush_parameters = [] {
+                    const char* value = std::getenv("EDEN_NX2_PBFLUSH");
+                    return value == nullptr || value[0] != '0';
+                }();
+                bool flushed_parameters = false;
+                if (flush_parameters && macro_payload && words <= 64) {
+                    namespace Profile = VideoCommon::Nx2Profile;
+                    auto& records = Tegra::Nx2IndirectRecords::Get();
+                    const GPUVAddr address = dma_state.dma_get;
+                    const size_t bytes = words * sizeof(u32);
+                    const bool record = records.Contains(address);
+                    if (record && records.resets_sent.load(std::memory_order_relaxed) == records.resets_flushed) {
+                        // Flushed after every reset sent so far: nothing queued rewrites them.
+                        Profile::Add(Profile::Counter::ParameterFlushesSkipped, 1);
+                        flushed_parameters = true;
+                    } else {
+                        Profile::Add(Profile::Counter::DrainParameters, 1);
+                        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+                            split.Drain();
+                        }
+                        // Only the words themselves: a page may also hold command lists and
+                        // semaphores the CPU writes, which a wider download would overwrite.
+                        if (record) {
+                            // The back ran every reset and culling pass sent before this entry.
+                            records.resets_flushed = records.resets_sent.load(std::memory_order_relaxed);
+                            constexpr u64 record_bytes = Tegra::Nx2IndirectRecords::RecordBytes;
+                            for (const u64 pointer : records.Records()) {
+                                if (memory_manager.IsMemoryDirty(pointer, record_bytes, VideoCommon::CacheType::BufferCache)) {
+                                    memory_manager.FlushRegion(pointer, record_bytes, VideoCommon::CacheType::BufferCache);
+                                }
+                            }
+                            flushed_parameters = true;
+                        } else if (memory_manager.IsMemoryDirty(address, bytes, VideoCommon::CacheType::BufferCache)) {
+                            memory_manager.FlushRegion(address, bytes, VideoCommon::CacheType::BufferCache);
+                            flushed_parameters = true;
+                            static std::atomic<u32> flush_logs{};
+                            if (flush_logs.fetch_add(1) < 20) {
+                                LOG_INFO(HW_GPU, "Macro parameters at {:#x} ({} words) were written by the GPU: flushed",
+                                         address, words);
+                            }
+                        }
+                    }
+                }
+                if (flushed_parameters) {
+                    engine_state->current_dirty = false;
+                } else if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
                                  bytes = words * sizeof(u32)] {
@@ -162,6 +268,7 @@ bool DmaPusher::Step() {
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
+            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
@@ -198,6 +305,7 @@ bool DmaPusher::Step() {
     }
 
     if (signal_sync) {
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DrainSync, 1);
         VideoCommon::GpuSplit::Get().Drain();
         rasterizer->SignalFence([this]() {
             std::scoped_lock lk(sync_mutex);
@@ -382,6 +490,9 @@ void DmaPusher::CallMethod(u32 argument) {
                                                  dma_state.is_last_call, &segment);
                         return;
                     }
+                } else if (type == Engines::EngineTypes::MaxwellDMA) {
+                    static_cast<Engines::MaxwellDMA*>(subchannel)->FrontNoteMethod(
+                        split.SentPosition(), dma_state.method, argument);
                 }
             }
             split.Method(subchannel, dma_state.method, argument, dma_state.is_last_call,
@@ -431,6 +542,13 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
                         compute->FrontCallMultiMethod(system, split, dma_state.method, base_start,
                                                       num_methods, dma_state.method_count, &segment);
                         return;
+                    }
+                } else if (type == Engines::EngineTypes::MaxwellDMA) {
+                    auto* const dma = static_cast<Engines::MaxwellDMA*>(subchannel);
+                    for (u32 i = 0; i < num_methods; ++i) {
+                        dma->FrontNoteMethod(split.SentPosition(),
+                                             dma_state.method + (dma_state.non_incrementing ? 0 : i),
+                                             base_start[i]);
                     }
                 }
             }

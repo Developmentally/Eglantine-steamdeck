@@ -366,7 +366,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         const u32 value = memory_manager.Read<u32>(address) + payload;
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                            Tegra::Nx2OnSemaphoreWrite(*device, value, 2);
                         }
                         static const u64 watch = [] {
                             const char* text = std::getenv("EDEN_NX2_SEM_WATCH");
@@ -386,7 +386,7 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
                         const u32 value = (std::max)(memory_manager.Read<u32>(address), payload);
                         memory_manager.Write<u32>(address, value);
                         if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-                            Tegra::Nx2SemaphoreWaiters::Get().OnWrite(*device, value);
+                            Tegra::Nx2OnSemaphoreWrite(*device, value, 2);
                         }
                     });
                 } else {
@@ -807,6 +807,11 @@ struct KeplerCompute::FrontState {
     bool compute_uploaded{};
     u32 bind_pointer{};
     MacroEngine* macro{}; ///< Without a native context: the one macro engine
+    // Mirror of the back's QMD scheduling, to predict the semaphore releases its dispatches
+    // will make (Nx2QueuedReleases): the back's acquires on them then need no round trip
+    // through a host GPU fence. QMDs uploaded inline are kept here until the back writes them.
+    NativeQmdScheduler qmd{true};
+    std::unordered_map<GPUVAddr, NativeQmdScheduler::Descriptor> inline_qmds;
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -827,12 +832,69 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
     return *front;
 }
 
-void KeplerCompute::FrontApply(FrontState& fs, u32 method, u32 argument) {
+void KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, FrontState& fs,
+                                   GPUVAddr address, u32 argument) {
+    auto& releases = Nx2QueuedReleases::Get();
+    const auto read = [&](u64 qmd_address, NativeQmdScheduler::Descriptor& descriptor) {
+        if (const auto it = fs.inline_qmds.find(qmd_address); it != fs.inline_qmds.end()) {
+            descriptor = it->second;
+            return true;
+        }
+        if (!memory_manager.IsFullyMappedRange(qmd_address, sizeof(descriptor))) {
+            return false;
+        }
+        memory_manager.ReadBlockUnsafe(qmd_address, descriptor.data(), sizeof(descriptor));
+        return true;
+    };
+    const auto release = [&](u64 destination, u32 payload, u32 flags) {
+        if (!memory_manager.IsFullyMappedRange(destination, sizeof(payload))) {
+            return false;
+        }
+        const auto device = memory_manager.GpuToCpuAddress(destination);
+        if (!device) {
+            return true;
+        }
+        u32 value = payload;
+        if (flags & ((1U << 26) | (1U << 19))) {
+            // Add or max: on top of the value the word will hold when the back gets here.
+            const u32 base = releases.Pending(*device, split.SentPosition(), split.ConsumedPosition())
+                                 .value_or(memory_manager.Read<u32>(destination));
+            value = (flags & (1U << 26)) ? base + payload : (std::max)(base, payload);
+        }
+        releases.Note(*device, value, split.SentPosition());
+        return true;
+    };
+    const auto dispatch = [](const NativeQmdScheduler::Descriptor&) { return true; };
+    const auto error = fs.qmd.Signal(address, argument, read, release, dispatch);
+    if (static u32 logged{}; !error.empty() && logged < 8) {
+        ++logged;
+        LOG_WARNING(HW_GPU, "Front QMD mirror: {} (QMD {:#x}, action {:#x})", error, address, argument);
+    }
+}
+
+void KeplerCompute::FrontApply(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                               u32 argument) {
     // As ProcessNativeMethod does with the macro code and bindings.
     if (method == 0x45 || method == 0x47) {
         fs.compute_uploaded = true;
     }
     fs.registers[method] = argument;
+    if (method == 0x107 && split.Active()) {
+        // Inline QMD (ProcessNativeMethod): written to memory by the back, launched at once
+        // unless the control word defers it.
+        const GPUVAddr address = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
+        NativeQmdScheduler::Descriptor descriptor{};
+        std::memcpy(descriptor.data(), fs.registers.data() + 0xc8, sizeof(descriptor));
+        fs.inline_qmds[address] = descriptor;
+        if ((fs.registers[0xa7] & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12))) {
+            FrontQmdSignal(split, fs, address, 3);
+        }
+    } else if (method == 0xaf || method == 0xb0) {
+        if (split.Active() && !(method == 0xaf && !(argument & 2)) &&
+            !(method == 0xb0 && ((argument & 15) == 0 || (argument & 15) == 1))) {
+            FrontQmdSignal(split, fs, GPUVAddr{fs.registers[0xad]} << 8, argument);
+        }
+    }
     switch (method) {
     case 0x45:
         FrontMacroEngine(fs).ClearCode(argument);
@@ -894,7 +956,7 @@ void KeplerCompute::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit&
         }
         return;
     }
-    FrontApply(fs, method, argument);
+    FrontApply(split, fs, method, argument);
     split.Method(this, method, argument, is_last_call, segment);
 }
 
@@ -910,7 +972,7 @@ void KeplerCompute::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuS
     }
     if (method < fs.registers.size()) {
         for (u32 i = 0; i < amount; ++i) {
-            FrontApply(fs, method, base_start[i]);
+            FrontApply(split, fs, method, base_start[i]);
         }
     }
     split.MultiMethod(this, method, base_start, amount, methods_pending, segment);
@@ -940,7 +1002,7 @@ void KeplerCompute::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& s
             if (address >= 0xe00) {
                 return false;
             }
-            FrontApply(fs, address, value);
+            FrontApply(split, fs, address, value);
             split.MacroWrite(this, address, value);
             return true;
         });

@@ -79,6 +79,8 @@ public:
         u32 operation;
         std::chrono::steady_clock::time_point since;
         bool reported;
+        u32 polls{}; ///< CanResumeAcquire checks so far (the back is drained on every 64th)
+        std::chrono::steady_clock::time_point conflict_since{}; ///< Memory met, prediction not
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

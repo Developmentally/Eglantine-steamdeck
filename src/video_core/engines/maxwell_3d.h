@@ -11,9 +11,11 @@
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "common/assert.h"
@@ -3083,6 +3085,12 @@ public:
         void ProcessMethodCall(Maxwell3D& maxwell3d, u32 method, u32 argument);
         void Clear(Maxwell3D& maxwell3d, u32 layer_count);
         void DrawDeferred(Maxwell3D& maxwell3d);
+        /// Instances after the first wait to be drawn together (DrawDeferred).
+        [[nodiscard]] bool HasDeferredDraw() const noexcept {
+            return draw_state.draw_mode == DrawMode::Instance && draw_state.instance_count != 0;
+        }
+        /// Methods an instance loop writes between its draws; any other write ends the loop.
+        [[nodiscard]] static bool IsInstanceLoopMethod(u32 method) noexcept;
         void DrawArray(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, u32 base_instance, u32 num_instances);
         void DrawArrayInstanced(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 vertex_first, u32 vertex_count, bool subsequent);
         void DrawIndex(Maxwell3D& maxwell3d, Maxwell3D::Regs::PrimitiveTopology topology, u32 index_first, u32 index_count, u32 base_index, u32 base_instance, u32 num_instances);
@@ -3158,6 +3166,9 @@ public:
     MacroEngine& GetNativeMacroEngine() { return native_macro_context ? native_macro_context->engine : macro_engine; }
     /// This channel's MME data RAM (shared with its compute engine).
     std::array<u32, 0xc00>& GetNativeDataRam() { return native_data_ram; }
+    /// Whether the vertex program at this address is title 4's indirect draw record reset
+    /// program (RasterizerVulkan::ResetIndirectRecordsOnCpu). Front or back thread.
+    [[nodiscard]] bool IsIndirectResetProgram(GPUVAddr program);
     std::span<u32> GetNativeMacroPositions() { return native_macro_context ? std::span<u32>{native_macro_context->positions} : std::span<u32>{macro_positions}; }
 
 
@@ -3345,6 +3356,8 @@ private:
                     bool is_last_call, bool from_macro);
     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
     void FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 count);
+    /// Front: a draw ended; a reset program's draw is counted (Nx2IndirectRecords).
+    void FrontNoteDrawEnd(const FrontState& fs);
     void FrontVerify(VideoCommon::GpuSplit& split, FrontState& state);
     void FinishFrontMacro(Core::System& system);
     std::unique_ptr<FrontState> front;
