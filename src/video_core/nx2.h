@@ -628,8 +628,18 @@ public:
         return latches.load(std::memory_order_acquire);
     }
 
-    /// Sleeps until a waiter latches or `timeout` passes: the GPU thread's poll loop, so a
-    /// release landing resumes its channel at once rather than after a host sleep.
+    /// Ends a WaitForLatch early: a submission arrived for the GPU thread to parse.
+    void Wake() {
+        {
+            std::scoped_lock lk{latch_mutex};
+            ++latch_generation;
+        }
+        latch_cv.notify_all();
+    }
+
+    /// Sleeps until a waiter latches, Wake() is called or `timeout` passes: the GPU thread's
+    /// poll loop, so a release landing resumes its channel at once rather than after a host
+    /// sleep.
     template <typename Rep, typename Period>
     void WaitForLatch(std::chrono::duration<Rep, Period> timeout) {
         std::unique_lock lk{latch_mutex};

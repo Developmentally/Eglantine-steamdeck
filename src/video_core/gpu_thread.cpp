@@ -5,6 +5,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include "common/assert.h"
@@ -73,9 +74,17 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
                     // The CPU usually releases the semaphore soon after: poll for half a
                     // millisecond before sleeping, or every wait also waits out a host sleep
                     // (title 1 waits ~25 times a second).
+                    // Releases the back lands and submissions both end the sleep early
+                    // (Nx2SemaphoreWaiters::Wake); only releases the guest CPU writes wait
+                    // for the timeout. EDEN_NX2_FRONT_SPIN_US sets the yield window (the
+                    // Deck's four cores are shared with six guest cores: 0 gives them the
+                    // thread back).
                     Profile::Scope scope{Profile::Zone::PendingSleep};
-                    if (std::chrono::steady_clock::now() - last_progress <
-                        std::chrono::microseconds{500}) {
+                    static const auto spin_window = [] {
+                        const char* value = std::getenv("EDEN_NX2_FRONT_SPIN_US");
+                        return std::chrono::microseconds{value ? std::strtol(value, nullptr, 10) : 500};
+                    }();
+                    if (std::chrono::steady_clock::now() - last_progress < spin_window) {
                         std::this_thread::yield();
                     } else {
                         Tegra::Nx2SemaphoreWaiters::Get().WaitForLatch(std::chrono::milliseconds{1});
@@ -187,6 +196,11 @@ u64 ThreadManager::PushCommand(CommandData&& command_data, bool block, bool is_a
     std::unique_lock lk(state.write_lock);
     const u64 fence{++state.last_fence};
     state.queue.EmplaceWait(std::move(command_data), fence, block);
+    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+        // The GPU thread may be sleeping on its suspended channels' latches rather than on
+        // the queue.
+        Tegra::Nx2SemaphoreWaiters::Get().Wake();
+    }
 
     if (block) {
         state.cv.wait(lk, thread.get_stop_token(), [this, fence] {
