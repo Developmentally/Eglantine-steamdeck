@@ -212,60 +212,61 @@ inline void Report(const char* thread_name = "GPU thread") {
         zoned += data.exclusive_ns[i];
     }
     data.exclusive_ns[0] = window > zoned ? window - zoned : 0;
+    const double wall = static_cast<double>(window);
     std::string line;
     for (size_t i = 0; i < data.exclusive_ns.size(); ++i) {
         if (data.exclusive_ns[i] == 0 && data.count[i] == 0) {
             continue;
         }
         // Per second of wall time: milliseconds spent and calls made.
-        const double ms = static_cast<double>(data.exclusive_ns[i]) * 1000.0 / window;
-        const double calls = static_cast<double>(data.count[i]) * 1e9 / window;
+        const double ms = static_cast<double>(data.exclusive_ns[i]) * 1000.0 / wall;
+        const double calls = static_cast<double>(data.count[i]) * 1e9 / wall;
         line += fmt::format(" | {} {:.1f} ms ({:.0f}/s)", zone_names[i], ms, calls);
     }
     line += fmt::format(" | buffer downloads {:.0f} KiB in {:.0f} copies ({:.0f} KiB on pages "
                         "MME DMA reads) | MME DMA reads {:.0f} KiB",
-                        static_cast<double>(data.counters[0]) * 1e9 / 1024.0 / window,
-                        static_cast<double>(data.counters[1]) * 1e9 / window,
-                        static_cast<double>(data.counters[3]) * 1e9 / 1024.0 / window,
-                        static_cast<double>(data.counters[2]) * 1e9 / 1024.0 / window);
+                        static_cast<double>(data.counters[0]) * 1e9 / 1024.0 / wall,
+                        static_cast<double>(data.counters[1]) * 1e9 / wall,
+                        static_cast<double>(data.counters[3]) * 1e9 / 1024.0 / wall,
+                        static_cast<double>(data.counters[2]) * 1e9 / 1024.0 / wall);
     line += fmt::format(" | 3D register writes {:.0f} ({:.0f} same value)",
-                        static_cast<double>(data.counters[4]) * 1e9 / window,
-                        static_cast<double>(data.counters[5]) * 1e9 / window);
+                        static_cast<double>(data.counters[4]) * 1e9 / wall,
+                        static_cast<double>(data.counters[5]) * 1e9 / wall);
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
-                        static_cast<double>(data.counters[6]) * 1e9 / window,
-                        static_cast<double>(data.counters[7]) * 1e9 / window);
+                        static_cast<double>(data.counters[6]) * 1e9 / wall,
+                        static_cast<double>(data.counters[7]) * 1e9 / wall);
     line += fmt::format(" | drains: acquire {:.0f} poll {:.0f} dma read {:.0f} (predicted {:.0f}) qmd read {:.0f} remap {:.0f} sync {:.0f} other {:.0f}",
-                        static_cast<double>(data.counters[8]) * 1e9 / window,
-                        static_cast<double>(data.counters[9]) * 1e9 / window,
-                        static_cast<double>(data.counters[10]) * 1e9 / window,
-                        static_cast<double>(data.counters[27]) * 1e9 / window,
-                        static_cast<double>(data.counters[28]) * 1e9 / window,
-                        static_cast<double>(data.counters[29]) * 1e9 / window,
-                        static_cast<double>(data.counters[11]) * 1e9 / window,
-                        static_cast<double>(data.counters[12]) * 1e9 / window);
+                        static_cast<double>(data.counters[8]) * 1e9 / wall,
+                        static_cast<double>(data.counters[9]) * 1e9 / wall,
+                        static_cast<double>(data.counters[10]) * 1e9 / wall,
+                        static_cast<double>(data.counters[27]) * 1e9 / wall,
+                        static_cast<double>(data.counters[28]) * 1e9 / wall,
+                        static_cast<double>(data.counters[29]) * 1e9 / wall,
+                        static_cast<double>(data.counters[11]) * 1e9 / wall,
+                        static_cast<double>(data.counters[12]) * 1e9 / wall);
     line += fmt::format(" | acquires met by drain {:.0f} (flush {:.0f}), by fences {:.0f}",
-                        static_cast<double>(data.counters[13]) * 1e9 / window,
-                        static_cast<double>(data.counters[14]) * 1e9 / window,
-                        static_cast<double>(data.counters[15]) * 1e9 / window);
+                        static_cast<double>(data.counters[13]) * 1e9 / wall,
+                        static_cast<double>(data.counters[14]) * 1e9 / wall,
+                        static_cast<double>(data.counters[15]) * 1e9 / wall);
     line += fmt::format(" | alias syncs {:.0f}/s walking {:.0f} aliases/s | unwritten at submit {:.0f}/s",
-                        static_cast<double>(data.counters[31]) * 1e9 / window,
-                        static_cast<double>(data.counters[32]) * 1e9 / window,
-                        static_cast<double>(data.counters[33]) * 1e9 / window);
+                        static_cast<double>(data.counters[31]) * 1e9 / wall,
+                        static_cast<double>(data.counters[32]) * 1e9 / wall,
+                        static_cast<double>(data.counters[33]) * 1e9 / wall);
     line += fmt::format(" | predicted {:.0f} ({:.0f} dropped, {:.0f} expired, {:.0f} behind the back)",
-                        static_cast<double>(data.counters[20]) * 1e9 / window,
-                        static_cast<double>(data.counters[21]) * 1e9 / window,
-                        static_cast<double>(data.counters[22]) * 1e9 / window,
-                        static_cast<double>(data.counters[30]) * 1e9 / window);
+                        static_cast<double>(data.counters[20]) * 1e9 / wall,
+                        static_cast<double>(data.counters[21]) * 1e9 / wall,
+                        static_cast<double>(data.counters[22]) * 1e9 / wall,
+                        static_cast<double>(data.counters[30]) * 1e9 / wall);
     line += fmt::format(" | waits ended by: memory {:.0f} query release {:.0f} QMD release {:.0f} drain {:.0f}",
-                        static_cast<double>(data.counters[16]) * 1e9 / window,
-                        static_cast<double>(data.counters[17]) * 1e9 / window,
-                        static_cast<double>(data.counters[18]) * 1e9 / window,
-                        static_cast<double>(data.counters[19]) * 1e9 / window);
+                        static_cast<double>(data.counters[16]) * 1e9 / wall,
+                        static_cast<double>(data.counters[17]) * 1e9 / wall,
+                        static_cast<double>(data.counters[18]) * 1e9 / wall,
+                        static_cast<double>(data.counters[19]) * 1e9 / wall);
     line += fmt::format(" | parameter drains {:.0f} (record flushes skipped {:.0f}), command list drains {:.0f}, engine write drains {:.0f}",
-                        static_cast<double>(data.counters[23]) * 1e9 / window,
-                        static_cast<double>(data.counters[24]) * 1e9 / window,
-                        static_cast<double>(data.counters[25]) * 1e9 / window,
-                        static_cast<double>(data.counters[26]) * 1e9 / window);
+                        static_cast<double>(data.counters[23]) * 1e9 / wall,
+                        static_cast<double>(data.counters[24]) * 1e9 / wall,
+                        static_cast<double>(data.counters[25]) * 1e9 / wall,
+                        static_cast<double>(data.counters[26]) * 1e9 / wall);
     LOG_INFO(HW_GPU, "{} per second:{}", thread_name, line);
     data = {};
     data.window_start = now;
