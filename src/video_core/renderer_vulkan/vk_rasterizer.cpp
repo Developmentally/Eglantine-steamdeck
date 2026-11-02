@@ -527,6 +527,33 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
                                      : maxwell3d->draw_manager.draw_state.vertex_buffer.count;
         RecordDrawStats(1, count * (std::max)(instance_count, 1U), false);
     }
+    // EDEN_NX2_DRAW_DELTA_LOG=<vertex program address, hex>: for the first draws with that
+    // program, the register writes since the previous draw (what a batch of them would have to
+    // carry), with the draw parameters.
+    if (static const u64 delta_vs = [] {
+            const char* value = std::getenv("EDEN_NX2_DRAW_DELTA_LOG");
+            return value != nullptr ? std::strtoull(value, nullptr, 16) : 0ULL;
+        }();
+        delta_vs != 0) {
+        const auto& regs = maxwell3d->regs;
+        const u64 vs = (u64{regs.pipelines[1].reserved[0] & 0xff} << 32) | regs.pipelines[1].reserved[1];
+        static u32 logged{};
+        if (vs == delta_vs && logged < 12) {
+            ++logged;
+            const auto& ds = maxwell3d->draw_manager.draw_state;
+            std::string writes;
+            for (const auto& w : maxwell3d->WritesSinceDraw()) {
+                writes += fmt::format(" {:#x}={:#x}", w.first, w.second);
+            }
+            LOG_INFO(HW_GPU, "Draw delta: vs {:#x} indexed {} first {} count {} base_vertex {} base_instance {} instances {} index {:#x} fmt {} topology {}; {} writes since the last draw:{}",
+                     vs, is_indexed, is_indexed ? ds.index_buffer.first : ds.vertex_buffer.first,
+                     is_indexed ? ds.index_buffer.count : ds.vertex_buffer.count, ds.base_index,
+                     ds.base_instance, instance_count, regs.index_buffer.StartAddress(),
+                     static_cast<u32>(regs.index_buffer.format), static_cast<u32>(ds.topology),
+                     maxwell3d->WritesSinceDraw().size(), writes);
+        }
+        maxwell3d->ClearWritesSinceDraw();
+    }
     // EDEN_NX2_CB24_TRACE: for draws whose vertex shader reads bank 24, show the inline
     // constant buffer upload target (CB_ADDRESS) and its first words.
     if (static const bool trace = std::getenv("EDEN_NX2_CB24_TRACE") != nullptr; trace) {
@@ -1816,11 +1843,21 @@ void RasterizerVulkan::TickFrame() {
     }
     if (!draw_stats.empty() && ++draw_stats_frames == 600) {
         std::vector<const DrawStats*> top;
+        u64 total_draws = 0;
+        u64 total_indirect = 0;
         for (const auto& [key, entry] : draw_stats) {
+            total_draws += entry.draws;
+            total_indirect += (entry.depth & 0x400) ? entry.draws : 0;
             if (entry.draws >= 300 || (entry.depth & 0x400)) {
                 top.push_back(&entry);
             }
         }
+        static auto last_dump = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        LOG_INFO(HW_GPU, "Draw stats: {} draws ({} indirect) in {} program pairs over 600 frames, {:.1f} s",
+                 total_draws, total_indirect, draw_stats.size(),
+                 std::chrono::duration<double>(now - last_dump).count());
+        last_dump = now;
         std::ranges::sort(top, std::greater{}, &DrawStats::vertices);
         for (const DrawStats* entry : top) {
             LOG_INFO(HW_GPU,

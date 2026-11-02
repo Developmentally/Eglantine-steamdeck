@@ -3329,6 +3329,15 @@ private:
         u32 pending;
     };
     std::array<RecentWrite, 48> recent_writes{};
+
+public:
+    /// EDEN_NX2_DRAW_DELTA_LOG: the register writes (method, value) since the last draw.
+    const std::vector<std::pair<u32, u32>>& WritesSinceDraw() const { return writes_since_draw; }
+    void ClearWritesSinceDraw() { writes_since_draw.clear(); }
+    std::vector<std::pair<u32, u32>> writes_since_draw;
+    bool record_writes_since_draw{std::getenv("EDEN_NX2_DRAW_DELTA_LOG") != nullptr};
+
+private:
     size_t recent_write_index = 0;
     void RecordWrite(u32 method, u32 argument, u32 amount, u32 pending) {
         recent_writes[recent_write_index++ % recent_writes.size()] = {method, argument, amount, pending};

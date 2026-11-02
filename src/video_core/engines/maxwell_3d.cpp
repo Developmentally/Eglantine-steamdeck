@@ -484,6 +484,9 @@ void Maxwell3D::CallMethod(Core::System& system, u32 method, u32 method_argument
             method_argument, static_cast<u32>(shadow_state.shadow_ram_control), is_last_call ? 1U : 0U};
     }
     const u32 argument = ProcessShadowRam(method, method_argument);
+    if (record_writes_since_draw && writes_since_draw.size() < 256) [[unlikely]] {
+        writes_since_draw.emplace_back(method, argument);
+    }
     // A state register written with the value it holds changes nothing: no dirty flags (they
     // would make the next draw re-check that state), no method processing. Title 1 makes ~6
     // million 3D register writes a second, ~60% of them same-value, most from macro replays.
@@ -518,6 +521,10 @@ void Maxwell3D::DumpRecentWrites(u32 method) {
 
 void Maxwell3D::CallMultiMethod(Core::System& system, u32 method, const u32* base_start, u32 amount, u32 methods_pending) {
     RecordWrite(method, amount ? base_start[0] : 0, amount, methods_pending);
+    if (record_writes_since_draw && writes_since_draw.size() < 256) [[unlikely]] {
+        // amount in the high half: a multi-method write of `amount` words from `method`.
+        writes_since_draw.emplace_back(method | (amount << 16), amount ? base_start[0] : 0);
+    }
     // Methods after 0xE00 are special, they're actually triggers for some microcode that was
     // uploaded to the GPU during initialization.
     if (method >= MacroRegistersStart) {
