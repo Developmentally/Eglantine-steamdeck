@@ -1158,18 +1158,20 @@ private:
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
                      u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
         }
-        // The present waits for this frame's fence. Returning early, waiting for the previous
-        // frame's fence instead (EDEN_NX2_FRAMES_AHEAD=1), let the game prepare frame N+1 while
-        // the GPU thread ran frame N and looked like a win (8-56 ms of every 34-105 ms frame on
-        // title 1), but the game takes the present's return as the GPU being done with that
-        // frame: it recycles the frame's command memory, and the GPU thread, still parsing it,
-        // read the next frame's words through torn entries (a release of 0xffffffff into the
-        // compute/3D handshake word, garbage shader stages). Donkey Kong Bananza froze on every
-        // big terrain break; with the wait it plays them, 31 fps.
-        static const bool frames_ahead = [] {
-            const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
-            return value != nullptr && value[0] == '1';
-        }();
+        // The console's compositor hands a buffer back to the game only once the frame rendered
+        // into it has passed its GPU fence, and that is what keeps the game from running ahead
+        // of the GPU: the game recycles a frame's command memory as soon as its buffer is back.
+        // This reply reports every buffer free, so the present itself waits for the frame's
+        // fence (no CPU/GPU overlap, but nothing the GPU thread has not read gets rewritten).
+        // EDEN_NX2_FRAMES_AHEAD=1 waits for the previous frame's fence instead: that let Donkey
+        // Kong Bananza reuse the command memory of a frame the GPU thread was still parsing
+        // (torn entries, a release of 0xffffffff into the compute/3D handshake word, garbage
+        // shader stages: a freeze on every big terrain break; with the wait, 31 fps there).
+        // EDEN_NX2_FRAMES_AHEAD=m reports the buffers' real state in the reply mask (BufferMask)
+        // and waits only when none is free, like the console: the right design, but Mario Kart
+        // World hung at boot with it once and reached 7.5 GB of GTT in its menus the next time,
+        // so it stays experimental.
+        const char pacing = Pacing();
         const auto entered = std::chrono::steady_clock::now();
         static const bool log_fences = std::getenv("EDEN_NX2_SYNCPT_LOG") != nullptr;
         if (log_fences) {
@@ -1177,15 +1179,33 @@ private:
                      m_presents, w[4], w[5], (w[7] & 0xffff) + 1, (w[7] >> 16) + 1, ~w[22], w[24],
                      ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
         }
-        if (frames_ahead) {
-            LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
-                      m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,
-                      ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
+        const u32 image_id = w[5];
+        const u32 fence_id = ~w[22];
+        const u32 fence_value = w[24];
+        if (pacing == '1') {
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
-            m_previous_fence_id = ~w[22];
-            m_previous_fence_value = w[24];
+            m_previous_fence_id = fence_id;
+            m_previous_fence_value = fence_value;
+        } else if (pacing == '0') {
+            WaitForFrame(fence_id, fence_value);
         } else {
-            WaitForFrame(~w[22], w[24]);
+            m_in_flight[image_id] = {fence_id, fence_value, m_presents};
+            // Nothing else to acquire: wait for the oldest frame still in flight.
+            while (FreeWindowImages(image_id) == 0) {
+                const InFlight* oldest = nullptr;
+                for (const auto& [id, frame] : m_in_flight) {
+                    if (id != image_id && (oldest == nullptr || frame.present < oldest->present)) {
+                        oldest = &frame;
+                    }
+                }
+                if (oldest == nullptr) {
+                    break;
+                }
+                WaitForFrame(oldest->fence_id, oldest->fence_value);
+                if (!system.Host1x().GetSyncpointManager().IsReadyGuest(oldest->fence_id, oldest->fence_value)) {
+                    break; // timed out: report it free rather than hang the game
+                }
+            }
         }
         const auto waited = std::chrono::steady_clock::now();
         // Word 7 packs the presented size as (width-1) | (height-1) << 16, the image's own size
@@ -1231,16 +1251,77 @@ private:
                 LogGuestCpu();
             }
         }
-        constexpr u64 AvailableSlots = 0x7fff;
-        TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
-                             static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+        const u64 mask = pacing == 'm' ? BufferMask() : 0x7fff;
+        TipcReplyWords(ctx, {static_cast<u32>(mask), static_cast<u32>(mask >> 32), 0, 0, 0, 0});
     }
 
-    // The console's compositor frees a buffer only once its frame's GPU fence has passed, which
-    // is what keeps a game from running ahead of the GPU. This reply always reports every buffer
-    // free, so pace the game here instead: wait (bounded, in case the GPU waits on the CPU) until
-    // Eden's GPU thread has processed the frame. Otherwise the game laps the GPU thread and
-    // rewrites command memory it hasn't read yet.
+    static char Pacing() {
+        static const char pacing = [] {
+            const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
+            return value != nullptr ? value[0] : '0';
+        }();
+        return pacing;
+    }
+
+    // A frame presented from a window image and not yet past its GPU fence.
+    struct InFlight {
+        u32 fence_id;
+        u32 fence_value;
+        u64 present;
+    };
+    std::map<u32, InFlight> m_in_flight;
+
+    /// Retires frames whose fence has passed; the first window-pool image id, or 0 if unknown.
+    u32 RetireFrames() {
+        auto& syncpoints = system.Host1x().GetSyncpointManager();
+        for (auto it = m_in_flight.begin(); it != m_in_flight.end();) {
+            if (it->second.fence_id >= 192 || syncpoints.IsReadyGuest(it->second.fence_id, it->second.fence_value)) {
+                it = m_in_flight.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        std::scoped_lock lk{m_objects->mutex};
+        for (const auto& [id, image] : m_objects->images) {
+            if (image.window_pool) {
+                return id;
+            }
+        }
+        return 0;
+    }
+
+    /// Window images not in flight, `presenting` excluded (its fence was just queued).
+    u32 FreeWindowImages(u32 presenting) {
+        const u32 first = RetireFrames();
+        u32 count = 0;
+        std::scoped_lock lk{m_objects->mutex};
+        const auto pool = m_objects->images.find(first);
+        const u32 images = pool != m_objects->images.end() ? pool->second.count : 3;
+        for (u32 id = first; id < first + images; ++id) {
+            if (id != presenting && !m_in_flight.contains(id)) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    /// The slots the game may acquire: every slot but those of frames still in flight. The slot
+    /// numbering is not known for sure, so a busy image clears both its id and its index in the
+    /// window pool.
+    u64 BufferMask() {
+        const u32 first = RetireFrames();
+        u64 mask = 0x7fff;
+        for (const auto& [id, frame] : m_in_flight) {
+            if (id < 64) {
+                mask &= ~(u64{1} << id);
+            }
+            if (id >= first && id - first < 64) {
+                mask &= ~(u64{1} << (id - first));
+            }
+        }
+        return mask;
+    }
+
     u32 m_wait_timeouts{};
     struct PresentStats {
         long long frame_us{}, fence_us{}, composite_us{}, pace_us{}, max_fence_us{};
@@ -1629,9 +1710,8 @@ private:
 
     // 228(u64 token, u32 slot): return a buffer without presenting it.
     void CancelClientBuffer(HLERequestContext& ctx) {
-        constexpr u64 AvailableSlots = 0x7fff;
-        TipcReplyWords(ctx, {static_cast<u32>(AvailableSlots),
-                             static_cast<u32>(AvailableSlots >> 32), 0, 0, 0, 0});
+        const u64 mask = Pacing() == 'm' ? BufferMask() : 0x7fff;
+        TipcReplyWords(ctx, {static_cast<u32>(mask), static_cast<u32>(mask >> 32), 0, 0, 0, 0});
     }
 
     void ReturnOne(HLERequestContext& ctx) {
