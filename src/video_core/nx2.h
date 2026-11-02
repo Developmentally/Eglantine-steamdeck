@@ -579,6 +579,22 @@ public:
         return 0;
     }
 
+    /// Microseconds since the owner's waiter latched (0 if none did). Profiling only.
+    [[nodiscard]] s64 LatchAgeUs(const void* owner) {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return 0;
+        }
+        std::scoped_lock lk{mutex};
+        for (const auto& w : waiters) {
+            if (w.owner == owner && w.latched) {
+                return std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - w.latched_at)
+                    .count();
+            }
+        }
+        return 0;
+    }
+
     /// A GPU write of `value` to the u32 at `device_address`.
     void OnWrite(u64 device_address, u32 value, u32 source = 1) {
         if (count.load(std::memory_order_acquire) == 0) {
@@ -591,6 +607,7 @@ public:
                 if (w.address == device_address && !w.latched && Matches(w, value)) {
                     w.latched = true;
                     w.source = source;
+                    w.latched_at = std::chrono::steady_clock::now();
                     latched_any = true;
                 }
             }
@@ -621,6 +638,7 @@ private:
         u32 operation;
         bool latched;
         u32 source{};
+        std::chrono::steady_clock::time_point latched_at{};
     };
 
     static bool Matches(const Waiter& w, u32 current) {
@@ -670,6 +688,7 @@ public:
         release.passed_since = {};
         release.with_timestamp = with_timestamp;
         release.who = who;
+        release.noted_at = std::chrono::steady_clock::now();
         ++release.outstanding;
         count.store(releases.size(), std::memory_order_release);
         if (Watched(device_address)) [[unlikely]] {
@@ -747,10 +766,28 @@ public:
         }
         std::scoped_lock lk{mutex};
         const auto it = releases.find(device_address);
-        if (it != releases.end() && --it->second.outstanding == 0) {
-            releases.erase(it);
-            count.store(releases.size(), std::memory_order_release);
+        if (it != releases.end()) {
+            landing_us += static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                               std::chrono::steady_clock::now() - it->second.noted_at).count());
+            ++landings;
+            if (--it->second.outstanding == 0) {
+                releases.erase(it);
+                count.store(releases.size(), std::memory_order_release);
+            }
         }
+    }
+
+    /// Average microseconds from a release being parsed by the front to its landing, since the
+    /// last call (diagnostics).
+    [[nodiscard]] std::string LandingLatency() {
+        std::scoped_lock lk{mutex};
+        const std::string text = landings != 0
+                                     ? fmt::format("{} landings, {} us from parse to landing on average",
+                                                   landings, landing_us / landings)
+                                     : std::string{"no landings"};
+        landings = 0;
+        landing_us = 0;
+        return text;
     }
 
     /// Drops a prediction memory has contradicted for a while (a release the back never made).
@@ -787,12 +824,15 @@ private:
         u32 outstanding{};
         bool with_timestamp{};
         const char* who{"?"}; ///< Engine that noted it (diagnostics)
+        std::chrono::steady_clock::time_point noted_at{};
         std::chrono::steady_clock::time_point passed_since{}; ///< First seen behind the back
     };
     std::mutex mutex;
     std::unordered_map<u64, Release> releases;
     std::atomic<size_t> count{};
     std::atomic<u64> expired{};
+    u64 landings{};
+    u64 landing_us{};
 };
 
 /// A GPU semaphore write landed in guest memory: wakes waiters, retires the queued release.

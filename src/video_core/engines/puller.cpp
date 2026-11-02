@@ -164,6 +164,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     const auto ended_by_latch = [&] {
         const u32 source = Nx2SemaphoreWaiters::Get().LatchedBy(this);
         pending_acquire->ended_by = source == 2 ? "QMD release" : "query release";
+        pending_acquire->latch_age_us = Nx2SemaphoreWaiters::Get().LatchAgeUs(this);
         if (VideoCommon::Nx2Profile::Enabled()) {
             VideoCommon::Nx2Profile::Add(source == 2 ? Counter::WaitEndedByQmd : Counter::WaitEndedByQuery, 1);
         }
@@ -273,6 +274,7 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
             struct Link {
                 u64 count{};
                 u64 us{};
+                u64 latch_age_us{}; ///< Release landed -> channel resumed (poll latency)
             };
             static std::map<std::tuple<u32, u64, std::string_view>, Link> links;
             static auto last_report = std::chrono::steady_clock::now();
@@ -280,21 +282,23 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
                                 std::string_view{pending_acquire->ended_by}}];
             ++link.count;
             link.us += static_cast<u64>(waited);
+            link.latch_age_us += static_cast<u64>(pending_acquire->latch_age_us);
             if (const auto now = std::chrono::steady_clock::now(); now - last_report > std::chrono::seconds{10}) {
                 const double seconds = std::chrono::duration<double>(now - last_report).count();
                 std::vector<std::pair<u64, std::string>> rows;
                 for (const auto& [key, value] : links) {
-                    rows.emplace_back(value.us, fmt::format("ch{} {:#x} by {}: {:.0f}/s, {:.1f} ms/s, {} us avg",
+                    rows.emplace_back(value.us, fmt::format("ch{} {:#x} by {}: {:.0f}/s, {:.1f} ms/s, {} us avg, resumed {} us after the landing",
                                                             std::get<0>(key), std::get<1>(key), std::get<2>(key),
                                                             value.count / seconds, value.us / 1000.0 / seconds,
-                                                            value.us / value.count));
+                                                            value.us / value.count, value.latch_age_us / value.count));
                 }
                 std::ranges::sort(rows, std::greater{});
                 std::string text;
                 for (size_t i = 0; i < rows.size() && i < 8; ++i) {
                     text += "\n  " + rows[i].second;
                 }
-                LOG_INFO(HW_GPU, "Acquire waits over {:.0f} s, heaviest links:{}", seconds, text);
+                LOG_INFO(HW_GPU, "Acquire waits over {:.0f} s ({}), heaviest links:{}", seconds,
+                         Nx2QueuedReleases::Get().LandingLatency(), text);
                 links.clear();
                 last_report = now;
             }
