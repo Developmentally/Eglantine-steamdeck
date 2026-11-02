@@ -3482,12 +3482,27 @@ template <class P>
 void TextureCache<P>::MarkModification(ImageBase& image) noexcept {
     image.flags |= ImageFlagBits::GpuModified;
     image.modification_tick = ++modification_tick;
+    // The images aliasing this one will have to copy from it: let their SynchronizeAliases
+    // know without walking every alias on every draw (Switch 2 titles sample images with
+    // ~40 aliases each; the walk was 5% of the GPU back thread).
+    for (const AliasedImage& aliased : image.aliased_images) {
+        slot_images[aliased.id].alias_max_tick = image.modification_tick;
+    }
 }
 
 template <class P>
 void TextureCache<P>::SynchronizeAliases(ImageId image_id) {
     boost::container::small_vector<const AliasedImage*, 8> aliased_images;
     Image& image = slot_images[image_id];
+    if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AliasSyncs, 1);
+    }
+    if (image.alias_max_tick <= image.modification_tick) {
+        return; // no alias has been modified since this image was
+    }
+    if (VideoCommon::Nx2Profile::Enabled()) [[unlikely]] {
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AliasSyncWalked, image.aliased_images.size());
+    }
     bool any_rescaled = True(image.flags & ImageFlagBits::Rescaled);
     bool any_modified = True(image.flags & ImageFlagBits::GpuModified);
     u64 most_recent_tick = image.modification_tick;
