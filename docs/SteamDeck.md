@@ -2,6 +2,8 @@
 
 This is the state of my fork of [Eglantine](https://github.com/Djihads80/Eglantine) as of 1 November 2026, three days after I started it. The goal is one thing: run Switch 2 games natively on a Steam Deck, with the Deck's own controls, the way the Deck already runs Switch 1 games. Everything below was measured on one Deck running SteamOS 3.8, with `eden-cli` (the SDL frontend, no Qt).
 
+If you just want to run it, download the AppImage from the [releases page](https://github.com/MFS-code/Eglantine-steamdeck/releases) and follow [the AppImage guide](user/SteamDeckAppImage.md).
+
 ## Where it is
 
 - **Donkey Kong Bananza** boots, gets through the menus, and is playable in the opening cave at 15-29 fps depending on the area. The diggable terrain renders (that took two days and three wrong fixes, see below). It used to freeze on every big terrain break (the pressure plate at the start): the present call returned after the *previous* frame's fence so the game could run a frame ahead, and within a frame of a big break the game recycled command memory the GPU thread had not read yet (a submit-time hash of every pushbuffer entry shows the entries rewritten 34 ms after submit). Any frame of overlap does it, even waiting for the previous frame on every channel; the present now waits for the current frame's fence and the breaks play.

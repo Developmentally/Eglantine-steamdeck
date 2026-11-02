@@ -193,9 +193,9 @@ jobs:
             flags=(--prerelease)
             title="Eglantine for Steam Deck ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})"
           fi
-          notes="eden-cli built from ${GITHUB_SHA} for the Steam Deck (SteamOS 3.8). The state of the fork, what runs and how fast, is in [docs/SteamDeck.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/SteamDeck.md).
+          notes="eden-cli built from ${GITHUB_SHA} for the Steam Deck (SteamOS 3.8). The state of the fork, what runs and how fast, is in [docs/SteamDeck.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/SteamDeck.md). Step-by-step setup, including a Steam shortcut for Game Mode: [docs/user/SteamDeckAppImage.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/user/SteamDeckAppImage.md).
 
-          **AppImage**: \`chmod +x\` it and run it from a terminal or a Steam shortcut; it bundles its libraries and needs glibc 2.39 or newer (SteamOS 3.8, Ubuntu 24.04, Fedora 40, Arch). Launch a loose dump with \`./eglantine-steamdeck-*.AppImage -g <title>/exefs/main\`; \`EDEN_NX2_AUTO_STUB=1\` is set by the launcher scripts in the repository and should be set here too.
+          **AppImage**: \`chmod +x\` it and run it from a terminal or a Steam shortcut; it bundles its libraries and needs glibc 2.39 or newer (SteamOS 3.8, Ubuntu 24.04, Fedora 40, Arch). Launch a loose dump with \`EDEN_NX2_AUTO_STUB=1 ./eglantine-steamdeck-*.AppImage -f -g <title>/exefs/main\`.
 
           **tar.gz**: \`eden-cli\` alone, linked against the system's ffmpeg, boost and opus at Ubuntu 24.04's versions.
 
