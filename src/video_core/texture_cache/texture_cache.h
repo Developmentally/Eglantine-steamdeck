@@ -142,7 +142,8 @@ void TextureCache<P>::RunGarbageCollector() {
         ticks_to_destroy = (std::max)(ticks_to_destroy, min_age);
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : 10);
     };
-    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode](ImageId image_id) {
+    bool allow_costly = false;
+    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &allow_costly](ImageId image_id) {
         if (num_iterations == 0) {
             return true;
         }
@@ -152,7 +153,7 @@ void TextureCache<P>::RunGarbageCollector() {
             return false;
         }
         const bool must_download = IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
-        if ((!aggressive_mode && True(image.flags & ImageFlagBits::CostlyLoad)) || (!high_priority_mode && must_download)) {
+        if ((!allow_costly && True(image.flags & ImageFlagBits::CostlyLoad)) || (!high_priority_mode && must_download)) {
             return false;
         }
         if (must_download) {
@@ -165,6 +166,18 @@ void TextureCache<P>::RunGarbageCollector() {
         }
         if (True(image.flags & ImageFlagBits::Tracked)) {
             UntrackImage(image, image_id);
+        }
+        if (image.guest_size_bytes >= 64_MiB) {
+            static u32 logged{};
+            if (logged++ < 40) {
+                LOG_INFO(HW_GPU, "Texture collector evicts {} MiB image {:#x} ({}x{}x{} layers {} levels {} format {}, costly {}, {} frames unused; used {} MiB, expected {} MiB, critical {} MiB)",
+                         image.guest_size_bytes >> 20, image.gpu_addr, image.info.size.width,
+                         image.info.size.height, image.info.size.depth, image.info.resources.layers,
+                         image.info.resources.levels, static_cast<u32>(image.info.format),
+                         True(image.flags & ImageFlagBits::CostlyLoad),
+                         frame_tick - lru_cache.GetTick(image.lru_index), total_used_memory >> 20,
+                         expected_memory >> 20, critical_memory >> 20);
+            }
         }
         ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
         UnregisterImage(image_id);
@@ -183,6 +196,19 @@ void TextureCache<P>::RunGarbageCollector() {
     if (total_used_memory >= critical_memory) {
         Configure(true);
         lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+    }
+    // Costly images (big layered arrays: seconds of unswizzling to bring back) only when still
+    // over the line, and only ones unused for a while. Evicting one Mario Kart World used 10
+    // frames earlier made the collector re-upload 260 MiB every few seconds, the GPU back
+    // thread unswizzling while both channels waited: 4-10 s stalls in the race.
+    if (total_used_memory >= critical_memory) {
+        Configure(true);
+        allow_costly = true;
+        static const u64 costly_age = [] {
+            const char* value = std::getenv("EDEN_NX2_TC_COSTLY_AGE");
+            return value != nullptr ? std::strtoull(value, nullptr, 10) : 90ULL;
+        }();
+        lru_cache.ForEachItemBelow(frame_tick - (std::max)(ticks_to_destroy, costly_age), Cleanup);
     }
 }
 

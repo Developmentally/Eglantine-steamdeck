@@ -169,6 +169,12 @@ struct WordManager {
             if (type == Type::GPU)
                 mask &= ~untracked_words[index];
             const u64 word = state_words[index] & mask;
+            // Nothing set in this word: nothing to report, and (for a clearing walk) nothing the
+            // clears below would change either. Switch 2 titles bind buffers of tens of MB per
+            // draw, so the walk is thousands of words long and almost always empty.
+            if (word == 0 && (!clear || type == Type::GPU || (untracked_words[index] & mask) == 0)) {
+                return;
+            }
             if (clear) {
                 if (type == Type::CPU || type == Type::CachedCPU) {
                     CollectChangedRanges(true, index, untracked_words[index], mask, ranges);

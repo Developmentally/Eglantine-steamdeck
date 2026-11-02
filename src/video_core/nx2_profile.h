@@ -9,6 +9,11 @@
 #include <string>
 #include <unordered_set>
 
+#if defined(__x86_64__)
+#include <x86intrin.h>
+#elif defined(_M_X64)
+#include <intrin.h>
+#endif
 #include "common/common_types.h"
 #include "common/logging.h"
 #include "common/cpu_features.h"
@@ -73,8 +78,20 @@ inline bool Enabled() {
 }
 
 // Nanoseconds; from the host's own counter where the wall clock reads it directly (the zones
-// run ~150,000 times a second, and QueryPerformanceCounter cost ~5% of the GPU thread).
+// run ~150,000 times a second, and QueryPerformanceCounter cost ~5% of the GPU thread). On x64
+// the wall clock fences its rdtsc on both sides; a zone boundary does not need that, and the
+// fences were 18% of the GPU back thread with the profile on (perf). Unfenced rdtsc, scaled by
+// the wall clock's own rate.
 inline u64 Now() {
+#if defined(__x86_64__) || defined(_M_X64)
+    if (Common::g_wall_clock.IsNative()) {
+        static const double ns_per_tick = [] {
+            const u64 ticks = Common::g_wall_clock.NsToTicks(std::chrono::nanoseconds{1'000'000'000});
+            return ticks != 0 ? 1e9 / static_cast<double>(ticks) : 1.0;
+        }();
+        return static_cast<u64>(static_cast<double>(__rdtsc()) * ns_per_tick);
+    }
+#endif
     return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
 }
 
