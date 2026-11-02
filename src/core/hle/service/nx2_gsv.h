@@ -1162,16 +1162,15 @@ private:
         // into it has passed its GPU fence, and that is what keeps the game from running ahead
         // of the GPU: the game recycles a frame's command memory as soon as its buffer is back.
         // The game ignores the slot mask in this reply (a probe handing out one slot at a time
-        // changed nothing), so the pacing happens in the call itself. Default (a): the present
-        // returns once every GPU channel has executed all it had been asked for at the previous
-        // present (each channel's syncpoint max then), so the game runs one frame ahead of the
-        // GPU thread without recycling anything it has not read. EDEN_NX2_FRAMES_AHEAD=0 waits
-        // for this frame's own fence (no overlap: Mario Kart World 18 instead of 25 fps).
-        // EDEN_NX2_FRAMES_AHEAD=1 waits for the previous frame's fence only, which is the 3D
-        // channel's: the compute channel could still be behind on that frame and Donkey Kong
-        // Bananza recycled its command memory (torn entries, a release of 0xffffffff into the
-        // compute/3D handshake word, garbage shader stages: a freeze on every big terrain
-        // break). EDEN_NX2_FRAMES_AHEAD=m reports the buffers' state in the mask (ignored).
+        // changed nothing), so the pacing happens in the call itself. Default (0): the present
+        // returns once this frame's fence has passed. Any overlap tears Donkey Kong Bananza:
+        // with EDEN_NX2_FRAMES_AHEAD=1 (the previous frame's fence) or =a (the previous frame
+        // finished on every channel) it recycles command memory the GPU thread has not read
+        // within a frame of a big terrain break (torn entries 34 ms after submit, a release of
+        // 0xffffffff into the compute/3D handshake word, garbage shader stages, a frozen game),
+        // so the console's present must be synchronous for it. Mario Kart World tolerates =a
+        // (25 instead of 18 fps, no torn entries in 45 min); it stays an opt-in.
+        // EDEN_NX2_FRAMES_AHEAD=m reports the buffers' state in the mask (ignored).
         const char pacing = Pacing();
         const auto entered = std::chrono::steady_clock::now();
         static const bool log_fences = std::getenv("EDEN_NX2_SYNCPT_LOG") != nullptr;
@@ -1292,7 +1291,7 @@ private:
     static char Pacing() {
         static const char pacing = [] {
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
-            return value != nullptr ? value[0] : 'a';
+            return value != nullptr ? value[0] : '0';
         }();
         return pacing;
     }
