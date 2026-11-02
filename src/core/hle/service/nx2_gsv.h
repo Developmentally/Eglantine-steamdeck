@@ -1520,6 +1520,7 @@ private:
     // next vblank instead (title 4 ran at up to 160 fps, its timing and audio with it).
     std::chrono::steady_clock::time_point m_next_vblank{};
     u32 m_swap_word{};
+    u32 m_swap_changes{};
 
     // timing: present word 12, (swap interval << 16) | refresh rate. Fire Emblem: Fortune's Weave
     // sends 0x1003c during its boot logos and 0x2003c (two vblanks per frame, 30 fps) after; paced
@@ -1535,9 +1536,13 @@ private:
         const u32 swap_interval =
             forced_interval != 0 ? forced_interval : std::clamp<u32>(timing >> 16, 1, 4);
         const u32 refresh_rate = (timing & 0xffff) >= 30 && (timing & 0xffff) <= 240 ? timing & 0xffff : 60;
-        if (timing != std::exchange(m_swap_word, timing)) {
-            LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x})",
-                     m_presents, swap_interval, refresh_rate, timing);
+        // Donkey Kong Bananza and Mario Kart World pick the interval per frame from their
+        // measured frame time, so it can change every few presents: log the first changes
+        // and then a sample.
+        if (timing != std::exchange(m_swap_word, timing) &&
+            (++m_swap_changes <= 8 || m_swap_changes % 1000 == 0)) {
+            LOG_INFO(Service, "nx2:vi2 present #{} swap interval {} at {} Hz (word 12 = {:#x}, change {})",
+                     m_presents, swap_interval, refresh_rate, timing, m_swap_changes);
         }
         const auto interval = std::chrono::nanoseconds{
             100'000'000'000LL * swap_interval / refresh_rate / Settings::SpeedLimit()};
