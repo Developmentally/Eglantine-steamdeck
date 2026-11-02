@@ -331,7 +331,14 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
         if (available == read_position) {
             Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
             // The front usually sends more within microseconds: spin briefly before sleeping.
-            for (u32 spins = 0; spins < 8192 && available == read_position; ++spins) {
+            // EDEN_NX2_BACK_SPIN sets how many pauses (8192 is ~150 us on the Deck; with the
+            // guest cores sharing its four cores, 1800 waits a second made that a quarter of
+            // a hardware thread).
+            static const u32 max_spins = [] {
+                const char* value = std::getenv("EDEN_NX2_BACK_SPIN");
+                return value ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 8192U;
+            }();
+            for (u32 spins = 0; spins < max_spins && available == read_position; ++spins) {
                 Pause();
                 available = published.load(std::memory_order_acquire);
             }
