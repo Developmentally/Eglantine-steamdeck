@@ -1,5 +1,10 @@
 name: release-binaries
 
+# Builds eden-cli for the Steam Deck (SteamOS 3.8: glibc 2.39, the same as Ubuntu 24.04) as a
+# self-contained AppImage plus a plain tar.gz, and publishes them as a GitHub release when a
+# deck-* tag is pushed. Manual runs build the current branch and publish a pre-release unless
+# "Publish" is unticked. The Qt frontend is not built: the Deck runs eden-cli (docs/SteamDeck.md).
+
 on:
   workflow_dispatch:
     inputs:
@@ -8,9 +13,8 @@ on:
         type: boolean
         default: true
   push:
-    branches:
-      - nx2
-      - nx2-experimental
+    tags:
+      - "deck-*"
 
 permissions:
   contents: read
@@ -21,71 +25,27 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.platform }} binary
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: linux-x86_64
-            runner: ubuntu-24.04
-          - platform: windows-x86_64
-            runner: windows-2022
-
+    name: linux-x86_64 eden-cli
+    runs-on: ubuntu-24.04
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Install Linux dependencies
-        if: matrix.platform == 'linux-x86_64'
+      # No libfmt-dev or nlohmann-json3-dev: CMake would pick Ubuntu's fmt 9 over the bundled
+      # fmt 12 and the build fails in common/logging.h (tools/steamdeck/README.md).
+      - name: Install dependencies
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            autoconf cmake g++ gcc git glslang-tools libglu1-mesa-dev \
+            autoconf g++ gcc git glslang-tools libglu1-mesa-dev \
             libpulse-dev libtool libudev-dev libxkbcommon-x11-0 \
-            mesa-common-dev nasm ninja-build qt6-base-private-dev \
-            qt6-charts-dev qt6-tools-dev libavfilter-dev libavcodec-dev \
+            mesa-common-dev nasm ninja-build libavfilter-dev libavcodec-dev \
             libswscale-dev pkg-config zlib1g-dev libva-dev libvdpau-dev \
             spirv-tools spirv-headers libusb-1.0-0-dev \
             libboost-dev libboost-fiber-dev libboost-context-dev \
-            libopus-dev libasound2-dev
-
-      - name: Install Qt on Linux
-        if: matrix.platform == 'linux-x86_64'
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: '6.8.3'
-          host: linux
-          target: desktop
-          arch: linux_gcc_64
-          modules: qtcharts
-          cache: true
-
-      - name: Set up MSVC
-        if: matrix.platform == 'windows-x86_64'
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Install Qt on Windows
-        if: matrix.platform == 'windows-x86_64'
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: '6.8.3'
-          host: windows
-          target: desktop
-          arch: win64_msvc2022_64
-          modules: qtcharts
-          cache: true
-
-      - name: Install Vulkan SDK on Windows
-        if: matrix.platform == 'windows-x86_64'
-        shell: pwsh
-        run: ./tools/windows/install-vulkan-sdk.ps1
-
-      - name: Verify Vulkan tools on Windows
-        if: matrix.platform == 'windows-x86_64'
-        shell: pwsh
-        run: glslangValidator --version
+            libopus-dev libasound2-dev libzstd-dev liblz4-dev libssl-dev ccache
+          cmake --version
 
       - name: Cache CPM downloads
         uses: actions/cache@v4
@@ -95,151 +55,154 @@ jobs:
           restore-keys: |
             cpm-${{ runner.os }}-
 
-      - name: Configure Linux
-        if: matrix.platform == 'linux-x86_64'
+      - name: Cache compiler objects
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ccache
+          key: ccache-linux-x86_64-${{ github.sha }}
+          restore-keys: |
+            ccache-linux-x86_64-
+
+      - name: Configure
         shell: bash
         run: >-
           cmake -S . -B build/release -G Ninja
           -DCMAKE_BUILD_TYPE=Release
           -DBUILD_TESTING=OFF
           -DYUZU_TESTS=OFF
+          -DENABLE_QT=OFF
           -DYUZU_CMD=ON
           -DYUZU_ROOM=OFF
           -DYUZU_ROOM_STANDALONE=OFF
-          -DYUZU_USE_BUNDLED_QT=OFF
-          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+          -DENABLE_WEB_SERVICE=OFF
+          -DENABLE_UPDATE_CHECKER=OFF
+          -DUSE_DISCORD_PRESENCE=OFF
           -DYUZU_USE_BUNDLED_SDL3=ON
           -DVulkanHeaders_FORCE_BUNDLED=ON
           -DVulkanUtilityLibraries_FORCE_BUNDLED=ON
-          -DENABLE_UPDATE_CHECKER=OFF
-          -DUSE_DISCORD_PRESENCE=OFF
-
-      - name: Configure Windows
-        if: matrix.platform == 'windows-x86_64'
-        shell: bash
-        run: >-
-          cmake -S . -B build/release -G Ninja
-          -DCMAKE_BUILD_TYPE=Release
-          -DBUILD_TESTING=OFF
-          -DYUZU_TESTS=OFF
-          -DYUZU_CMD=ON
-          -DYUZU_ROOM=OFF
-          -DYUZU_ROOM_STANDALONE=OFF
-          -DYUZU_USE_BUNDLED_QT=OFF
-          -DYUZU_USE_BUNDLED_SDL3=ON
-          -DENABLE_UPDATE_CHECKER=OFF
-          -DUSE_DISCORD_PRESENCE=OFF
+          -DUSE_CCACHE=ON
 
       - name: Build
         shell: bash
-        run: cmake --build build/release --target yuzu yuzu-cmd --parallel
+        run: |
+          cmake --build build/release --target yuzu-cmd --parallel
+          ccache --show-stats
+          test -x build/release/bin/eden-cli
+          strip build/release/bin/eden-cli
 
-      # A self-contained AppImage: linuxdeploy bundles every library the two programs need except
-      # the base system ones (glibc, X11/Wayland client libraries, the GPU driver and Vulkan loader),
-      # and its Qt plugin adds the Qt libraries and platform plugins. Runs on glibc 2.39+ systems.
-      - name: Package Linux AppImage
-        if: matrix.platform == 'linux-x86_64'
+      - name: Name the build
+        id: name
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # GitHub artifacts drop the executable bit; a tar keeps it. Uses the system's libraries
+      # (ffmpeg, boost, opus...) at the versions SteamOS 3.8 ships.
+      - name: Package tar.gz
         shell: bash
         run: |
           set -euo pipefail
-          test -x build/release/bin/eglantine
-          test -x build/release/bin/eden-cli
-          # Libraries Qt's xcb platform plugin needs, so linuxdeploy can resolve and bundle them.
-          sudo apt-get install -y --no-install-recommends libxcb-cursor0 libxcb-icccm4 libxcb-image0 \
-            libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 libxcb-xkb1
+          tar -czf "eglantine-steamdeck-${{ steps.name.outputs.version }}-linux-x86_64.tar.gz" \
+            -C build/release/bin eden-cli
+          ls -la eglantine-steamdeck-*.tar.gz
+
+      # linuxdeploy bundles every library eden-cli needs except the base system ones (glibc,
+      # X11/Wayland client libraries, the GPU driver and Vulkan loader). Runs on glibc 2.39+.
+      - name: Package AppImage
+        shell: bash
+        run: |
+          set -euo pipefail
           tools="$RUNNER_TEMP/linuxdeploy"
           mkdir -p "$tools"
           curl -fsSL -o "$tools/linuxdeploy-x86_64.AppImage" \
             https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
-          curl -fsSL -o "$tools/linuxdeploy-plugin-qt-x86_64.AppImage" \
-            https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
           chmod +x "$tools"/*.AppImage
-          # The desktop file names its icon dev.eglantine.eglantine.
-          icon="$RUNNER_TEMP/dev.eglantine.eglantine.png"
+          icon="$RUNNER_TEMP/dev.eglantine.eden-cli.png"
           cp dist/Eglantine.png "$icon"
+          cat > "$RUNNER_TEMP/dev.eglantine.eden-cli.desktop" <<'EOF'
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=Eglantine (Steam Deck)
+          GenericName=Switch 2 Emulator
+          Comment=Eglantine's eden-cli built for the Steam Deck
+          Icon=dev.eglantine.eden-cli
+          Exec=eden-cli %f
+          Terminal=true
+          Categories=Game;Emulator;
+          Keywords=Nintendo;Switch;
+          EOF
           export APPIMAGE_EXTRACT_AND_RUN=1
-          export QMAKE="$QT_ROOT_DIR/bin/qmake"
-          export LDAI_OUTPUT="eglantine-${GITHUB_SHA}-linux-x86_64.AppImage"
+          export LDAI_OUTPUT="eglantine-steamdeck-${{ steps.name.outputs.version }}-linux-x86_64.AppImage"
           export OUTPUT="$LDAI_OUTPUT"
+          export ARCH=x86_64
           "$tools/linuxdeploy-x86_64.AppImage" --appdir AppDir \
-            --executable build/release/bin/eglantine \
             --executable build/release/bin/eden-cli \
-            --desktop-file dist/dev.eden_emu.eden.desktop \
+            --desktop-file "$RUNNER_TEMP/dev.eglantine.eden-cli.desktop" \
             --icon-file "$icon" \
-            --plugin qt \
             --output appimage
           test -s "$LDAI_OUTPUT"
           ls -la "$LDAI_OUTPUT"
 
-      - name: Package Windows binary
-        if: matrix.platform == 'windows-x86_64'
-        shell: pwsh
-        run: |
-          foreach ($exe in 'eglantine.exe', 'eden-cli.exe') {
-            if (-not (Test-Path "build/release/bin/$exe")) {
-              throw "build/release/bin/$exe was not produced"
-            }
-          }
-          windeployqt --release --no-translations build/release/bin/eglantine.exe
-
-      # The artifact is the bin folder itself: GitHub zips artifacts on download, and uploading a
-      # zip gave a zip inside a zip. The release job zips it once for the release.
-      - name: Upload Windows binary
-        if: matrix.platform == 'windows-x86_64'
+      - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
-          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
-          path: build/release/bin/
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload Linux binary
-        if: matrix.platform == 'linux-x86_64'
-        uses: actions/upload-artifact@v4
-        with:
-          name: eglantine-${{ matrix.platform }}-${{ github.sha }}
-          path: eglantine-${{ github.sha }}-${{ matrix.platform }}.AppImage
+          name: eglantine-steamdeck-${{ steps.name.outputs.version }}
+          path: |
+            eglantine-steamdeck-*.tar.gz
+            eglantine-steamdeck-*.AppImage
           if-no-files-found: error
           compression-level: 0
-          retention-days: 7
+          retention-days: 14
 
-  # Publishes both binaries as a GitHub pre-release once every platform built: on pushes to nx2
-  # and nx2-experimental, and on manual runs unless "Publish the binaries as a GitHub release" is
-  # unticked.
   release:
     name: Publish release
     needs: build
-    if: github.event_name == 'push' || inputs.publish_release
+    if: github.ref_type == 'tag' || inputs.publish_release
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
-          pattern: eglantine-*-${{ github.sha }}
+          pattern: eglantine-steamdeck-*
           path: artifacts
-
-      - name: Package release files
-        shell: bash
-        run: |
-          mkdir dist
-          (cd "artifacts/eglantine-windows-x86_64-${GITHUB_SHA}" &&
-            zip -qr "${GITHUB_WORKSPACE}/dist/eglantine-${GITHUB_SHA}-windows-x86_64.zip" .)
-          cp "artifacts/eglantine-linux-x86_64-${GITHUB_SHA}/eglantine-${GITHUB_SHA}-linux-x86_64.AppImage" dist/
+          merge-multiple: true
 
       - name: Create release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ls -la dist
-          gh release create "build-${GITHUB_RUN_NUMBER}" dist/* \
+          set -euo pipefail
+          ls -la artifacts
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            tag="${GITHUB_REF_NAME}"
+            flags=()
+            title="Eglantine for Steam Deck ${GITHUB_REF_NAME}"
+          else
+            tag="build-${GITHUB_RUN_NUMBER}"
+            flags=(--prerelease)
+            title="Eglantine for Steam Deck ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})"
+          fi
+          notes="eden-cli built from ${GITHUB_SHA} for the Steam Deck (SteamOS 3.8). The state of the fork, what runs and how fast, is in [docs/SteamDeck.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/SteamDeck.md).
+
+          **AppImage**: \`chmod +x\` it and run it from a terminal or a Steam shortcut; it bundles its libraries and needs glibc 2.39 or newer (SteamOS 3.8, Ubuntu 24.04, Fedora 40, Arch). Launch a loose dump with \`./eglantine-steamdeck-*.AppImage -g <title>/exefs/main\`; \`EDEN_NX2_AUTO_STUB=1\` is set by the launcher scripts in the repository and should be set here too.
+
+          **tar.gz**: \`eden-cli\` alone, linked against the system's ffmpeg, boost and opus at Ubuntu 24.04's versions.
+
+          Qt frontend, Windows, macOS and Android are not built by this fork; use upstream Eglantine for those."
+          gh release create "$tag" artifacts/* \
             --repo "${GITHUB_REPOSITORY}" \
             --target "${GITHUB_SHA}" \
-            --prerelease \
-            --title "Eglantine ${GITHUB_REF_NAME} build ${GITHUB_RUN_NUMBER} (${GITHUB_SHA::7})" \
-            --notes "Automatic build of ${GITHUB_REF_NAME} at ${GITHUB_SHA}.
-
-          Windows: extract the zip and run eglantine.exe, or eden-cli.exe from a terminal.
-          Linux: make the AppImage executable (chmod +x) and run it; it bundles its libraries and needs glibc 2.39 or newer (Ubuntu 24.04, Fedora 40, Debian 13, Arch)."
+            "${flags[@]}" \
+            --title "$title" \
+            --notes "$notes"
