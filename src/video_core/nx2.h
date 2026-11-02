@@ -389,6 +389,59 @@ private:
     std::vector<Write> writes;
 };
 
+/// GPU page-table changes (nvhost_as_gpu::Nx2Map/Nx2Unmap) run on the split's back, in order
+/// with the work queued before them, while the front parses command lists as they are submitted
+/// through the page table as it stands. A list in a range whose change has not run yet would be
+/// read through the old mapping: Donkey Kong Bananza reuses the video player's addresses for
+/// command buffers right after closing a tutorial clip, and the front parsed the clip's stale
+/// words (a torn macro, a release of 0xffffffff into the compute/3D handshake word: both
+/// channels then waited forever). The front drains the back for such a list.
+class Nx2PendingMappings {
+public:
+    static Nx2PendingMappings& Get() {
+        static Nx2PendingMappings pending;
+        return pending;
+    }
+
+    /// A change of [gpu_address, +size) was queued for the back; returns its token.
+    [[nodiscard]] u64 Add(u64 gpu_address, u64 size) {
+        std::scoped_lock lk{mutex};
+        const u64 token = next_token++;
+        changes.push_back({gpu_address, gpu_address + size, token});
+        count.store(changes.size(), std::memory_order_release);
+        return token;
+    }
+
+    /// The back ran it.
+    void Remove(u64 token) {
+        std::scoped_lock lk{mutex};
+        std::erase_if(changes, [token](const Change& change) { return change.token == token; });
+        count.store(changes.size(), std::memory_order_release);
+    }
+
+    [[nodiscard]] bool Overlaps(u64 gpu_address, u64 size) {
+        if (count.load(std::memory_order_acquire) == 0) {
+            return false;
+        }
+        std::scoped_lock lk{mutex};
+        const u64 end = gpu_address + size;
+        return std::ranges::any_of(changes, [gpu_address, end](const Change& change) {
+            return change.begin < end && gpu_address < change.end;
+        });
+    }
+
+private:
+    struct Change {
+        u64 begin;
+        u64 end;
+        u64 token;
+    };
+    std::mutex mutex;
+    std::vector<Change> changes;
+    std::atomic<size_t> count{};
+    u64 next_token{1};
+};
+
 class Nx2SemaphoreHistory {
 public:
     enum Source : u32 {

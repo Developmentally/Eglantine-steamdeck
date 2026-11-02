@@ -155,8 +155,11 @@ void nvhost_as_gpu::Nx2Map(u64 gpu_address, u64 cpu_address, u64 size) {
     // On the GPU thread, like the unmaps: the GPU page table is not safe to change under the GPU
     // thread's feet (Mario Kart World's scene changes map and unmap thousands of ranges while it
     // runs, and a torn kind map left it looping in PageTableOp for good).
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, device_address, size] {
+    // Nx2PendingMappings: the front drains the back before parsing a command list in the range.
+    const u64 token = Tegra::Nx2PendingMappings::Get().Add(gpu_address, size);
+    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, device_address, size, token] {
         gmmu->Map(gpu_address, device_address, size, Tegra::PTEKind::PITCH, false);
+        Tegra::Nx2PendingMappings::Get().Remove(token);
     });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU mapping {:#x}+{:#x} -> CPU {:#x}", gpu_address, size,
               cpu_address);
@@ -185,9 +188,11 @@ void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
         const auto& [start, range] = *it;
         const auto& [region_size, device_address] = range;
         if (gpu_address >= start && gpu_address + size <= start + region_size) {
-            system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size,
+            const u64 token = Tegra::Nx2PendingMappings::Get().Add(gpu_address, size);
+            system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size, token,
                                      device = device_address + (gpu_address - start)] {
                 gmmu->Map(gpu_address, device, size, Tegra::PTEKind::PITCH, false);
+                Tegra::Nx2PendingMappings::Get().Remove(token);
             });
             LOG_DEBUG(Service_NVDRV, "Switch 2 GPU unmapping {:#x}+{:#x}: back to sparse region {:#x}",
                       gpu_address, size, start);
@@ -195,7 +200,11 @@ void nvhost_as_gpu::Nx2Unmap(u64 gpu_address, u64 size) {
         }
     }
     // The GPU thread may still be running command lists that use the range.
-    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size] { gmmu->Unmap(gpu_address, size); });
+    const u64 token = Tegra::Nx2PendingMappings::Get().Add(gpu_address, size);
+    system.GPU().RunInOrder([gmmu = gmmu.get(), gpu_address, size, token] {
+        gmmu->Unmap(gpu_address, size);
+        Tegra::Nx2PendingMappings::Get().Remove(token);
+    });
     LOG_DEBUG(Service_NVDRV, "Switch 2 GPU unmapping {:#x}+{:#x}", gpu_address, size);
 }
 

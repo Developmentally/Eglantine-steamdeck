@@ -128,6 +128,17 @@ void DmaPusher::WaitForPendingWrites(GPUVAddr address, size_t size) {
     if (!split.Active()) {
         return;
     }
+    if (Tegra::Nx2PendingMappings::Get().Overlaps(address, size)) {
+        // A map or unmap of the list's range is queued for the back: read through the page
+        // table as it will be, not as it was for the previous user of these addresses.
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DrainMappings, 1);
+        split.Drain();
+        static std::atomic<u32> logs{};
+        if (logs.fetch_add(1, std::memory_order_relaxed) < 20) {
+            LOG_INFO(HW_GPU, "Command list at {:#x} ({} bytes) is in a range being remapped: drained first",
+                     address, size);
+        }
+    }
     const auto device = memory_manager.GpuToCpuAddress(address);
     if (!device) {
         return;
