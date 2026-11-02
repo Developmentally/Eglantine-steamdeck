@@ -1798,8 +1798,8 @@ void RasterizerVulkan::FlushCommands() {
 void RasterizerVulkan::TickFrame() {
     draw_counter = 0;
     ++frame_counter;
-    // EDEN_NX2_TRACE_TRIGGER=<path>: trace the frame after that file appears (the test harness
-    // creates it with a `touch` step, so the trace lands on the scene being screenshotted).
+    // EDEN_NX2_TRACE_TRIGGER=<path>: trace the frame after that file appears (`touch` it from
+    // outside, so the trace lands on the scene currently on screen).
     static const char* const trigger = std::getenv("EDEN_NX2_TRACE_TRIGGER");
     if (trigger != nullptr && frame_trace_state == 0 && frame_counter % 8 == 0 &&
         std::filesystem::exists(trigger)) {

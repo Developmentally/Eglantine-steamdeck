@@ -791,7 +791,7 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         return result;
     }();
     // EDEN_NX2_PS_TEX_OVERRIDE_GATE=<path>: a set is active only while a gate file exists
-    // (toggled by the harness, so one scene can be shot with and without it): <path> selects
+    // (so one scene can be shot with and without it): <path> selects
     // the first set, <path>.2 the second, and so on.
     static const char* const override_gate = std::getenv("EDEN_NX2_PS_TEX_OVERRIDE_GATE");
     static size_t open_set = override_gate == nullptr ? 0 : tex_overrides.size();

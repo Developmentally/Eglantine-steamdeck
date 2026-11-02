@@ -31,6 +31,11 @@ It's written in C++ with portability in mind, with builds for Windows, Linux, ma
     </a>
 </p>
 
+> **This is a Steam Deck fork.** It tracks [Djihads80/Eglantine](https://github.com/Djihads80/Eglantine) and adds what it takes to run
+> Switch 2 titles natively on SteamOS: memory fences for a 16 GB unified-memory APU and GPU
+> command-stream and shader fixes found on the Deck. It is behind upstream and only tested on a Deck;
+> read [docs/SteamDeck.md](docs/SteamDeck.md) for the state, the known regressions and how to help.
+
 <p align="center">
   <a href="#compatibility">Compatibility</a> |
   <a href="#development">Development</a> |
