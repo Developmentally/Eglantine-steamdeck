@@ -390,6 +390,29 @@ private:
     std::vector<Write> writes;
 };
 
+/// Command lists each GPU channel has been handed (nvhost_gpu's submits, counted on the guest
+/// thread) and has finished (the back ran its last entry). A frame's GPU work is done on every
+/// channel once each channel has finished all it had been handed when the frame was presented:
+/// nx2:vi2 paces the game with that. Submissions without a syncpoint increment count too (a
+/// channel whose lists the game tracks with its own semaphores sat 24 s behind a stalled back
+/// in Mario Kart World, and the game recycled their memory).
+inline std::array<std::atomic<u64>, 64> g_nx2_channel_lists_submitted{};
+inline std::array<std::atomic<u64>, 64> g_nx2_channel_lists_done{};
+inline std::atomic<u64> g_nx2_channel_mask{};
+
+inline void Nx2NoteListSubmitted(u32 channel) {
+    if (channel < 64) {
+        g_nx2_channel_lists_submitted[channel].fetch_add(1, std::memory_order_release);
+        g_nx2_channel_mask.fetch_or(u64{1} << channel, std::memory_order_relaxed);
+    }
+}
+
+inline void Nx2NoteListDone(u32 channel) {
+    if (channel < 64) {
+        g_nx2_channel_lists_done[channel].fetch_add(1, std::memory_order_release);
+    }
+}
+
 /// GPU page-table changes (nvhost_as_gpu::Nx2Map/Nx2Unmap) run on the split's back, in order
 /// with the work queued before them, while the front parses command lists as they are submitted
 /// through the page table as it stands. A list in a range whose change has not run yet would be

@@ -164,6 +164,19 @@ void DmaPusher::WaitForPendingWrites(GPUVAddr address, size_t size) {
     }
 }
 
+// A command list is finished once the back has run everything it queued (Nx2NoteListDone).
+void DmaPusher::NoteListDone() {
+    if (!g_nx2_ampere.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const u32 channel = channel_state.bind_id;
+    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+        split.Defer([channel] { Tegra::Nx2NoteListDone(channel); });
+    } else {
+        Tegra::Nx2NoteListDone(channel);
+    }
+}
+
 bool DmaPusher::Step() {
     if (!ib_enable || dma_pushbuffer.empty()) {
         return false;
@@ -180,6 +193,7 @@ bool DmaPusher::Step() {
     if (prefetch_size == 0 && command_list_size == 0) {
         dma_pushbuffer.pop();
         dma_pushbuffer_subindex = 0;
+        NoteListDone();
         return true;
     }
 
@@ -192,6 +206,7 @@ bool DmaPusher::Step() {
         }
         command_resume_offset = 0;
         dma_pushbuffer.pop();
+        NoteListDone();
         return true;
     }
 
@@ -366,6 +381,7 @@ bool DmaPusher::Step() {
         parked_methods.clear();
         dma_pushbuffer.pop();
         dma_pushbuffer_subindex = 0;
+        NoteListDone();
     } else {
         signal_sync = command_list.command_lists[dma_pushbuffer_subindex].sync && Settings::values.sync_memory_operations.GetValue();
     }

@@ -1161,16 +1161,17 @@ private:
         // The console's compositor hands a buffer back to the game only once the frame rendered
         // into it has passed its GPU fence, and that is what keeps the game from running ahead
         // of the GPU: the game recycles a frame's command memory as soon as its buffer is back.
-        // This reply reports every buffer free, so the present itself waits for the frame's
-        // fence (no CPU/GPU overlap, but nothing the GPU thread has not read gets rewritten).
-        // EDEN_NX2_FRAMES_AHEAD=1 waits for the previous frame's fence instead: that let Donkey
-        // Kong Bananza reuse the command memory of a frame the GPU thread was still parsing
-        // (torn entries, a release of 0xffffffff into the compute/3D handshake word, garbage
-        // shader stages: a freeze on every big terrain break; with the wait, 31 fps there).
-        // EDEN_NX2_FRAMES_AHEAD=m reports the buffers' real state in the reply mask (BufferMask)
-        // and waits only when none is free, like the console: the right design, but Mario Kart
-        // World hung at boot with it once and reached 7.5 GB of GTT in its menus the next time,
-        // so it stays experimental.
+        // The game ignores the slot mask in this reply (a probe handing out one slot at a time
+        // changed nothing), so the pacing happens in the call itself. Default (a): the present
+        // returns once every GPU channel has executed all it had been asked for at the previous
+        // present (each channel's syncpoint max then), so the game runs one frame ahead of the
+        // GPU thread without recycling anything it has not read. EDEN_NX2_FRAMES_AHEAD=0 waits
+        // for this frame's own fence (no overlap: Mario Kart World 18 instead of 25 fps).
+        // EDEN_NX2_FRAMES_AHEAD=1 waits for the previous frame's fence only, which is the 3D
+        // channel's: the compute channel could still be behind on that frame and Donkey Kong
+        // Bananza recycled its command memory (torn entries, a release of 0xffffffff into the
+        // compute/3D handshake word, garbage shader stages: a freeze on every big terrain
+        // break). EDEN_NX2_FRAMES_AHEAD=m reports the buffers' state in the mask (ignored).
         const char pacing = Pacing();
         const auto entered = std::chrono::steady_clock::now();
         static const bool log_fences = std::getenv("EDEN_NX2_SYNCPT_LOG") != nullptr;
@@ -1186,6 +1187,31 @@ private:
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
             m_previous_fence_id = fence_id;
             m_previous_fence_value = fence_value;
+        } else if (pacing == 'a') {
+            // One frame ahead on every channel: wait until each GPU channel has finished all the
+            // command lists it had been handed when the previous frame was presented. Waiting
+            // for the previous frame's own fence (mode 1) covered the 3D channel only; the
+            // compute channel could still be behind, and the game recycled its command memory.
+            const u64 channels = Tegra::g_nx2_channel_mask.load(std::memory_order_relaxed);
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds{4000};
+            for (u32 id = 0; id < 64; ++id) {
+                if (!((channels >> id) & 1)) {
+                    continue;
+                }
+                while (Tegra::g_nx2_channel_lists_done[id].load(std::memory_order_acquire) < m_previous_lists[id] &&
+                       system.IsPoweredOn() && std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::microseconds{100});
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    ++m_wait_timeouts;
+                    if (m_wait_timeouts <= 8) {
+                        LOG_WARNING(Service, "nx2:vi2 present #{}: channel {} still has {} lists to finish after 4 s",
+                                    m_presents, id,
+                                    m_previous_lists[id] - Tegra::g_nx2_channel_lists_done[id].load(std::memory_order_acquire));
+                    }
+                }
+                m_previous_lists[id] = Tegra::g_nx2_channel_lists_submitted[id].load(std::memory_order_acquire);
+            }
         } else if (pacing == '0') {
             WaitForFrame(fence_id, fence_value);
         } else {
@@ -1251,14 +1277,22 @@ private:
                 LogGuestCpu();
             }
         }
-        const u64 mask = pacing == 'm' ? BufferMask() : 0x7fff;
+        u64 mask = pacing == 'm' ? BufferMask() : 0x7fff;
+        // EDEN_NX2_SLOT_PROBE=1: reply one slot bit at a time (cycling) and log which image the
+        // game presents next, to learn how the mask's slots map onto the window images.
+        static const bool probe = std::getenv("EDEN_NX2_SLOT_PROBE") != nullptr;
+        if (probe) {
+            mask = u64{1} << (m_presents % 15);
+            LOG_INFO(Service, "nx2:vi2 slot probe: present #{} image {} -> mask {:#x}", m_presents,
+                     image_id, mask);
+        }
         TipcReplyWords(ctx, {static_cast<u32>(mask), static_cast<u32>(mask >> 32), 0, 0, 0, 0});
     }
 
     static char Pacing() {
         static const char pacing = [] {
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
-            return value != nullptr ? value[0] : '0';
+            return value != nullptr ? value[0] : 'a';
         }();
         return pacing;
     }
@@ -1331,6 +1365,7 @@ private:
     } m_stats{};
     u32 m_previous_fence_id{~0U}; // none yet (WaitForFrame ignores ids >= 192)
     u32 m_previous_fence_value{};
+    std::array<u64, 64> m_previous_lists{}; // pacing mode a: lists submitted per channel at the previous present
 
     // Guest CPU load since the last report: how busy each emulated core was (its idle thread's
     // time) and the busiest guest threads, to tell a game that is CPU-bound in the emulated cores

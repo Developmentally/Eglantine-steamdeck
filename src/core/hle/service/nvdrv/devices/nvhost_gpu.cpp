@@ -24,6 +24,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/nx2.h"
 
 namespace Service::Nvidia::Devices {
 namespace {
@@ -447,6 +448,7 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
         }
 
         if (!syncpoint_manager.IsFenceSignalled(params.fence)) {
+            Tegra::Nx2NoteListSubmitted(bind_id);
             gpu.PushGPUEntries(bind_id, Tegra::CommandList{BuildWaitCommandList(params.fence)});
         }
     }
@@ -456,14 +458,17 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
     u32 increment{(flags.fence_increment.Value() != 0 ? 2 : 0) +
                   (flags.increment_value.Value() != 0 ? params.fence.value : 0)};
     params.fence.value = syncpoint_manager.IncrementSyncpointMaxExt(channel_syncpoint, increment);
+    Tegra::Nx2NoteListSubmitted(bind_id);
     gpu.PushGPUEntries(bind_id, std::move(entries));
 
     if (g_nx2_driver && !flags.fence_increment.Value() && increment > 0) {
+        Tegra::Nx2NoteListSubmitted(bind_id);
         gpu.PushGPUEntries(bind_id,
                            Tegra::CommandList{BuildIncrementCountCommandList(params.fence, increment)});
     }
 
     if (flags.fence_increment.Value()) {
+        Tegra::Nx2NoteListSubmitted(bind_id);
         if (flags.suppress_wfi.Value()) {
             gpu.PushGPUEntries(bind_id,
                                Tegra::CommandList{BuildIncrementCommandList(params.fence)});

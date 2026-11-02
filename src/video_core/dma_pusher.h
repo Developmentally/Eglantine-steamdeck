@@ -194,6 +194,7 @@ public:
     /// Logs the GPFIFO entry being processed (and the one before it), read through the GPU MMU
     /// and straight from guest memory, to find pushbuffer desyncs. Debug aid for Switch 2.
     void DumpCurrentEntry(const char* reason);
+    void NoteListDone();
     void CheckSubmitHash(const CommandListHeader& header, u64 submit_hash,
                          std::span<const u32> submit_words,
                          std::chrono::steady_clock::time_point submit_time);
