@@ -1,6 +1,6 @@
 # Eglantine on the Steam Deck
 
-This is the state of my fork of [Eglantine](https://github.com/Djihads80/Eglantine) as of 1 November 2026, three days after I started it. The goal is one thing: run Switch 2 games natively on a Steam Deck, with the Deck's own controls, the way the Deck already runs Switch 1 games. Everything below was measured on one Deck running SteamOS 3.8, with `eden-cli` (the SDL frontend, no Qt).
+This is the state of my fork of [Eglantine](https://github.com/Djihads80/Eglantine) as of 2 November 2026, four days after I started it. The goal is one thing: run Switch 2 games natively on a Steam Deck, with the Deck's own controls, the way the Deck already runs Switch 1 games. Everything below was measured on one Deck running SteamOS 3.8, with `eden-cli` (the SDL frontend, no Qt).
 
 If you just want to run it, download the AppImage from the [releases page](https://github.com/MFS-code/Eglantine-steamdeck/releases) and follow [the AppImage guide](user/SteamDeckAppImage.md).
 
