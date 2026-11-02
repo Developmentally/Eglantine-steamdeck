@@ -1306,7 +1306,6 @@ private:
     }
 
     void LogGuestCpu() {
-        auto& kernel = system.Kernel();
         auto* const process = kernel.ApplicationProcess();
         if (process == nullptr) {
             return;

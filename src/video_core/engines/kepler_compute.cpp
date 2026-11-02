@@ -609,7 +609,7 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
     };
     constexpr std::array<std::pair<u32, u32>, 2> handle_layouts{{{0x90, 0xa0}, {0x60, 0x70}}};
     std::optional<Texture::TICEntry> input, output;
-    for (const auto [input_offset, output_offset] : handle_layouts) {
+    for (const auto& [input_offset, output_offset] : handle_layouts) {
         input = image(input_offset);
         output = image(output_offset);
         if (usable(input, output)) break;

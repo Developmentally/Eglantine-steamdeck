@@ -601,9 +601,9 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
                     break;
                 }
                 const auto& view{texture_cache.GetImageView(views[view_index].id)};
-                const u64 key{(ps_address << 20) ^ (u64{desc.cbuf_offset} << 32) ^
-                              (view.image_id ? view.image_id.index : 0)};
-                if (!logged.insert(key).second) {
+                const u64 log_key{(ps_address << 20) ^ (u64{desc.cbuf_offset} << 32) ^
+                                  (view.image_id ? view.image_id.index : 0)};
+                if (!logged.insert(log_key).second) {
                     continue;
                 }
                 if (!view.image_id) {
