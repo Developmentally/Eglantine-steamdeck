@@ -51,6 +51,7 @@ public:
     BlockDescriptor Emit(IR::Block& block) noexcept;
 
     void ClearCache() override;
+    void WritePerfMapEntry(const void* entrypoint, size_t size, u64 guest_pc);
 
     void InvalidateCacheRanges(const boost::icl::interval_set<u64>& ranges);
 

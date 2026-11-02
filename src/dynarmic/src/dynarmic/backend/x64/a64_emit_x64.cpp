@@ -8,8 +8,15 @@
 
 #include "dynarmic/backend/x64/a64_emit_x64.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <string>
 #include <fmt/format.h>
 #include <fmt/ostream.h>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 #include "common/assert.h"
 #include "common/common_types.h"
 #include "dynarmic/ir/terminal.h"
@@ -163,9 +170,36 @@ finish_this_inst:
     block_ranges.AddRange(range, descriptor);
 
     auto bdesc = RegisterBlock(descriptor, entrypoint, size);
+    WritePerfMapEntry(entrypoint, size, descriptor.PC());
     code.DisableWriting();
     shared_labels.clear();
     return bdesc;
+}
+
+// EDEN_NX2_PERF_MAP=1: append each block to /tmp/perf-<pid>.map so `perf report` names JIT
+// samples by guest PC ("guest 0x...") instead of lumping them into [JIT].
+void A64EmitX64::WritePerfMapEntry(const void* entrypoint, size_t size, u64 guest_pc) {
+#if defined(__linux__)
+    static FILE* const map = [] () -> FILE* {
+        const char* value = std::getenv("EDEN_NX2_PERF_MAP");
+        if (value == nullptr || value[0] == '0') {
+            return nullptr;
+        }
+        const std::string path = fmt::format("/tmp/perf-{}.map", static_cast<long>(getpid()));
+        return std::fopen(path.c_str(), "a");
+    }();
+    if (map == nullptr) {
+        return;
+    }
+    static std::mutex mutex;
+    std::scoped_lock lk{mutex};
+    fmt::print(map, "{:x} {:x} guest_{:x}\n", reinterpret_cast<uintptr_t>(entrypoint), size, guest_pc);
+    std::fflush(map);
+#else
+    (void)entrypoint;
+    (void)size;
+    (void)guest_pc;
+#endif
 }
 
 void A64EmitX64::ClearCache() {
