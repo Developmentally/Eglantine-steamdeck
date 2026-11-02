@@ -4,7 +4,12 @@
 // SPDX-FileCopyrightText: 2022 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <map>
+#include <string_view>
+#include <tuple>
+#include <vector>
 #include <cstdlib>
 
 #include "common/assert.h"
@@ -262,6 +267,38 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     if (log_waits && pending_acquire) {
         const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - pending_acquire->since).count();
+        // Where the channels' waiting time goes, summed per (channel, word, what ended the
+        // wait), printed every 10 s: the links of the frame's dependency chain by weight.
+        {
+            struct Link {
+                u64 count{};
+                u64 us{};
+            };
+            static std::map<std::tuple<u32, u64, std::string_view>, Link> links;
+            static auto last_report = std::chrono::steady_clock::now();
+            auto& link = links[{dma_pusher.channel_state.bind_id, pending_acquire->address & ~GPUVAddr{0xf},
+                                std::string_view{pending_acquire->ended_by}}];
+            ++link.count;
+            link.us += static_cast<u64>(waited);
+            if (const auto now = std::chrono::steady_clock::now(); now - last_report > std::chrono::seconds{10}) {
+                const double seconds = std::chrono::duration<double>(now - last_report).count();
+                std::vector<std::pair<u64, std::string>> rows;
+                for (const auto& [key, value] : links) {
+                    rows.emplace_back(value.us, fmt::format("ch{} {:#x} by {}: {:.0f}/s, {:.1f} ms/s, {} us avg",
+                                                            std::get<0>(key), std::get<1>(key), std::get<2>(key),
+                                                            value.count / seconds, value.us / 1000.0 / seconds,
+                                                            value.us / value.count));
+                }
+                std::ranges::sort(rows, std::greater{});
+                std::string text;
+                for (size_t i = 0; i < rows.size() && i < 8; ++i) {
+                    text += "\n  " + rows[i].second;
+                }
+                LOG_INFO(HW_GPU, "Acquire waits over {:.0f} s, heaviest links:{}", seconds, text);
+                links.clear();
+                last_report = now;
+            }
+        }
         if (waited >= 10'000) {
             const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
             LOG_INFO(HW_GPU, "Channel {} acquire {:#x} (device {:#x}) op {} value {:#x} held the "
