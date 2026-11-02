@@ -98,7 +98,7 @@ inline u64 Now() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 34> counters{}; ///< See Counter
+    std::array<u64, 35> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
 };
@@ -174,6 +174,7 @@ enum class Counter : u32 {
     AliasSyncs,         ///< SynchronizeAliases calls (texture cache, per sampled aliased image)
     AliasSyncWalked,    ///< Alias entries walked by them
     SnapshotsUnwritten, ///< Entries read from memory because they were zeros when submitted
+    ChannelYields,      ///< A channel handed the GPU thread to one whose wait ended
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -248,10 +249,11 @@ inline void Report(const char* thread_name = "GPU thread") {
                         static_cast<double>(data.counters[13]) * 1e9 / wall,
                         static_cast<double>(data.counters[14]) * 1e9 / wall,
                         static_cast<double>(data.counters[15]) * 1e9 / wall);
-    line += fmt::format(" | alias syncs {:.0f}/s walking {:.0f} aliases/s | unwritten at submit {:.0f}/s",
+    line += fmt::format(" | alias syncs {:.0f}/s walking {:.0f} aliases/s | unwritten at submit {:.0f}/s | channel yields {:.0f}/s",
                         static_cast<double>(data.counters[31]) * 1e9 / wall,
                         static_cast<double>(data.counters[32]) * 1e9 / wall,
-                        static_cast<double>(data.counters[33]) * 1e9 / wall);
+                        static_cast<double>(data.counters[33]) * 1e9 / wall,
+                        static_cast<double>(data.counters[34]) * 1e9 / wall);
     line += fmt::format(" | predicted {:.0f} ({:.0f} dropped, {:.0f} expired, {:.0f} behind the back)",
                         static_cast<double>(data.counters[20]) * 1e9 / wall,
                         static_cast<double>(data.counters[21]) * 1e9 / wall,

@@ -613,12 +613,19 @@ public:
             }
         }
         if (latched_any) {
+            latches.fetch_add(1, std::memory_order_release);
             {
                 std::scoped_lock lk{latch_mutex};
                 ++latch_generation;
             }
             latch_cv.notify_all();
         }
+    }
+
+    /// Latches so far: a channel parsing a long submission compares it between entries and
+    /// hands the GPU thread to the channel whose wait just ended (Scheduler).
+    [[nodiscard]] u64 Latches() const noexcept {
+        return latches.load(std::memory_order_acquire);
     }
 
     /// Sleeps until a waiter latches or `timeout` passes: the GPU thread's poll loop, so a
@@ -657,6 +664,7 @@ private:
     std::mutex mutex;
     std::vector<Waiter> waiters;
     std::atomic<size_t> count{};
+    std::atomic<u64> latches{};
     std::mutex latch_mutex;
     std::condition_variable latch_cv;
     u64 latch_generation{};

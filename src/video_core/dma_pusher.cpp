@@ -41,13 +41,46 @@ DmaPusher::DmaPusher(Core::System& system_, MemoryManager& memory_manager_, Cont
 
 DmaPusher::~DmaPusher() = default;
 
+bool DmaPusher::ShouldYield() {
+    // EDEN_NX2_CHANNEL_YIELD=0 keeps a submission on the thread until it ends or waits.
+    static const bool yield_between_entries = [] {
+        const char* value = std::getenv("EDEN_NX2_CHANNEL_YIELD");
+        return value == nullptr || value[0] != '0';
+    }();
+    if (!yield_between_entries || !g_nx2_ampere.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    const u64 latches = Nx2SemaphoreWaiters::Get().Latches();
+    if (latches == latches_seen) {
+        return false;
+    }
+    // Only a latch since the last yield counts: a latched channel that still cannot resume
+    // (its release is behind the back) would otherwise take the thread after every entry.
+    latches_seen = latches;
+    VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::ChannelYields, 1);
+    return true;
+}
+
 void DmaPusher::DispatchCalls() {
     // The sub-index is kept: a channel suspended on a semaphore resumes inside its command list.
     dma_state.is_last_call = true;
+    bool yielded = false;
     while (system.IsPoweredOn()) {
         if (!Step()) {
             break;
         }
+        if (HasWork() && ShouldYield()) {
+            yielded = true;
+            break;
+        }
+    }
+    if (yielded) {
+        // The list continues after the other channel ran: publish what was parsed, but the
+        // command-list end (a Vulkan submission) waits for the real end.
+        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
+            split.Publish();
+        }
+        return;
     }
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
         split.Defer([gpu = &system.GPU()] {

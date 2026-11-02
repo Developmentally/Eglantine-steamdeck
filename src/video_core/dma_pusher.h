@@ -156,6 +156,10 @@ public:
     [[nodiscard]] bool HasPendingAcquire() const {
         return puller.HasPendingAcquire();
     }
+    /// Switch 2: command lists left to run (a channel that yielded the GPU thread mid-list).
+    [[nodiscard]] bool HasWork() const {
+        return !dma_pushbuffer.empty();
+    }
     [[nodiscard]] bool CanResumeAcquire() {
         return puller.CanResumeAcquire(*this);
     }
@@ -187,6 +191,11 @@ private:
     /// suspended the channel.
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
     size_t command_resume_offset{}; ///< Words of the current entry done before a suspension
+    /// Switch 2: whether to hand the GPU thread to another channel between entries. The
+    /// hardware runs channels concurrently; here one thread parses them in turn, and a channel
+    /// whose semaphore wait just ended (a latch) otherwise sits until this list is done.
+    [[nodiscard]] bool ShouldYield();
+    u64 latches_seen{}; ///< Nx2SemaphoreWaiters::Latches() at the last yield
 
     void SetState(const CommandHeader& command_header);
 

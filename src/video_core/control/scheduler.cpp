@@ -44,7 +44,8 @@ void Scheduler::Push(GPU& gpu, s32 channel, CommandList&& entries) {
     // Multiple channels can prepare their commands in parallel.
     channel_state->payload->dma_pusher.Push(std::move(entries));
     channel_state->payload->dma_pusher.DispatchCalls();
-    if (channel_state->payload->dma_pusher.HasPendingAcquire() &&
+    // Suspended on an acquire, or yielded to another channel mid-list: both continue here.
+    if (channel_state->payload->dma_pusher.HasWork() &&
         std::find(pending_channels.begin(), pending_channels.end(), channel_state) ==
             pending_channels.end()) {
         pending_channels.push_back(channel_state);
@@ -66,7 +67,10 @@ void Scheduler::ResumePending(GPU& gpu) {
             if (!dma_pusher.system.IsPoweredOn()) {
                 return;
             }
-            if (!dma_pusher.HasPendingAcquire() || !dma_pusher.CanResumeAcquire()) {
+            if (!dma_pusher.HasWork()) {
+                continue;
+            }
+            if (dma_pusher.HasPendingAcquire() && !dma_pusher.CanResumeAcquire()) {
                 continue;
             }
             BindChannel(gpu, state->bind_id);
@@ -75,7 +79,7 @@ void Scheduler::ResumePending(GPU& gpu) {
         }
     }
     std::erase_if(pending_channels, [](const auto& state) {
-        return !state->payload->dma_pusher.HasPendingAcquire();
+        return !state->payload->dma_pusher.HasWork();
     });
 }
 
