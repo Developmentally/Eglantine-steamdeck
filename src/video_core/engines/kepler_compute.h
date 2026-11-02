@@ -271,6 +271,7 @@ private:
     bool UpscaleInsteadOfNativeProgram();
     bool ProcessNativeMethod(Core::System& system, u32 method, u32 argument, bool is_last_call);
     NativeQmdScheduler native_qmd;
+    u64 last_run_qmd{}; ///< EDEN_NX2_RELEASE_WATCH diagnostics
     std::array<u32, 0xc00>* native_data_ram{};
     bool native_mme_dumped{};
     std::optional<u32> native_executing_macro_logged;

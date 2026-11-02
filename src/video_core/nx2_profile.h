@@ -81,7 +81,7 @@ inline u64 Now() {
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 29> counters{}; ///< See Counter
+    std::array<u64, 30> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
 };
@@ -151,6 +151,7 @@ enum class Counter : u32 {
     DrainCommandLists,  ///< Front drains for command lists on pages the GPU has written (dma_pusher)
     DrainEngineWrites,  ///< Front drains for command lists a queued copy or upload writes (dma_pusher)
     DmaReadPredicted,   ///< Native MME DMA reads answered without a drain (queued releases applied)
+    DrainQmdRead,       ///< Front drains for a QMD a queued copy or upload writes (compute mirror)
     DrainMappings,      ///< Front drains for command lists in a range a queued map/unmap changes
 };
 
@@ -212,12 +213,13 @@ inline void Report(const char* thread_name = "GPU thread") {
     line += fmt::format(" | acquires {:.0f} ({:.0f} waited)",
                         static_cast<double>(data.counters[6]) * 1e9 / window,
                         static_cast<double>(data.counters[7]) * 1e9 / window);
-    line += fmt::format(" | drains: acquire {:.0f} poll {:.0f} dma read {:.0f} (predicted {:.0f}) remap {:.0f} sync {:.0f} other {:.0f}",
+    line += fmt::format(" | drains: acquire {:.0f} poll {:.0f} dma read {:.0f} (predicted {:.0f}) qmd read {:.0f} remap {:.0f} sync {:.0f} other {:.0f}",
                         static_cast<double>(data.counters[8]) * 1e9 / window,
                         static_cast<double>(data.counters[9]) * 1e9 / window,
                         static_cast<double>(data.counters[10]) * 1e9 / window,
                         static_cast<double>(data.counters[27]) * 1e9 / window,
                         static_cast<double>(data.counters[28]) * 1e9 / window,
+                        static_cast<double>(data.counters[29]) * 1e9 / window,
                         static_cast<double>(data.counters[11]) * 1e9 / window,
                         static_cast<double>(data.counters[12]) * 1e9 / window);
     line += fmt::format(" | acquires met by drain {:.0f} (flush {:.0f}), by fences {:.0f}",

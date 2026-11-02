@@ -43,6 +43,13 @@ KeplerCompute::KeplerCompute(MemoryManager& memory_manager_)
             LOG_INFO(HW_GPU, "QMD trace {} {:#x} {} (engine {} as {})", event, address, value,
                      fmt::ptr(this), memory_manager.GetID());
         };
+    } else if (std::getenv("EDEN_NX2_RELEASE_WATCH")) {
+        // Pairs with the front mirror's log (FrontQmdSignal): which QMD made a watched release.
+        native_qmd.trace = [this](std::string_view event, u64 address, s32 value) {
+            if (event == "run") {
+                last_run_qmd = address;
+            }
+        };
     }
     execution_mask.reset();
     execution_mask[KEPLER_COMPUTE_REG_INDEX(exec_upload)] = true;
@@ -361,6 +368,11 @@ bool KeplerCompute::ProcessNativeMethod(Core::System& system, u32 method, u32 ar
             },
             [&](u64 address, u32 payload, u32 flags) {
                 if (!memory_manager.IsFullyMappedRange(address, sizeof(payload))) return false;
+                if (const auto device = memory_manager.GpuToCpuAddress(address);
+                    device && Nx2QueuedReleases::Watched(*device)) [[unlikely]] {
+                    LOG_INFO(HW_GPU, "Release watch: back QMD {:#x} releases {:#x}={:#x} flags {:#x} (action {:#x} on {:#x})",
+                             last_run_qmd, address, payload, flags, argument, qmd_address);
+                }
                 if (flags & (1U << 26)) {
                     rasterizer->SignalFence([this, address, payload] {
                         const u32 value = memory_manager.Read<u32>(address) + payload;
@@ -812,7 +824,12 @@ struct KeplerCompute::FrontState {
     // will make (Nx2QueuedReleases): the back's acquires on them then need no round trip
     // through a host GPU fence. QMDs uploaded inline are kept here until the back writes them.
     NativeQmdScheduler qmd{true};
-    std::unordered_map<GPUVAddr, NativeQmdScheduler::Descriptor> inline_qmds;
+    struct InlineQmd {
+        NativeQmdScheduler::Descriptor words;
+        u64 position; ///< Split position of the back's write; memory holds it from then on
+    };
+    std::unordered_map<GPUVAddr, InlineQmd> inline_qmds;
+    u64 last_run_qmd{}; ///< The QMD the mirror ran last (set by qmd.trace)
 };
 
 KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
@@ -835,14 +852,37 @@ KeplerCompute::FrontState& KeplerCompute::Front(VideoCommon::GpuSplit& split) {
 
 void KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, FrontState& fs,
                                    GPUVAddr address, u32 argument) {
+    // Off by default: the SDK patches QMDs (payloads, dependency counts, which QMD a chain
+    // runs next) after submitting them, so this mirror, which reads them microseconds after
+    // submission, runs Mario Kart World's chains differently from the back and predicts
+    // releases that never land; those held the 3D channel's acquires ~90 ms past the value in
+    // memory, one race frame in six (27 -> 19 fps). The back's QMD releases land within
+    // microseconds of their execution anyway. EDEN_NX2_QMD_PREDICT=1 turns the mirror on.
+    static const bool predict = [] {
+        const char* value = std::getenv("EDEN_NX2_QMD_PREDICT");
+        return value != nullptr && value[0] != '0';
+    }();
+    if (!predict) {
+        return;
+    }
     auto& releases = Nx2QueuedReleases::Get();
     const auto read = [&](u64 qmd_address, NativeQmdScheduler::Descriptor& descriptor) {
         if (const auto it = fs.inline_qmds.find(qmd_address); it != fs.inline_qmds.end()) {
-            descriptor = it->second;
-            return true;
+            if (split.ConsumedPosition() < it->second.position) {
+                descriptor = it->second.words;
+                return true;
+            }
+            // The back has written it: memory is current, and later writers may have changed it.
+            fs.inline_qmds.erase(it);
         }
         if (!memory_manager.IsFullyMappedRange(qmd_address, sizeof(descriptor))) {
             return false;
+        }
+        // A copy or upload the back has not run yet may write the descriptor.
+        if (const auto device = memory_manager.GpuToCpuAddress(qmd_address);
+            device && Nx2PendingGpuWrites::Get().Pending(*device, sizeof(descriptor), split.ConsumedPosition())) {
+            VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DrainQmdRead, 1);
+            split.Drain();
         }
         memory_manager.ReadBlockUnsafe(qmd_address, descriptor.data(), sizeof(descriptor));
         return true;
@@ -855,6 +895,10 @@ void KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, FrontState& fs,
         if (!device) {
             return true;
         }
+        // Chained QMDs are the most patched (see above): only the signaled one is predicted.
+        if (fs.last_run_qmd != address) {
+            return true;
+        }
         u32 value = payload;
         if (flags & ((1U << 26) | (1U << 19))) {
             // Add or max: on top of the value the word will hold when the back gets here.
@@ -862,10 +906,22 @@ void KeplerCompute::FrontQmdSignal(VideoCommon::GpuSplit& split, FrontState& fs,
                                  .value_or(memory_manager.Read<u32>(destination));
             value = (flags & (1U << 26)) ? base + payload : (std::max)(base, payload);
         }
-        releases.Note(*device, value, split.SentPosition());
+        if (Nx2QueuedReleases::Watched(*device)) [[unlikely]] {
+            LOG_INFO(HW_GPU, "Release watch: front QMD {:#x} releases {:#x}={:#x} flags {:#x} (action {:#x} on {:#x}, inline {})",
+                     fs.last_run_qmd, destination, payload, flags, argument, address,
+                     fs.inline_qmds.contains(fs.last_run_qmd));
+        }
+        releases.Note(*device, value, split.SentPosition(), false, "QMD");
         return true;
     };
     const auto dispatch = [](const NativeQmdScheduler::Descriptor&) { return true; };
+    if (!fs.qmd.trace) {
+        fs.qmd.trace = [&fs](std::string_view event, u64 qmd_address, s32) {
+            if (event == "run") {
+                fs.last_run_qmd = qmd_address;
+            }
+        };
+    }
     const auto error = fs.qmd.Signal(address, argument, read, release, dispatch);
     if (static u32 logged{}; !error.empty() && logged < 8) {
         ++logged;
@@ -886,7 +942,8 @@ void KeplerCompute::FrontApply(VideoCommon::GpuSplit& split, FrontState& fs, u32
         const GPUVAddr address = ((GPUVAddr{fs.registers[0xc6]} << 32) | fs.registers[0xc7]) << 8;
         NativeQmdScheduler::Descriptor descriptor{};
         std::memcpy(descriptor.data(), fs.registers.data() + 0xc8, sizeof(descriptor));
-        fs.inline_qmds[address] = descriptor;
+        // The upload runs on the back with this method (sent right after FrontApply).
+        fs.inline_qmds[address] = {descriptor, split.SentPosition() + 1};
         if ((fs.registers[0xa7] & (1U << 24)) || !(fs.registers[0xcc] & (1U << 12))) {
             FrontQmdSignal(split, fs, address, 3);
         }

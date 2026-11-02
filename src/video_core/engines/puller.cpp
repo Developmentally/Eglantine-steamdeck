@@ -69,7 +69,7 @@ void NoteQueuedRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload,
         return;
     }
     if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
-        Nx2QueuedReleases::Get().Note(*device, payload, split.SentPosition(), with_timestamp);
+        Nx2QueuedReleases::Get().Note(*device, payload, split.SentPosition(), with_timestamp, "puller");
     }
 }
 
@@ -136,8 +136,9 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     // for work while the front waited for it.
     using Counter = VideoCommon::Nx2Profile::Counter;
     const auto ended_by_latch = [&] {
+        const u32 source = Nx2SemaphoreWaiters::Get().LatchedBy(this);
+        pending_acquire->ended_by = source == 2 ? "QMD release" : "query release";
         if (VideoCommon::Nx2Profile::Enabled()) {
-            const u32 source = Nx2SemaphoreWaiters::Get().LatchedBy(this);
             VideoCommon::Nx2Profile::Add(source == 2 ? Counter::WaitEndedByQmd : Counter::WaitEndedByQuery, 1);
         }
         return true;
@@ -148,10 +149,25 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     const auto matches = [&](u32 word) { return pending_acquire->Matches(word); };
     if (MetWithoutDrain(dma_pusher, pending_acquire->address, matches)) {
         VideoCommon::Nx2Profile::Add(Counter::WaitEndedByMemory, 1);
+        pending_acquire->ended_by = "memory";
         return true;
     }
     if ((++pending_acquire->polls % 64) != 0) {
         return false;
+    }
+    static const bool log_waits = std::getenv("EDEN_NX2_ACQUIRE_LOG") != nullptr;
+    if (log_waits && !pending_acquire->diagnosed &&
+        std::chrono::steady_clock::now() - pending_acquire->since > std::chrono::milliseconds{30}) {
+        pending_acquire->diagnosed = true;
+        auto& split = VideoCommon::GpuSplit::Get();
+        const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
+        LOG_INFO(HW_GPU, "Channel {} acquire {:#x} op {} value {:#x} 30 ms in: memory {:#x}, "
+                 "queued release: {}; sent {} consumed {}",
+                 dma_pusher.channel_state.bind_id, pending_acquire->address,
+                 pending_acquire->operation, pending_acquire->value,
+                 dma_pusher.memory_manager.Read<u32>(pending_acquire->address),
+                 device ? Nx2QueuedReleases::Get().Describe(*device) : std::string{"?"},
+                 split.SentPosition(), split.ConsumedPosition());
     }
     DrainBack(Counter::DrainPoll);
     const u32 current = ReadSemaphoreWordPredicted(dma_pusher, pending_acquire->address);
@@ -160,6 +176,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     }
     if (pending_acquire->Matches(current)) {
         VideoCommon::Nx2Profile::Add(Counter::WaitEndedByDrain, 1);
+        pending_acquire->ended_by = "drain";
         return true;
     }
     if (const u32 raw = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
@@ -180,6 +197,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                             dma_pusher.channel_state.bind_id, pending_acquire->address, raw, current);
             }
             VideoCommon::Nx2Profile::Add(Counter::PredictionConflicts, 1);
+            pending_acquire->ended_by = "dropped prediction";
             return true;
         }
     } else {
@@ -191,7 +209,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
         const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
         LOG_WARNING(HW_GPU, "Channel {} waits on semaphore {:#x} (op {}, {:#x}, now {:#x}) for 2 s; "
                     "device {:#x}, buffer cache holds GPU data: {}, words {:08x} {:08x} {:08x} {:08x}; "
-                    "history of the 64 bytes:{}",
+                    "queued release: {}; history of the 64 bytes:{}",
                     dma_pusher.channel_state.bind_id, pending_acquire->address,
                     pending_acquire->operation, pending_acquire->value, current, device.value_or(0),
                     device && dma_pusher.rasterizer->MustFlushRegion(*device, 16, VideoCommon::CacheType::All),
@@ -199,6 +217,7 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 4),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 8),
                     dma_pusher.memory_manager.Read<u32>((pending_acquire->address & ~GPUVAddr{0xf}) + 12),
+                    device ? Nx2QueuedReleases::Get().Describe(*device) : std::string{"?"},
                     device ? Nx2SemaphoreHistory::Get().Describe(*device & ~u64{0x3f}) : std::string{});
     }
     return false;
@@ -207,6 +226,21 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
 bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     if (!CanResumeAcquire(dma_pusher)) {
         return false;
+    }
+    // EDEN_NX2_ACQUIRE_LOG=1: acquires that held the channel for over 10 ms, and what ended them.
+    static const bool log_waits = std::getenv("EDEN_NX2_ACQUIRE_LOG") != nullptr;
+    if (log_waits && pending_acquire) {
+        const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - pending_acquire->since).count();
+        if (waited >= 10'000) {
+            const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
+            LOG_INFO(HW_GPU, "Channel {} acquire {:#x} (device {:#x}) op {} value {:#x} held the "
+                     "channel {} us, ended by {} after {} polls; history:{}",
+                     dma_pusher.channel_state.bind_id, pending_acquire->address, device.value_or(0),
+                     pending_acquire->operation, pending_acquire->value, waited,
+                     pending_acquire->ended_by, pending_acquire->polls,
+                     device && waited >= 50'000 ? Nx2SemaphoreHistory::Get().Describe(*device & ~u64{0x3f}) : std::string{});
+        }
     }
     pending_acquire.reset();
     Nx2SemaphoreWaiters::Get().Remove(this);

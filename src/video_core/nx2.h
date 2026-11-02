@@ -20,6 +20,7 @@
 #include <fmt/format.h>
 
 #include "common/common_types.h"
+#include "common/logging.h"
 
 namespace Tegra {
 
@@ -636,7 +637,8 @@ public:
 
     /// `with_timestamp`: a 16-byte release (payload, 0, 64-bit timestamp), as far as the caller
     /// knows (Maxwell3D::FrontDmaRead treats the timestamp words as unpredictable).
-    void Note(u64 device_address, u32 payload, u64 split_position, bool with_timestamp = false) {
+    void Note(u64 device_address, u32 payload, u64 split_position, bool with_timestamp = false,
+              const char* who = "?") {
         Nx2SemaphoreHistory::Get().Record(device_address, payload, Nx2SemaphoreHistory::Queued);
         std::scoped_lock lk{mutex};
         auto& release = releases[device_address];
@@ -644,8 +646,22 @@ public:
         release.position = split_position;
         release.passed_since = {};
         release.with_timestamp = with_timestamp;
+        release.who = who;
         ++release.outstanding;
         count.store(releases.size(), std::memory_order_release);
+        if (Watched(device_address)) [[unlikely]] {
+            LOG_INFO(HW_GPU, "Release watch: {} noted {:#x}={:#x} at {} (outstanding {})", who,
+                     device_address, payload, split_position, release.outstanding);
+        }
+    }
+
+    /// EDEN_NX2_RELEASE_WATCH=<device address, hex>: logs notes and landings on its 16 bytes.
+    [[nodiscard]] static bool Watched(u64 device_address) {
+        static const u64 watch = [] {
+            const char* value = std::getenv("EDEN_NX2_RELEASE_WATCH");
+            return value ? std::strtoull(value, nullptr, 16) & ~u64{0xf} : u64{};
+        }();
+        return watch != 0 && (device_address & ~u64{0xf}) == watch;
     }
 
     /// The payload the word will hold once the releases queued for it have landed, if any
@@ -696,6 +712,9 @@ public:
     /// A GPU write to the u32 at `device_address` landed: one fewer release outstanding; the
     /// last one landing retires the prediction whatever it wrote (a wrong one must not stay).
     void OnWrite(u64 device_address) {
+        if (Watched(device_address)) [[unlikely]] {
+            LOG_INFO(HW_GPU, "Release watch: landed on {:#x}", device_address);
+        }
         if (count.load(std::memory_order_acquire) == 0) {
             return;
         }
@@ -718,12 +737,29 @@ public:
         return count.load(std::memory_order_acquire) == 0;
     }
 
+    /// The outstanding release noted for `device_address`, for diagnostics.
+    [[nodiscard]] std::string Describe(u64 device_address) {
+        std::scoped_lock lk{mutex};
+        const auto it = releases.find(device_address);
+        if (it == releases.end()) {
+            return "none";
+        }
+        const auto& r = it->second;
+        return fmt::format("payload {:#x} by {} position {} outstanding {} timestamp {} behind back for {} ms",
+                           r.payload, r.who, r.position, r.outstanding, r.with_timestamp,
+                           r.passed_since == std::chrono::steady_clock::time_point{}
+                               ? -1
+                               : std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - r.passed_since).count());
+    }
+
 private:
     struct Release {
         u32 payload{};
         u64 position{};
         u32 outstanding{};
         bool with_timestamp{};
+        const char* who{"?"}; ///< Engine that noted it (diagnostics)
         std::chrono::steady_clock::time_point passed_since{}; ///< First seen behind the back
     };
     std::mutex mutex;
@@ -734,6 +770,9 @@ private:
 
 /// A GPU semaphore write landed in guest memory: wakes waiters, retires the queued release.
 inline void Nx2OnSemaphoreWrite(u64 device_address, u32 value, u32 source = 1) {
+    if (Nx2QueuedReleases::Watched(device_address)) [[unlikely]] {
+        LOG_INFO(HW_GPU, "Release watch: {:#x}={:#x} written (source {})", device_address, value, source);
+    }
     Nx2SemaphoreHistory::Get().Record(device_address, value, source);
     Nx2SemaphoreWaiters::Get().OnWrite(device_address, value, source);
     Nx2QueuedReleases::Get().OnWrite(device_address);

@@ -977,7 +977,7 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
                 report.query.reduction_enable == 0) {
                 if (const auto device = memory_manager.GpuToCpuAddress(report.Address())) {
                     Nx2QueuedReleases::Get().Note(*device, report.payload, split.SentPosition(),
-                                                  report.query.short_query == 0);
+                                                  report.query.short_query == 0, "3D");
                 }
             }
             break;

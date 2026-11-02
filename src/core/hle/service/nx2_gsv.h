@@ -238,17 +238,32 @@ private:
         request.syncpoint = syncpoint;
         request.pending = true;
         auto& manager = system.Host1x().GetSyncpointManager();
+        // EDEN_NX2_SYNCPT_LOG=1: what the game waits for and how far behind the GPU thread is.
+        static const bool log_waits = std::getenv("EDEN_NX2_SYNCPT_LOG") != nullptr;
+        const u32 current = log_waits ? manager.GetGuestSyncpointValue(syncpoint) : 0;
+        const auto requested_at = std::chrono::steady_clock::now();
         // The action runs on the GPU thread under the manager's lock, or inline if the value is
         // already reached.
         request.handle = manager.RegisterGuestAction(
             syncpoint, static_cast<u32>(value),
-            [shared = m_shared, &kernel = system.Kernel(), &request, event] {
+            [shared = m_shared, &kernel = system.Kernel(), &request, event, slot, syncpoint, value,
+             current, requested_at] {
                 std::scoped_lock lk{shared->mutex};
                 if (!shared->alive) {
                     return;
                 }
                 request.pending = false;
                 event->Signal(kernel);
+                if (log_waits) {
+                    const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - requested_at).count();
+                    if (waited >= 200) {
+                        LOG_INFO(Service, "nx2:syncpt slot {} syncpoint {} value {:#x} (was {:#x}, "
+                                 "{} behind) reached after {} us",
+                                 slot, syncpoint, value, current,
+                                 static_cast<s64>(static_cast<u32>(value) - current), waited);
+                    }
+                }
             });
         TipcReplyWords(ctx, {});
     }
@@ -1152,6 +1167,11 @@ private:
             return value == nullptr || value[0] != '0';
         }();
         const auto entered = std::chrono::steady_clock::now();
+        static const bool log_fences = std::getenv("EDEN_NX2_SYNCPT_LOG") != nullptr;
+        if (log_fences) {
+            LOG_INFO(Service, "nx2:vi2 present #{} fence ({}, {:#x}) now {:#x}", m_presents, ~w[22],
+                     w[24], ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
+        }
         if (frames_ahead) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
                       m_presents, ~w[22], w[24], m_previous_fence_id, m_previous_fence_value,

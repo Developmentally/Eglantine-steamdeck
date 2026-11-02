@@ -92,7 +92,7 @@ void MaxwellDMA::FrontNoteMethod(u64 split_position, u32 method, u32 argument) {
     const GPUVAddr address =
         (GPUVAddr{front_semaphore[0] & 0xff} << 32) | front_semaphore[1];
     if (const auto device = memory_manager.GpuToCpuAddress(address)) {
-        Nx2QueuedReleases::Get().Note(*device, front_semaphore[2], split_position);
+        Nx2QueuedReleases::Get().Note(*device, front_semaphore[2], split_position, false, "DMA");
     }
 }
 

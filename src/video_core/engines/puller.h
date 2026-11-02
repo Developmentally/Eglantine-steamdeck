@@ -81,6 +81,8 @@ public:
         bool reported;
         u32 polls{}; ///< CanResumeAcquire checks so far (the back is drained on every 64th)
         std::chrono::steady_clock::time_point conflict_since{}; ///< Memory met, prediction not
+        const char* ended_by{"?"}; ///< How the wait ended (EDEN_NX2_ACQUIRE_LOG)
+        bool diagnosed{}; ///< Logged once 30 ms in (EDEN_NX2_ACQUIRE_LOG)
 
         [[nodiscard]] bool Matches(u32 current) const;
     };
