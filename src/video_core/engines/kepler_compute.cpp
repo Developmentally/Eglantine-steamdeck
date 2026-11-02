@@ -936,6 +936,18 @@ void KeplerCompute::FrontApply(VideoCommon::GpuSplit& split, FrontState& fs, u32
         fs.compute_uploaded = true;
     }
     fs.registers[method] = argument;
+    if (method == KEPLER_COMPUTE_REG_INDEX(exec_upload) && split.Active()) {
+        // An inline upload to memory the back runs later, like Maxwell3D::FrontNoteUpload: a
+        // command list or QMD it writes must not be read before it.
+        const u32 length = fs.registers[0x60];
+        const u32 lines = fs.registers[0x61];
+        const GPUVAddr address = (GPUVAddr{fs.registers[0x62]} << 32) | fs.registers[0x63];
+        const u32 pitch = fs.registers[0x64];
+        const u64 span = u64{lines} * (std::max)(length, (argument & 1) != 0 ? length : pitch);
+        if (const auto device = memory_manager.GpuToCpuAddress(address); device && span != 0) {
+            Nx2PendingGpuWrites::Get().Note(*device, span, split.SentPosition());
+        }
+    }
     if (method == 0x107 && split.Active()) {
         // Inline QMD (ProcessNativeMethod): written to memory by the back, launched at once
         // unless the control word defers it.

@@ -427,12 +427,14 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
         }
         static const bool check = std::getenv("EDEN_NX2_PB_CHECK") != nullptr;
         if (check) {
+            entries.submit_time = std::chrono::steady_clock::now();
             std::vector<u32> words;
             for (const auto& entry : entries.command_lists) {
                 words.resize(entry.size);
                 system.ApplicationMemory().ReadBlock(entry.addr.Value(), words.data(),
                                                      words.size() * sizeof(u32));
                 entries.submit_hashes.push_back(Tegra::HashPushbufferWords(words));
+                entries.submit_words.emplace_back(words.size() <= 128 ? words : std::vector<u32>{});
             }
         }
     }

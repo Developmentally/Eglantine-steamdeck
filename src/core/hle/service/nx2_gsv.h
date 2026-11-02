@@ -1158,19 +1158,24 @@ private:
             LOG_INFO(Service, "nx2:vi2 229 present #{} token={:#x} slot={} image={}", m_presents,
                      u64{w[2]} | (u64{w[3]} << 32), w[4], w[5]);
         }
-        // Wait for the previous frame's fence instead of this one, so the game prepares frame N+1
-        // while the GPU thread runs frame N (the console keeps several frames in flight). Waiting
-        // for this frame serialized the two: 8-56 ms of every 34-105 ms frame on title 1.
-        // EDEN_NX2_FRAMES_AHEAD=0 restores the wait for the current frame.
+        // The present waits for this frame's fence. Returning early, waiting for the previous
+        // frame's fence instead (EDEN_NX2_FRAMES_AHEAD=1), let the game prepare frame N+1 while
+        // the GPU thread ran frame N and looked like a win (8-56 ms of every 34-105 ms frame on
+        // title 1), but the game takes the present's return as the GPU being done with that
+        // frame: it recycles the frame's command memory, and the GPU thread, still parsing it,
+        // read the next frame's words through torn entries (a release of 0xffffffff into the
+        // compute/3D handshake word, garbage shader stages). Donkey Kong Bananza froze on every
+        // big terrain break; with the wait it plays them, 31 fps.
         static const bool frames_ahead = [] {
             const char* value = std::getenv("EDEN_NX2_FRAMES_AHEAD");
-            return value == nullptr || value[0] != '0';
+            return value != nullptr && value[0] == '1';
         }();
         const auto entered = std::chrono::steady_clock::now();
         static const bool log_fences = std::getenv("EDEN_NX2_SYNCPT_LOG") != nullptr;
         if (log_fences) {
-            LOG_INFO(Service, "nx2:vi2 present #{} fence ({}, {:#x}) now {:#x}", m_presents, ~w[22],
-                     w[24], ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
+            LOG_INFO(Service, "nx2:vi2 present #{} slot {} image {} size {}x{} fence ({}, {:#x}) now {:#x}",
+                     m_presents, w[4], w[5], (w[7] & 0xffff) + 1, (w[7] >> 16) + 1, ~w[22], w[24],
+                     ~w[22] < 192 ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(~w[22]) : 0U);
         }
         if (frames_ahead) {
             LOG_DEBUG(Service, "nx2:vi2 present #{} fence ({}, {:#x}), waiting for ({}, {:#x}); now {:#x}",
@@ -1254,6 +1259,7 @@ private:
         std::array<s64, Core::Hardware::NUM_CPU_CORES> idle{};
         std::map<u64, s64> threads;
         std::map<u64, Kernel::KThread::WaitAccounting> waits;
+        std::set<u64> previously_busy;
     } m_guest_cpu{};
 
     static std::string DescribeWaitObject(const Kernel::KThread::WaitAccounting::ObjectKey& key) {
@@ -1348,6 +1354,9 @@ private:
             s32 core;
         };
         std::vector<Busy> busy;
+        // Threads that ran in the previous window and not at all in this one, with what they
+        // wait on: a game whose picture stops while its render loop goes on has one of these.
+        std::string stalled;
         {
             Kernel::KScopedLightLock lk{process->GetListLock()};
             Kernel::KScopedSchedulerLock sl{kernel};
@@ -1359,8 +1368,21 @@ private:
                 const s64 delta = ticks - (previous != m_guest_cpu.threads.end() ? previous->second : 0);
                 if (delta > 0) {
                     busy.push_back({thread.GetThreadId(), delta, thread.GetPriority(), thread.GetActiveCore()});
+                } else if (previous != m_guest_cpu.threads.end() && m_guest_cpu.previously_busy.contains(thread.GetThreadId())) {
+                    static constexpr std::array<const char*, 7> Reasons{
+                        "none", "sleep", "ipc", "sync", "condvar", "arbiter", "suspended"};
+                    const auto reason = static_cast<size_t>(thread.GetWaitReasonForDebugging());
+                    stalled += fmt::format("\n  #{} (prio {}) stalled: {} state {:#x} key {:#x} value {:#x} condvar {:#x}",
+                                           thread.GetThreadId(), thread.GetPriority(),
+                                           reason < Reasons.size() ? Reasons[reason] : "?",
+                                           static_cast<u32>(thread.GetState()),
+                                           GetInteger(thread.GetAddressKey()), thread.GetAddressKeyValue(),
+                                           thread.GetConditionVariableKey());
                 }
             }
+        }
+        for (const auto& b : busy) {
+            sample.previously_busy.insert(b.id);
         }
         if (elapsed != 0) {
             std::sort(busy.begin(), busy.end(), [](const Busy& a, const Busy& b) { return a.ticks > b.ticks; });
@@ -1373,7 +1395,7 @@ private:
                                                      before != m_guest_cpu.waits.end() ? &before->second : nullptr,
                                                      static_cast<s64>(elapsed)));
             }
-            LOG_INFO(Service, "nx2:vi2 guest cores busy: {}; busiest threads:{}", cores, threads);
+            LOG_INFO(Service, "nx2:vi2 guest cores busy: {}; busiest threads:{}{}", cores, threads, stalled);
         }
         m_guest_cpu = std::move(sample);
     }

@@ -1021,7 +1021,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
         ReportRuntimePipeline("Graphics", begin);
     };
     GraphicsEnvironments environments;
-    GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    try {
+        GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    } catch (const Shader::Exception& exception) {
+        // A Switch 2 program bound to a stage the native path does not run: that is a torn
+        // pushbuffer binding garbage, not a pipeline to build (it terminated the process).
+        LOG_ERROR(Render_Vulkan, "Graphics pipeline environment rejected: {}", exception.what());
+        return nullptr;
+    }
 
     main_pools.ReleaseContents();
     auto pipeline{

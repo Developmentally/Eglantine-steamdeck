@@ -672,7 +672,8 @@ public:
     /// value memory will never hold lets an acquire pass early, and a channel that runs ahead
     /// of its releases deadlocks the game (`011932`).
     [[nodiscard]] std::optional<u32> Pending(u64 device_address, u64 split_position,
-                                             u64 back_position, bool* with_timestamp = nullptr) {
+                                             u64 back_position, bool* with_timestamp = nullptr,
+                                             bool* executed = nullptr) {
         if (count.load(std::memory_order_acquire) == 0) {
             return std::nullopt;
         }
@@ -700,6 +701,9 @@ public:
         }
         if (with_timestamp != nullptr) {
             *with_timestamp = release.with_timestamp;
+        }
+        if (executed != nullptr) {
+            *executed = release.position <= back_position;
         }
         return release.payload;
     }

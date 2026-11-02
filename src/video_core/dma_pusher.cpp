@@ -315,7 +315,11 @@ bool DmaPusher::Step() {
                 }
             }
             if (dma_pushbuffer_subindex < command_list.submit_hashes.size()) {
-                CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex]);
+                CheckSubmitHash(header, command_list.submit_hashes[dma_pushbuffer_subindex],
+                                dma_pushbuffer_subindex < command_list.submit_words.size()
+                                    ? std::span<const u32>{command_list.submit_words[dma_pushbuffer_subindex]}
+                                    : std::span<const u32>{},
+                                command_list.submit_time);
             }
         }
         // A resumed entry is read again: the words after the acquire may be new by now.
@@ -642,19 +646,61 @@ void DmaPusher::ReportUnboundSubchannel() {
     if (reported.fetch_add(1) < 8) {
         LOG_WARNING(HW_GPU, "Dropping method {:#x} on unbound subchannel {}", dma_state.method,
                     dma_state.subchannel);
+        if (g_record_parsed_entries && reported.load() == 1) {
+            // A desynced parse: which recent entries changed under the parser.
+            DumpCurrentEntry("unbound subchannel");
+        }
     }
 }
 
-void DmaPusher::CheckSubmitHash(const CommandListHeader& header, u64 submit_hash) {
+void DmaPusher::CheckSubmitHash(const CommandListHeader& header, u64 submit_hash,
+                                std::span<const u32> submit_words,
+                                std::chrono::steady_clock::time_point submit_time) {
     std::vector<u32> words(header.size);
     memory_manager.ReadBlockUnsafe(header.addr, words.data(), words.size() * sizeof(u32));
     static std::atomic<u64> checked{};
     static std::atomic<u64> changed{};
     ++checked;
     if (HashPushbufferWords(words) != submit_hash) {
-        if (changed.fetch_add(1) < 16) {
-            LOG_WARNING(HW_GPU, "pushbuffer entry {:#x}+{:#x} changed between submit and execution",
-                        header.addr.Value(), header.size.Value());
+        // The 5-word indirect draw records the GPU fills in are expected to change.
+        const bool record = words.size() == 5;
+        if (!record && changed.fetch_add(1) < 64) {
+            // The submit-time hash came from the guest CPU's view of the same address. Whether
+            // the CPU's view still differs from the GPU's tells a stale GPU mapping or cache
+            // (differs) from words the CPU rewrote after submitting (same).
+            std::vector<u32> cpu_words(header.size);
+            system.ApplicationMemory().ReadBlock(header.addr.Value(), cpu_words.data(),
+                                                 cpu_words.size() * sizeof(u32));
+            size_t first = 0;
+            while (first < words.size() && words[first] == cpu_words[first]) {
+                ++first;
+            }
+            const auto device = memory_manager.GpuToCpuAddress(header.addr.Value());
+            size_t since_submit = 0;
+            while (since_submit < std::min(words.size(), submit_words.size()) &&
+                   words[since_submit] == submit_words[since_submit]) {
+                ++since_submit;
+            }
+            LOG_WARNING(HW_GPU,
+                        "pushbuffer entry {:#x}+{:#x} (device {:#x}, GPU-written page {}, cached GPU data {}) "
+                        "changed between submit and execution ({} us after submit, channel {}); GPU and CPU views {} now{}; first change "
+                        "at word {} (submitted {:08x}, now {:08x}); GPU words {:08x}",
+                        header.addr.Value(), header.size.Value(), device.value_or(0),
+                        device && Tegra::Nx2IsGpuWritten(*device),
+                        memory_manager.IsMemoryDirty(header.addr.Value(), words.size() * sizeof(u32),
+                                                     VideoCommon::CacheType::BufferCache),
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - submit_time).count(),
+                        channel_state.bind_id,
+                        first == words.size() ? "agree" : "differ",
+                        first == words.size()
+                            ? std::string{}
+                            : fmt::format(" (first at word {}: GPU {:08x}, CPU {:08x})", first,
+                                          words[first], cpu_words[first]),
+                        since_submit,
+                        since_submit < submit_words.size() ? submit_words[since_submit] : 0u,
+                        since_submit < words.size() ? words[since_submit] : 0u,
+                        fmt::join(std::span{words}.first(std::min<size_t>(words.size(), 12)), " "));
         }
     }
     if ((checked % 20000) == 0) {
@@ -685,8 +731,17 @@ void DmaPusher::DumpCurrentEntry(const char* reason) {
         for (const u32 word : words) {
             hash = (hash ^ word) * 0x100000001b3ULL;
         }
-        LOG_WARNING(HW_GPU, "  parsed -{}: {:#x}+{:#x} {}", i, entry.address, entry.size,
-                    hash == entry.hash ? "unchanged" : "CHANGED since parsed");
+        const auto device = memory_manager.GpuToCpuAddress(entry.address);
+        LOG_WARNING(HW_GPU, "  parsed -{}: {:#x}+{:#x} {} (GPU-written page {}, cached GPU data {}){}",
+                    i, entry.address, entry.size,
+                    hash == entry.hash ? "unchanged" : "CHANGED since parsed",
+                    device && Tegra::Nx2IsGpuWritten(*device),
+                    memory_manager.IsMemoryDirty(entry.address, entry.size * sizeof(u32),
+                                                 VideoCommon::CacheType::BufferCache),
+                    i == 0 || hash != entry.hash
+                        ? fmt::format("; words {:08x}",
+                                      fmt::join(std::span{words}.first(std::min<size_t>(words.size(), 24)), " "))
+                        : std::string{});
     }
     // EDEN_NX2_PB_DUMP=<file>: also write the whole command list (u64 address, u32 size and the
     // current words of every entry, then the current entry index) for offline replay.

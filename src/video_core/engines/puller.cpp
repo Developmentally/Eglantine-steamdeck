@@ -75,13 +75,19 @@ void NoteQueuedRelease(DmaPusher& dma_pusher, GPUVAddr address, u32 payload,
 
 // The value the semaphore holds when the back reaches this point: the last release queued ahead
 // of it if its payload has not landed yet (a stale word in memory must not count: release(0)
-// then acquire(1) waits for the CPU on the console), else `word` from memory.
-u32 PredictedSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address, u32 word) {
+// then acquire(1) waits for the CPU on the console), else `word` from memory. `executed` tells
+// whether the back has run that release (only its host fence is outstanding).
+u32 PredictedSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address, u32 word,
+                           bool* executed = nullptr) {
     auto& split = VideoCommon::GpuSplit::Get();
     auto& releases = Nx2QueuedReleases::Get();
+    if (executed != nullptr) {
+        *executed = true;
+    }
     if (split.Active() && !releases.Empty()) {
         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
-            const auto pending = releases.Pending(*device, split.SentPosition(), split.ConsumedPosition());
+            const auto pending = releases.Pending(*device, split.SentPosition(), split.ConsumedPosition(),
+                                                  nullptr, executed);
             // GPU thread only: the predictions Pending() just expired, for the profile.
             static u64 expired_seen{};
             if (const u64 expired = releases.Expired(); expired != expired_seen) {
@@ -98,11 +104,26 @@ u32 PredictedSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address, u32 word) {
     return word;
 }
 
-// Without touching the back half's state: guest memory as it is now.
+// Without touching the back half's state: guest memory as it is now. EDEN_NX2_ACQUIRE_EXECUTED=1:
+// a release queued for the back but not run yet does not meet an acquire, whatever it will
+// write (the console reaches the acquire only after it); tried against Donkey Kong Bananza's
+// post-clip freeze, which it did not change, at the cost of most acquires waiting.
 template <typename Matches>
 bool MetWithoutDrain(DmaPusher& dma_pusher, GPUVAddr address, const Matches& matches) {
-    return matches(PredictedSemaphoreWord(dma_pusher, address,
-                                          dma_pusher.memory_manager.Read<u32>(address)));
+    static const bool require_executed = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQUIRE_EXECUTED");
+        return value != nullptr && value[0] == '1';
+    }();
+    bool executed = true;
+    const u32 word = PredictedSemaphoreWord(dma_pusher, address,
+                                            dma_pusher.memory_manager.Read<u32>(address), &executed);
+    if (!executed) {
+        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireBehindBack, 1);
+        if (require_executed) {
+            return false;
+        }
+    }
+    return matches(word);
 }
 
 // After a drain: ReadSemaphoreWord's flushed value, under the same prediction.
@@ -229,6 +250,15 @@ bool Puller::ResumeAcquire(DmaPusher& dma_pusher) {
     }
     // EDEN_NX2_ACQUIRE_LOG=1: acquires that held the channel for over 10 ms, and what ended them.
     static const bool log_waits = std::getenv("EDEN_NX2_ACQUIRE_LOG") != nullptr;
+    if (pending_acquire) {
+        if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(pending_acquire->address);
+            device && Nx2QueuedReleases::Watched(*device)) [[unlikely]] {
+            LOG_INFO(HW_GPU, "Release watch: channel {} acquire {:#x} op {} value {:#x} resumes, ended by {} (memory {:#x})",
+                     dma_pusher.channel_state.bind_id, pending_acquire->address,
+                     pending_acquire->operation, pending_acquire->value, pending_acquire->ended_by,
+                     dma_pusher.memory_manager.Read<u32>(pending_acquire->address));
+        }
+    }
     if (log_waits && pending_acquire) {
         const auto waited = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - pending_acquire->since).count();
@@ -391,9 +421,23 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
         // CPU wait for the GPU. Now the channel suspends and the release's landing wakes it
         // (Nx2SemaphoreWaiters::OnWrite from the fencing thread); the back only submits what
         // it has so the fence completes soon. EDEN_NX2_SYNC_ACQUIRE=1 restores the drain.
+        const auto watched_device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address);
+        const bool watched = watched_device && Nx2QueuedReleases::Watched(*watched_device);
         if (MetWithoutDrain(dma_pusher, acquire.address,
                             [&](u32 word) { return acquire.Matches(word); })) {
+            if (watched) [[unlikely]] {
+                LOG_INFO(HW_GPU, "Release watch: channel {} acquire {:#x} op {} value {:#x} met at once (memory {:#x}, queued: {})",
+                         dma_pusher.channel_state.bind_id, acquire.address, acquire.operation,
+                         acquire.value, dma_pusher.memory_manager.Read<u32>(acquire.address),
+                         Nx2QueuedReleases::Get().Describe(*watched_device));
+            }
             return;
+        }
+        if (watched) [[unlikely]] {
+            LOG_INFO(HW_GPU, "Release watch: channel {} acquire {:#x} op {} value {:#x} suspends (memory {:#x}, queued: {})",
+                     dma_pusher.channel_state.bind_id, acquire.address, acquire.operation,
+                     acquire.value, dma_pusher.memory_manager.Read<u32>(acquire.address),
+                     Nx2QueuedReleases::Get().Describe(*watched_device));
         }
         static const bool sync_acquire = [] {
             const char* value = std::getenv("EDEN_NX2_SYNC_ACQUIRE");
