@@ -61,7 +61,7 @@ void DmaPusher::DispatchCalls() {
     system.GPU().OnCommandListEnd();
 }
 
-void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+bool DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
     // Title 1 runs small command lists its culling dispatches fill in each frame. Accurate GPU
     // mode reads every command list through the caches (safe reads); here only the ones on pages
     // the GPU has written are, or their draws run with an older frame's words (trees vanish).
@@ -75,7 +75,7 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
         return value != nullptr && value[0] != '0';
     }();
     if (!flush_commands || size == 0 || !Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
-        return;
+        return false;
     }
     bool written = false;
     for (GPUVAddr page = address & ~GPUVAddr{0xfff}; page < address + size; page += 0x1000) {
@@ -86,7 +86,7 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
         }
     }
     if (!written) {
-        return;
+        return false;
     }
     // The caches belong to the split's back, and the words may be written by work the front queued
     // that the back has not run yet: it runs all of it first.
@@ -116,23 +116,26 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
             }
         }
     }
+    return true;
 }
 
 // An entry a copy or upload sent to the back writes (Nx2PendingGpuWrites) is read after the back
 // ran it, as the hardware's in-order copy engines would have by the time it fetches the entry.
-void DmaPusher::WaitForPendingWrites(GPUVAddr address, size_t size) {
+bool DmaPusher::WaitForPendingWrites(GPUVAddr address, size_t size) {
     if (!g_nx2_ampere.load(std::memory_order_relaxed)) {
-        return;
+        return false;
     }
     auto& split = VideoCommon::GpuSplit::Get();
     if (!split.Active()) {
-        return;
+        return false;
     }
+    bool drained = false;
     if (Tegra::Nx2PendingMappings::Get().Overlaps(address, size)) {
         // A map or unmap of the list's range is queued for the back: read through the page
         // table as it will be, not as it was for the previous user of these addresses.
         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DrainMappings, 1);
         split.Drain();
+        drained = true;
         static std::atomic<u32> logs{};
         if (logs.fetch_add(1, std::memory_order_relaxed) < 20) {
             LOG_INFO(HW_GPU, "Command list at {:#x} ({} bytes) is in a range being remapped: drained first",
@@ -141,7 +144,7 @@ void DmaPusher::WaitForPendingWrites(GPUVAddr address, size_t size) {
     }
     const auto device = memory_manager.GpuToCpuAddress(address);
     if (!device) {
-        return;
+        return drained;
     }
     auto& pending = Tegra::Nx2PendingGpuWrites::Get();
     bool wait = pending.Pending(*device, size, split.ConsumedPosition());
@@ -153,7 +156,7 @@ void DmaPusher::WaitForPendingWrites(GPUVAddr address, size_t size) {
         }
     }
     if (!wait) {
-        return;
+        return drained;
     }
     VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DrainEngineWrites, 1);
     split.Drain();
@@ -162,6 +165,7 @@ void DmaPusher::WaitForPendingWrites(GPUVAddr address, size_t size) {
         LOG_INFO(HW_GPU, "Command list at {:#x} ({} bytes) is written by a copy queued for the back: drained first",
                  address, size);
     }
+    return true;
 }
 
 // A command list is finished once the back has run everything it queued (Nx2NoteListDone).
@@ -222,7 +226,9 @@ bool DmaPusher::Step() {
     }
 
     if (header.size > 0) {
-        WaitForPendingWrites(dma_state.dma_get, size_t{header.size} * sizeof(u32));
+        // Memory holds newer words than the submit-time snapshot: a GPU write to the entry the
+        // back has now run, or a record flushed below.
+        bool memory_newer = WaitForPendingWrites(dma_state.dma_get, size_t{header.size} * sizeof(u32));
         if (subchannels[dma_state.subchannel] && dma_state.method_count) {
             const auto engine = subchannel_type[dma_state.subchannel];
             const bool kepler_payload = engine == Engines::EngineTypes::KeplerCompute && dma_state.method == ComputeInline && dma_state.non_incrementing;
@@ -292,6 +298,7 @@ bool DmaPusher::Step() {
                 }
                 if (flushed_parameters) {
                     engine_state->current_dirty = false;
+                    memory_newer = true;
                 } else if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
                     // The caches behind IsMemoryDirty belong to the split's back thread.
                     split.Defer([engine_state, memory = &memory_manager, address = GPUVAddr{dma_state.dma_get},
@@ -342,14 +349,36 @@ bool DmaPusher::Step() {
         // (the split only starts with unsafe reads; the settings can change mid-game).
         const bool use_safe = !VideoCommon::GpuSplit::Get().Active() &&
                               (Settings::IsDMALevelDefault() ? Settings::IsGPULevelHigh() : Settings::IsDMALevelSafe());
-        if (use_safe) {
+        if (!use_safe && FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32))) {
+            memory_newer = true;
+        }
+        // The words as submitted (nvhost_gpu), unless this entry is resumed, memory has newer
+        // words for it, or the game had not written it yet when it submitted (Mario Kart World
+        // submits one 330-word entry of zeros behind an acquire and fills it afterwards).
+        const std::span<const CommandHeader> snapshot = [&]() -> std::span<const CommandHeader> {
+            if (command_resume_offset != 0 || memory_newer ||
+                dma_pushbuffer_subindex >= command_list.submitted_offsets.size()) {
+                return {};
+            }
+            const std::span<const CommandHeader> words{
+                command_list.submitted_words.data() + command_list.submitted_offsets[dma_pushbuffer_subindex],
+                header.size};
+            if (words.front().argument == 0) {
+                VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::SnapshotsUnwritten, 1);
+                return {};
+            }
+            return words;
+        }();
+        if (!snapshot.empty()) {
+            RecordParsedEntry(header, snapshot);
+            command_resume_offset += ProcessCommands(snapshot, 0);
+        } else if (use_safe) {
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::SafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);
             command_resume_offset +=
                 ProcessCommands(commands.subspan(command_resume_offset), command_resume_offset);
         } else {
-            FlushGpuWrittenCommands(dma_state.dma_get, size_t{header.size} * sizeof(u32));
             Tegra::Memory::GpuGuestMemory<Tegra::CommandHeader, Tegra::Memory::GuestMemoryFlags::UnsafeRead>headers(memory_manager, dma_state.dma_get, header.size, &command_headers);
             const std::span<const CommandHeader> commands{headers.data(), headers.size()};
             RecordParsedEntry(header, commands);

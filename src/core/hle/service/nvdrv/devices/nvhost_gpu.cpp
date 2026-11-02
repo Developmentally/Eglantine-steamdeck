@@ -24,6 +24,7 @@
 #include "video_core/engines/puller.h"
 #include "video_core/gpu.h"
 #include "video_core/host1x/host1x.h"
+#include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
 
 namespace Service::Nvidia::Devices {
@@ -436,6 +437,31 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
                                                      words.size() * sizeof(u32));
                 entries.submit_hashes.push_back(Tegra::HashPushbufferWords(words));
                 entries.submit_words.emplace_back(words.size() <= 128 ? words : std::vector<u32>{});
+            }
+        }
+        // Keep the words as submitted: the present can return before the GPU thread reaches
+        // this frame's work (nx2_gsv.h, frames ahead), and the game then refills command
+        // memory it already submitted (Mario Kart World rendered the end of a frame into the
+        // next frame's image; Donkey Kong Bananza poisoned its ring and the channels hung).
+        // The front executes the copy (dma_pusher.cpp). EDEN_NX2_PB_SNAPSHOT=0: from memory.
+        // (Approach from Wael3rd/Eglantine-MKW.)
+        static const bool snapshot = [] {
+            const char* value = std::getenv("EDEN_NX2_PB_SNAPSHOT");
+            return value == nullptr || value[0] != '0';
+        }();
+        if (snapshot && channel_state->memory_manager) {
+            size_t words = 0;
+            for (const auto& entry : entries.command_lists) {
+                words += entry.size;
+            }
+            entries.submitted_words.resize(words);
+            entries.submitted_offsets.reserve(entries.command_lists.size());
+            size_t offset = 0;
+            for (const auto& entry : entries.command_lists) {
+                entries.submitted_offsets.push_back(static_cast<u32>(offset));
+                channel_state->memory_manager->ReadBlockUnsafe(entry.addr, entries.submitted_words.data() + offset,
+                                                               entry.size * sizeof(u32));
+                offset += entry.size;
             }
         }
     }

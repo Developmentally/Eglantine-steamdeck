@@ -121,6 +121,10 @@ struct CommandList final {
     std::vector<u64> submit_hashes;
     std::vector<std::vector<u32>> submit_words;
     std::chrono::steady_clock::time_point submit_time{};
+    /// Switch 2: the entries' words as submitted, entry i at submitted_offsets[i]. The front
+    /// executes these rather than memory the game may be refilling for a later frame already.
+    std::vector<CommandHeader> submitted_words;
+    std::vector<u32> submitted_offsets;
 };
 
 /// FNV-1a over pushbuffer words (EDEN_NX2_PB_CHECK).
@@ -173,10 +177,12 @@ private:
     static constexpr u32 non_puller_methods = 0x40;
     static constexpr u32 max_subchannels = 8;
     bool Step();
-    /// Re-reads a command list the GPU has written through the caches (Switch 2 titles).
-    void FlushGpuWrittenCommands(GPUVAddr address, size_t size);
+    /// Re-reads a command list the GPU has written through the caches (Switch 2 titles);
+    /// returns whether it was one.
+    bool FlushGpuWrittenCommands(GPUVAddr address, size_t size);
     /// Drains the back before an entry a copy or upload sent to it writes (Switch 2 titles).
-    void WaitForPendingWrites(GPUVAddr address, size_t size);
+    /// Returns whether it did: the entry's words in memory are newer than any snapshot then.
+    bool WaitForPendingWrites(GPUVAddr address, size_t size);
     /// Returns how many words were processed: fewer than given when a semaphore acquire
     /// suspended the channel.
     size_t ProcessCommands(std::span<const CommandHeader> commands, size_t word_offset = 0);
