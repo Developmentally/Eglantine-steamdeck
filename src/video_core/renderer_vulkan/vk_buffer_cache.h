@@ -168,6 +168,10 @@ public:
         return ref.mapped_span;
     }
 
+    VideoCommon::StreamedUniform RequestMappedUniformBuffer(u32 size);
+    void BindMappedUniformBuffer(const VideoCommon::StreamedUniform& mapped, u32 size);
+    [[nodiscard]] bool MappedUniformValid(const VideoCommon::StreamedUniform& mapped) const noexcept;
+
     [[nodiscard]] VkDeviceSize SparseAlignmentFor(bool sparse_compatible) const noexcept {
         if (!sparse_compatible || !multi_range_buffers.use_sparse) {
             return 0;

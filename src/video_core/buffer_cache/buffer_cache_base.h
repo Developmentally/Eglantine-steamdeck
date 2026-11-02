@@ -118,6 +118,15 @@ struct HostBindings {
     u32 max_index{0};
 };
 
+/// A uniform buffer streamed by the runtime (a staging region), reusable within one submission.
+struct StreamedUniform {
+    u64 buffer{};         ///< Backend buffer handle (0: none)
+    u64 device_address{};
+    u64 offset{};
+    std::span<u8> mapped_span{};
+    u64 tick{};           ///< Submission it was requested in
+};
+
 class BufferCacheChannelInfo : public ChannelInfo {
 public:
     BufferCacheChannelInfo() = delete;
@@ -170,6 +179,16 @@ public:
     std::array<u32, NUM_STAGES> fast_bound_uniform_buffers{};
     std::array<std::array<u32, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES>
         uniform_buffer_binding_sizes{};
+
+    /// The last copy the fast uniform path made for a binding: the same guest range, unwritten
+    /// since (write epochs), within the same submission, is bound again without a copy.
+    struct FastUniformMemo {
+        DAddr device_addr{};
+        u32 size{};
+        u32 epoch{};
+        StreamedUniform mapped{};
+    };
+    std::array<std::array<FastUniformMemo, NUM_GRAPHICS_UNIFORM_BUFFERS>, NUM_STAGES> fast_uniform_memo{};
 };
 
 template <class P>
@@ -539,6 +558,30 @@ private:
     }
     Common::RangeSet<DAddr> gpu_modified_ranges;
     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
+
+    /// A counter per (hashed) device page, bumped by every write the cache is told about (guest
+    /// CPU writes, engine writes through the memory manager): the fast uniform path compares the
+    /// sum over a binding's pages with the one it copied under. Aliasing only costs a copy.
+    static constexpr size_t WriteEpochPages = size_t{1} << 20;
+    std::vector<u32> write_epochs = std::vector<u32>(WriteEpochPages);
+
+    void BumpWriteEpochs(DAddr device_addr, u64 size) {
+        const DAddr first = device_addr >> Core::DEVICE_PAGEBITS;
+        const DAddr last = (device_addr + size - 1) >> Core::DEVICE_PAGEBITS;
+        for (DAddr page = first; page <= last; ++page) {
+            ++write_epochs[page & (WriteEpochPages - 1)];
+        }
+    }
+
+    [[nodiscard]] u32 WriteEpoch(DAddr device_addr, u64 size) const {
+        const DAddr first = device_addr >> Core::DEVICE_PAGEBITS;
+        const DAddr last = (device_addr + size - 1) >> Core::DEVICE_PAGEBITS;
+        u32 epoch = 0;
+        for (DAddr page = first; page <= last; ++page) {
+            epoch += write_epochs[page & (WriteEpochPages - 1)];
+        }
+        return epoch;
+    }
 
     // Async Buffers
     Common::OverlapRangeSet<DAddr> async_downloads;

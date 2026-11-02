@@ -167,6 +167,7 @@ void BufferCache<P>::UnmapGPUMemory(size_t as_id, GPUVAddr gpu_addr, size_t size
 
 template <class P>
 void BufferCache<P>::WriteMemory(DAddr device_addr, u64 size) {
+    BumpWriteEpochs(device_addr, size);
     if (IsRegionGpuModified(device_addr, size)) {
         ClearDownload(device_addr, size);
         gpu_modified_ranges.Subtract(device_addr, size);
@@ -187,6 +188,7 @@ void BufferCache<P>::CachedWriteMemory(DAddr device_addr, u64 size) {
         return;
     }
 
+    BumpWriteEpochs(device_addr, size);
     tmp_buffer.resize_destructive(size);
     device_memory.ReadBlockUnsafe(device_addr, tmp_buffer.data(), size);
 
@@ -1044,6 +1046,30 @@ void BufferCache<P>::BindHostGraphicsUniformBuffer(size_t stage, u32 index, u32 
         }
         channel_state->fast_bound_uniform_buffers[stage] |= 1u << binding_index;
         channel_state->uniform_buffer_binding_sizes[stage][binding_index] = size;
+        if constexpr (!IS_OPENGL) {
+            // Stream buffer path: the copy is skipped when this binding already streamed the
+            // same range in this submission and nothing has written to its pages since (a
+            // Switch 2 title binds a dozen unchanged constant buffers per stage on each of its
+            // ~8,000 draws a frame; copying them all was 14% of the GPU back thread).
+            static const bool reuse = [] {
+                const char* value = std::getenv("EDEN_NX2_UNIFORM_MEMO");
+                return value == nullptr || value[0] != '0';
+            }();
+            auto& memo = channel_state->fast_uniform_memo[stage][index];
+            const u32 epoch = WriteEpoch(device_addr, size);
+            if (reuse && memo.device_addr == device_addr && memo.size == size && memo.epoch == epoch &&
+                runtime.MappedUniformValid(memo.mapped)) {
+                runtime.BindMappedUniformBuffer(memo.mapped, size);
+                return;
+            }
+            memo.mapped = runtime.RequestMappedUniformBuffer(size);
+            memo.device_addr = device_addr;
+            memo.size = size;
+            memo.epoch = epoch;
+            device_memory.ReadBlockUnsafe(device_addr, memo.mapped.mapped_span.data(), size);
+            runtime.BindMappedUniformBuffer(memo.mapped, size);
+            return;
+        }
         // Stream buffer path to avoid stalling on non-Nvidia drivers or Vulkan
         const std::span<u8> span = runtime.BindMappedUniformBuffer(stage, binding_index, size);
         device_memory.ReadBlockUnsafe(device_addr, span.data(), size);

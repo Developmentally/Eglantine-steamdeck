@@ -701,6 +701,21 @@ void BufferCacheRuntime::BindTransformFeedbackBuffer(u32 index, VkBuffer buffer,
     });
 }
 
+VideoCommon::StreamedUniform BufferCacheRuntime::RequestMappedUniformBuffer(u32 size) {
+    const StagingBufferRef ref = staging_pool.Request(size, MemoryUsage::Upload);
+    return {reinterpret_cast<u64>(ref.buffer), ref.device_address, ref.offset, ref.mapped_span,
+            scheduler.CurrentTick()};
+}
+
+void BufferCacheRuntime::BindMappedUniformBuffer(const VideoCommon::StreamedUniform& mapped, u32 size) {
+    guest_descriptor_queue.AddBuffer(reinterpret_cast<VkBuffer>(mapped.buffer), mapped.device_address,
+                                     static_cast<u32>(mapped.offset), size);
+}
+
+bool BufferCacheRuntime::MappedUniformValid(const VideoCommon::StreamedUniform& mapped) const noexcept {
+    return mapped.buffer != 0 && mapped.tick == scheduler.CurrentTick();
+}
+
 void BufferCacheRuntime::BindTransformFeedbackBuffers(VideoCommon::HostBindings<Buffer>& bindings) {
     if (!device.IsExtTransformFeedbackSupported()) {
         // Already logged in the rasterizer
