@@ -7,15 +7,19 @@
 #pragma once
 
 #include <array>
+#include <cstring>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <type_traits>
+#include <unordered_map>
 #include "common/container/unordered_map.h"
 #include <vector>
 
+#include "common/cityhash.h"
 #include "common/common_types.h"
 #include "common/thread_worker.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
@@ -116,6 +120,23 @@ public:
 
     [[nodiscard]] ComputePipeline* CurrentComputePipeline();
 
+    // Task/mesh emulation (EDEN_NX2_MESH_EMU=1, video_core/nx2_mesh_emulation.h). The rewritten
+    // task or mesh program at `program` as a compute pipeline; the launch description must
+    // already be the one the dispatch will use (its constant buffers are read at translation).
+    [[nodiscard]] ComputePipeline* MeshEmulationComputePipeline(GPUVAddr program, bool has_task,
+                                                                 u32 threads);
+
+    // The replay draw's pipeline: the generated passthrough vertex program for `mesh_header`
+    // with the title's fragment program at `fragment_program`, over the current fixed state.
+    [[nodiscard]] GraphicsPipeline* MeshReplayPipeline(std::span<const u8, 128> mesh_header,
+                                                       GPUVAddr fragment_program);
+
+    // Batched draws: the current graphics pipeline translated with a per-draw storage offset
+    // table on program slot `program` (Maxwell3D::Regs::ShaderType index). Kept apart from the
+    // normal cache and never serialized.
+    [[nodiscard]] GraphicsPipeline* BatchedGraphicsPipeline(
+        size_t program, const Shader::Environment::DrawTable& table);
+
     void LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                            const VideoCore::DiskResourceLoadCallback& callback);
 
@@ -165,6 +186,25 @@ private:
 
     ::Common::unordered_map<ComputePipelineCacheKey, std::unique_ptr<ComputePipeline>> compute_cache;
     ::Common::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> graphics_cache;
+    // Task/mesh emulation pipelines: by program address and task flag, and by replay key. Not
+    // serialized (few, rebuilt every run).
+    std::unordered_map<u64, std::unique_ptr<ComputePipeline>> mesh_compute_cache;
+    std::unordered_map<GraphicsPipelineCacheKey, std::unique_ptr<GraphicsPipeline>> mesh_replay_cache;
+    struct BatchedKey {
+        GraphicsPipelineCacheKey key;
+        size_t program;
+        Shader::Environment::DrawTable table;
+        bool operator==(const BatchedKey& rhs) const noexcept {
+            return key == rhs.key && program == rhs.program && std::memcmp(&table, &rhs.table, sizeof(table)) == 0;
+        }
+    };
+    struct BatchedKeyHash {
+        size_t operator()(const BatchedKey& k) const noexcept {
+            return k.key.Hash() ^ (k.program * 0x9e3779b97f4a7c15ULL) ^
+                   Common::CityHash64(reinterpret_cast<const char*>(&k.table), sizeof(k.table));
+        }
+    };
+    std::unordered_map<BatchedKey, std::unique_ptr<GraphicsPipeline>, BatchedKeyHash> batched_graphics_cache;
 
     ShaderPools main_pools;
 

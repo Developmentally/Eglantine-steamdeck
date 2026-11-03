@@ -7,6 +7,10 @@
 #pragma once
 
 #include <array>
+#include <bitset>
+#include <chrono>
+#include <optional>
+#include <vector>
 #include <unordered_map>
 
 #include <boost/container/static_vector.hpp>
@@ -15,6 +19,8 @@
 #include "video_core/control/channel_state_cache.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "shader_recompiler/environment.h"
+#include "video_core/nx2_mesh_emulation.h"
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/blit_image.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
@@ -164,6 +170,84 @@ private:
     /// the current draw was it (nothing left to draw).
     bool ResetIndirectRecordsOnCpu(bool is_indexed);
 
+    /// Task/mesh emulation (EDEN_NX2_MESH_EMU=1): the native mesh draw in flight, run as the
+    /// rewritten compute programs over the scratch and a replay draw. True when submitted.
+    bool DrawEmulatedMesh(const VideoCommon::Nx2MeshEmulation::DrawDescription& draw);
+
+    /// Emulator scratch (guest-visible GPU memory, nx2_gpu_memory.h): `bytes` of it, rung
+    /// through; 0 when there is none or it is not mapped in this address space yet.
+    GPUVAddr ReserveScratch(u64 bytes);
+
+    // Batched chunk draws (EDEN_NX2_CHUNK_BATCH=1): a run of indexed draws that differ only in
+    // storage buffer pointers patched into one constant buffer and in their index range is drawn
+    // as one vkCmdDrawIndexedIndirect, the pointers moved into a gl_DrawID-indexed table of
+    // offsets (DrawTablePass). Title 4 draws its terrain this way: 7,600 chunks a frame.
+    struct ChunkBatch {
+        static constexpr u32 MaxDraws = 4096;
+        static constexpr u32 MaxSlots = 4;
+        GPUVAddr cbuf_address{};  ///< the patched constant buffer (CB_ADDRESS of the pattern)
+        u32 cbuf_size{};
+        size_t program{};         ///< program slot whose bank it is
+        size_t stage{};           ///< its stage index
+        u32 bank{};
+        Shader::Environment::DrawTable table{};
+        std::array<GPUVAddr, MaxSlots> span_base{};
+        std::array<u64, MaxSlots> span_size{};
+        u32 index_shift{};
+        u32 index_format{};
+        u32 topology{};
+        u32 stream_mask{};        ///< enabled vertex streams, bound per draw
+        GPUVAddr scratch{};       ///< [cbuf copy | table]
+        u64 scratch_size{};
+        u32 table_offset{};
+        std::vector<u8> cbuf_copy;
+        std::vector<u32> rows;    ///< MaxSlots u32 per draw
+        /// One chunk: its own index range and vertex buffers; the pipeline, descriptors and the
+        /// rest of the state are the batch's.
+        struct Draw {
+            GPUVAddr index_address;
+            u32 first_index;
+            u32 index_count;
+            s32 base_vertex;
+            std::array<GPUVAddr, Tegra::Engines::Maxwell3D::Regs::NumVertexArrays> vb_address{};
+            std::array<u32, Tegra::Engines::Maxwell3D::Regs::NumVertexArrays> vb_size{};
+        };
+        std::vector<Draw> draws;
+        GraphicsPipeline* base_pipeline{};  ///< the game's pipeline for these draws
+        GraphicsPipeline* pipeline{};       ///< its patched variant
+    };
+    /// Batches open at once (one per patched constant buffer and slot set in practice); the
+    /// geometry shader only appends to each chunk's own record, so the draws of different
+    /// batches may be reordered.
+    static constexpr size_t MaxOpenChunkBatches = 8;
+    std::vector<ChunkBatch> chunk_batches;
+    /// Windows found for pointers, per 64 KiB of pointer; cleared when mappings change.
+    std::unordered_map<GPUVAddr, std::pair<GPUVAddr, u64>> chunk_window_cache;
+    struct ChunkBatchStats {
+        std::chrono::steady_clock::time_point window{std::chrono::steady_clock::now()};
+        u64 flushes{};
+        u64 batches{};
+        u64 draws{};
+        u64 ended_by_miss{};  ///< a chunk draw outside every open batch, with none free
+        u64 ended_by_draw{};  ///< a draw that is not a chunk draw
+        u64 miss_index{};     ///< a vertex buffer of unusable size
+        std::array<u64, ChunkBatch::MaxSlots> miss_slot{};
+    } chunk_batch_stats;
+    /// The pattern of register writes since the previous draw, if it is a chunk patch.
+    struct ChunkPattern {
+        GPUVAddr cbuf_address{};
+        std::array<u32, ChunkBatch::MaxSlots> slots{};
+        u32 num_slots{};
+    };
+    [[nodiscard]] std::optional<ChunkPattern> MatchChunkPattern() const;
+    /// True when the current draw was taken into a batch (begun or extended).
+    bool TryBatchChunkDraw(bool is_indexed, u32 instance_count);
+    bool BeginChunkBatch(const ChunkPattern& pattern);
+    bool ExtendChunkBatch(ChunkBatch& batch, const ChunkPattern& pattern);
+    void FlushChunkBatches();
+    void DrawChunkBatch(ChunkBatch& batch);
+    std::optional<std::pair<GPUVAddr, u64>> ChunkWindow(GPUVAddr pointer, u64 need);
+
     void FlushWork();
 
     void UpdateDynamicStates();
@@ -254,8 +338,13 @@ private:
     u32 frame_counter = 0;
     u32 frame_trace_state = 0;
     u32 traced_image_frame = 0;
+    // Emulator scratch: the session's region, rung through (ReserveScratch).
+    GPUVAddr scratch_base = 0;
+    u64 scratch_size = 0;
+    u64 scratch_next = 0;
     bool bias_vs_active = false;
     std::unordered_map<u64, u32> vs_dump_counts;
+    bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
 };
 
 } // namespace Vulkan

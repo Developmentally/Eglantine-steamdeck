@@ -170,6 +170,14 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
     } else {
         info.previous_stage_stores.mask.set();
     }
+    if (previous_program && previous_program->stage == Shader::Stage::Mesh) {
+        for (const u32 line : previous_program->mesh.primitive_lines) {
+            const auto attribute{static_cast<Shader::IR::Attribute>(line)};
+            if (Shader::IR::IsGeneric(attribute)) {
+                info.per_primitive_generics.set(Shader::IR::GenericAttributeIndex(attribute));
+            }
+        }
+    }
     const Shader::Stage stage{program.stage};
     const bool has_geometry{key.unique_hashes[4] != 0 && !programs[4].is_geometry_passthrough};
     const bool gl_ndc{key.state.ndc_minus_one_to_one != 0};
@@ -229,6 +237,9 @@ Shader::RuntimeInfo MakeRuntimeInfo(std::span<const Shader::IR::Program> program
             ASSERT(false);
             return Shader::TessSpacing::Equal;
         }();
+        break;
+    case Shader::Stage::Mesh:
+        info.convert_depth_mode = gl_ndc;
         break;
     case Shader::Stage::Geometry:
         if (program.output_topology == Shader::OutputTopology::PointList) {
@@ -374,7 +385,9 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
                            Shader::Stage::TessellationEval) |
         subgroup_stage_bit(VK_SHADER_STAGE_GEOMETRY_BIT, Shader::Stage::Geometry) |
         subgroup_stage_bit(VK_SHADER_STAGE_FRAGMENT_BIT, Shader::Stage::Fragment) |
-        subgroup_stage_bit(VK_SHADER_STAGE_COMPUTE_BIT, Shader::Stage::Compute)};
+        subgroup_stage_bit(VK_SHADER_STAGE_COMPUTE_BIT, Shader::Stage::Compute) |
+        subgroup_stage_bit(VK_SHADER_STAGE_TASK_BIT_EXT, Shader::Stage::Task) |
+        subgroup_stage_bit(VK_SHADER_STAGE_MESH_BIT_EXT, Shader::Stage::Mesh)};
     if (driver_id == VK_DRIVER_ID_MESA_TURNIP) {
         supported_subgroup_stages &= ~(1u << static_cast<u32>(Shader::Stage::Geometry));
     }
@@ -605,6 +618,134 @@ ComputePipeline* PipelineCache::CurrentComputePipeline() {
     return pipeline.get();
 }
 
+GraphicsPipeline* PipelineCache::BatchedGraphicsPipeline(
+    size_t program, const Shader::Environment::DrawTable& table) try {
+    if (!RefreshStages(graphics_key.unique_hashes)) {
+        return nullptr;
+    }
+    graphics_key.state.Refresh(*maxwell3d, dynamic_features);
+    const BatchedKey batched_key{.key = graphics_key, .program = program, .table = table};
+    const auto [pair, is_new] = batched_graphics_cache.try_emplace(batched_key);
+    auto& pipeline = pair->second;
+    if (!is_new) {
+        return pipeline.get();
+    }
+    GraphicsEnvironments environments;
+    GetGraphicsEnvironments(environments, graphics_key.unique_hashes);
+    Shader::Environment::DrawTable stage_table{table};
+    if (program != 1) {
+        // Only the vertex stage has a draw index of its own: the vertex program forwards it on a
+        // generic attribute neither it nor the patched stage uses (the stages between them, if
+        // any, would have to pass it on too; not supported).
+        if (current_pipeline == nullptr || program != 4 || graphics_key.unique_hashes[2] != 0 ||
+            graphics_key.unique_hashes[3] != 0) {
+            LOG_WARNING(Render_Vulkan, "Batched pipeline: draw index cannot reach program slot {}", program);
+            return nullptr;
+        }
+        // One the vertex program does not write (a pass-through geometry program reads them
+        // all, so "unread" is only a preference).
+        const auto& infos{current_pipeline->StageInfos()};
+        u32 attribute{~0U};
+        for (const bool prefer_unread : {true, false}) {
+            for (u32 generic = 31; generic != ~0U && attribute == ~0U; --generic) {
+                const auto base{static_cast<Shader::IR::Attribute>(
+                    static_cast<u32>(Shader::IR::Attribute::Generic0X) + generic * 4)};
+                if (infos[0].stores.AnyComponent(base)) {
+                    continue;
+                }
+                if (prefer_unread && infos[program - 1].loads.AnyComponent(base)) {
+                    continue;
+                }
+                attribute = generic;
+            }
+        }
+        if (attribute == ~0U) {
+            LOG_WARNING(Render_Vulkan, "Batched pipeline: no free generic attribute for the draw index");
+            return nullptr;
+        }
+        stage_table.draw_id_attribute = attribute;
+        Shader::Environment::DrawTable vertex_table{};
+        vertex_table.draw_id_attribute = attribute;
+        vertex_table.forward_draw_id = true;
+        environments.envs[1].SetDrawTable(vertex_table);
+    }
+    environments.envs[program].SetDrawTable(stage_table);
+    main_pools.ReleaseContents();
+    pipeline = CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), nullptr, false);
+    return pipeline.get();
+} catch (const Shader::Exception& exception) {
+    LOG_ERROR(Render_Vulkan, "Batched pipeline: {}", exception.what());
+    return nullptr;
+}
+
+ComputePipeline* PipelineCache::MeshEmulationComputePipeline(GPUVAddr program, bool has_task,
+                                                             u32 threads) {
+    // Keyed apart from the shader cache, whose memo for this very address holds its rejection
+    // as a graphics stage. A failed build is remembered as null.
+    const u64 slot_key = program ^ (has_task ? 1ULL << 63 : 0) ^ (u64{threads & 0x3f} << 56);
+    const auto [pair, is_new] = mesh_compute_cache.try_emplace(slot_key);
+    auto& pipeline = pair->second;
+    if (!is_new) {
+        return pipeline.get();
+    }
+    try {
+        VideoCommon::MeshEmulationEnvironment env{*kepler_compute, *gpu_memory, program, has_task, threads};
+        const ComputePipelineCacheKey key{
+            .unique_hash = env.CalculateHash(),
+            .shared_memory_size = 0,
+            .workgroup_size = env.WorkgroupSize(),
+        };
+        main_pools.ReleaseContents();
+        pipeline = CreateComputePipeline(main_pools, key, env, nullptr, false);
+    } catch (const Shader::Exception& exception) {
+        LOG_ERROR(Render_Vulkan, "Task/mesh emulation: {}", exception.what());
+    }
+    return pipeline.get();
+}
+
+GraphicsPipeline* PipelineCache::MeshReplayPipeline(std::span<const u8, 128> mesh_header,
+                                                    GPUVAddr fragment_program) try {
+    // The fragment program goes through the shader cache like any other (depth-only draws have
+    // none); the vertex program is generated, so its hash is its own key.
+    const ShaderInfo* fragment_info{};
+    if (fragment_program != 0) {
+        const std::optional<VAddr> fragment_cpu_address{gpu_memory->GpuToCpuAddress(fragment_program)};
+        if (!fragment_cpu_address) {
+            return nullptr;
+        }
+        fragment_info = TryGet(*fragment_cpu_address);
+        if (!fragment_info) {
+            VideoCommon::GraphicsEnvironment env{*maxwell3d, *gpu_memory, Maxwell::ShaderType::Pixel,
+                                                 fragment_program, 0};
+            fragment_info = MakeShaderInfo(env, *fragment_cpu_address);
+        }
+    }
+    // Per-primitive attributes would come from the geometry slot's header; not wired yet.
+    VideoCommon::PassthroughVertexEnvironment vertex_env{*maxwell3d, *gpu_memory, mesh_header, {}};
+    GraphicsPipelineCacheKey key{};
+    key.unique_hashes[1] = vertex_env.CalculateHash();
+    key.unique_hashes[5] = fragment_info ? fragment_info->unique_hash : 0;
+    key.state.Refresh(*maxwell3d, dynamic_features);
+    const auto [pair, is_new] = mesh_replay_cache.try_emplace(key);
+    auto& pipeline = pair->second;
+    if (!is_new) {
+        return pipeline.get();
+    }
+    boost::container::static_vector<Shader::Environment*, 2> envs{&vertex_env};
+    std::optional<VideoCommon::GraphicsEnvironment> fragment_env;
+    if (fragment_info) {
+        fragment_env.emplace(*maxwell3d, *gpu_memory, Maxwell::ShaderType::Pixel, fragment_program, 0U);
+        fragment_env->SetCachedSize(fragment_info->size_bytes);
+        envs.push_back(&*fragment_env);
+    }
+    main_pools.ReleaseContents();
+    pipeline = CreateGraphicsPipeline(main_pools, key, envs, nullptr, false);
+    return pipeline.get();
+} catch (const Shader::Exception& exception) {
+    LOG_ERROR(Render_Vulkan, "Task/mesh replay pipeline: {}", exception.what());
+    return nullptr;
+}
+
 void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading,
                                       const VideoCore::DiskResourceLoadCallback& callback) {
     if (title_id == 0) {
@@ -664,6 +805,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+
+        // Task/mesh pipelines are not stored (their mesh registers are not in the format); skip
+        // any that were.
+        if (std::ranges::any_of(envs, [](const FileEnvironment& env) {
+                return env.ShaderStage() == Shader::Stage::Task ||
+                       env.ShaderStage() == Shader::Stage::Mesh;
+            })) {
+            return;
+        }
 
         if ((key.state.extended_dynamic_state != 0) !=
                 dynamic_features.has_extended_dynamic_state ||
@@ -1034,6 +1184,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
     auto pipeline{
         CreateGraphicsPipeline(main_pools, graphics_key, environments.Span(), nullptr, true)};
     if (!pipeline || pipeline_cache_filename.empty()) {
+        return pipeline;
+    }
+    if (pipeline->IsMeshPipeline()) {
+        // Not stored: task and mesh programs are translated with the mesh registers, which the
+        // cache format does not carry. The few of them rebuild quickly from the driver cache.
+        QueueVulkanPipelineCacheFlush();
         return pipeline;
     }
     serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs)] {

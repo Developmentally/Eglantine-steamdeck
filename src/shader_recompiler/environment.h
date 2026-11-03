@@ -121,9 +121,52 @@ public:
         return is_proprietary_driver;
     }
 
+    /// Task and mesh programs: SET_MESH_SHADER_A, SET_MESH_SHADER_B and SET_MESH_INIT_SHADER.
+    [[nodiscard]] const std::array<u32, 3>& MeshRegisters() const noexcept {
+        return mesh_registers;
+    }
+
+    /// Mesh programs: the header of the pass-through geometry program bound with them, whose
+    /// output map lists the per-primitive outputs.
+    [[nodiscard]] const ProgramHeader& MeshPrimitiveHeader() const noexcept {
+        return mesh_primitive_header;
+    }
+
+    /// Batched draws: storage buffers whose pointer lives at one of `slots` are addressed per
+    /// draw. The host binds a span covering every draw's buffer at the slot and a table of
+    /// `u32 delta[slots]` rows, `stride` bytes apart, at the pointer in `table_slot`; the
+    /// program adds `row[gl_BaseInstance].delta[i]` (the draw's first instance is its row) to each access through slot i.
+    struct DrawTable {
+        struct Slot {
+            u32 cbuf_index;
+            u32 cbuf_offset;
+        };
+        std::array<Slot, 4> slots{};
+        u32 num_slots{};
+        Slot table_slot{};
+        u32 stride{};
+        /// Generic attribute (0-31) through which the vertex program forwards gl_BaseInstance to a
+        /// later stage that is patched (hosts give geometry programs no draw index of their
+        /// own); ~0 when the patched stage reads gl_BaseInstance itself.
+        u32 draw_id_attribute{~0U};
+        /// Set on the vertex program's environment: forward gl_BaseInstance on `draw_id_attribute`.
+        bool forward_draw_id{};
+
+        [[nodiscard]] bool Enabled() const noexcept {
+            return num_slots != 0 || forward_draw_id;
+        }
+    };
+
+    [[nodiscard]] const DrawTable& GetDrawTable() const noexcept {
+        return draw_table;
+    }
+
 protected:
     ProgramHeader sph{};
     std::array<u32, 8> gp_passthrough_mask{};
+    std::array<u32, 3> mesh_registers{};
+    ProgramHeader mesh_primitive_header{};
+    DrawTable draw_table{};
     Stage stage{};
     u32 start_address{};
     bool is_proprietary_driver{};

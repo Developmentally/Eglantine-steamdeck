@@ -13,6 +13,11 @@
 //     -d           dump the IR of each program after translation
 //     -b <file>    baseline: one program file name per line that is allowed to fail; the exit
 //                  status then reports only new failures, and fixed programs are listed
+//     -t <spec>    draw table: "<cb>:<hex off>[,<cb>:<hex off>...]@<cb>:<hex off>" patches the
+//                  storage buffers at those cbuf slots per gl_DrawID through a table at the
+//                  last slot (Environment::DrawTable), to check the batched-draw variant;
+//                  "@<cb>:<off>#<n>" reads the draw index from generic attribute n instead
+//     -f <n>       vertex program of a batched pipeline: forward gl_DrawID on generic n
 
 #include <algorithm>
 #include <cstdio>
@@ -33,6 +38,7 @@
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
 #include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "shader_recompiler/frontend/ampere/mesh_emulation.h"
 #include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "shader_recompiler/frontend/ampere/program_dump.h"
 #include "shader_recompiler/frontend/ir/program.h"
@@ -51,6 +57,7 @@ namespace fs = std::filesystem;
 bool verbose = false;
 bool dump_ir = false;
 fs::path spirv_output;
+Shader::Environment::DrawTable draw_table_spec;
 using Shader::Ampere::Instruction;
 using Shader::Ampere::ProgramDumpInfo;
 
@@ -58,9 +65,20 @@ using Shader::Ampere::ProgramDumpInfo;
 // with the program header in front and the native address map behind.
 class DumpEnvironment final : public Shader::Environment {
 public:
-    DumpEnvironment(const ProgramDumpInfo& info, const Shader::Ampere::LoweredProgram& lowered) {
+    DumpEnvironment(const ProgramDumpInfo& info, const Shader::Ampere::LoweredProgram& lowered,
+                    std::span<const Instruction> native) {
         stage = static_cast<Shader::Stage>(info.stage);
         gp_passthrough_mask = info.gp_passthrough_mask;
+        draw_table = draw_table_spec;
+        // Task and mesh programs are dumped from the vertex slot; the dump carries neither the
+        // mesh registers nor the per-primitive header, so translate them with the shape the
+        // title's programs have: 32 lanes, triangles, 4 vertices and 2 primitives per lane.
+        if (const auto analysis = Shader::Ampere::MeshEmulation::Analyze(native);
+            stage != Shader::Stage::Compute && analysis) {
+            using Shader::Ampere::MeshEmulation::ProgramKind;
+            stage = analysis.kind == ProgramKind::Task ? Shader::Stage::Task : Shader::Stage::Mesh;
+            mesh_registers = {4U | (128U << 4) | (64U << 13), 32U << 20, 32U | (1U << 12) | (1U << 22)};
+        }
         std::memcpy(&sph, info.header.data(), sizeof(sph));
         start_address = sizeof(sph);
         is_proprietary_driver = true;
@@ -308,7 +326,7 @@ Outcome Check(const fs::path& path, bool lowering_only) {
         Shader::ObjectPool<Shader::IR::Inst> inst_pool;
         Shader::ObjectPool<Shader::IR::Block> block_pool;
         Shader::ObjectPool<Shader::Maxwell::Flow::Block> flow_pool;
-        DumpEnvironment env(info, lowered);
+        DumpEnvironment env(info, lowered, native);
         const auto host = HostInfo();
         outcome.phase = "translate";
         Shader::Maxwell::Flow::CFG cfg(env, flow_pool, env.StartAddress());
@@ -370,6 +388,36 @@ int main(int argc, char** argv) {
         else if (arg == "-d") dump_ir = verbose = true;
         else if (arg == "-b" && i + 1 < argc) baseline_path = argv[++i];
         else if (arg == "-s" && i + 1 < argc) spirv_output = argv[++i];
+        else if (arg == "-t" && i + 1 < argc) {
+            const std::string spec{argv[++i]};
+            const auto parse_slot = [](std::string_view text) {
+                const size_t colon = text.find(':');
+                return Shader::Environment::DrawTable::Slot{
+                    static_cast<u32>(std::stoul(std::string{text.substr(0, colon)})),
+                    static_cast<u32>(std::stoul(std::string{text.substr(colon + 1)}, nullptr, 16))};
+            };
+            const size_t at = spec.find('@');
+            std::string_view slots{spec};
+            slots = slots.substr(0, at);
+            while (!slots.empty() && draw_table_spec.num_slots < draw_table_spec.slots.size()) {
+                const size_t comma = slots.find(',');
+                draw_table_spec.slots[draw_table_spec.num_slots++] = parse_slot(slots.substr(0, comma));
+                slots = comma == std::string_view::npos ? std::string_view{} : slots.substr(comma + 1);
+            }
+            std::string_view table{std::string_view{spec}.substr(at + 1)};
+            if (const size_t hash = table.find('#'); hash != std::string_view::npos) {
+                // "#<n>": the patched stage reads the draw index from generic attribute n.
+                draw_table_spec.draw_id_attribute = static_cast<u32>(std::stoul(std::string{table.substr(hash + 1)}));
+                table = table.substr(0, hash);
+            }
+            draw_table_spec.table_slot = parse_slot(table);
+            draw_table_spec.stride = 16;
+        }
+        else if (arg == "-f" && i + 1 < argc) {
+            // Vertex program of a batched pipeline: forward gl_DrawID on generic attribute n.
+            draw_table_spec.draw_id_attribute = static_cast<u32>(std::stoul(argv[++i]));
+            draw_table_spec.forward_draw_id = true;
+        }
         else inputs.emplace_back(arg);
     }
     if (inputs.empty()) {

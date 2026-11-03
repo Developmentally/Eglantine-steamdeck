@@ -8,6 +8,7 @@
 
 #include <array>
 #include <bitset>
+#include <functional>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -2543,6 +2544,19 @@ public:
             return IsShaderConfigEnabled(static_cast<std::size_t>(type));
         }
 
+        // Switch 2 (NVN) task and mesh pipelines (clc597.h): SET_MESH_CONTROL, SET_MESH_SHADER_A
+        // and _B, SET_MESH_INIT_SHADER. While mesh control is on, the vertex slot holds the task
+        // program (or the mesh program when there is no task), the tessellation slot the mesh
+        // program and the geometry slot a pass-through header naming the per-primitive outputs.
+        static constexpr std::size_t MeshControl = 0x114c / 4;
+        static constexpr std::size_t MeshShaderA = 0x1150 / 4;
+        static constexpr std::size_t MeshShaderB = 0x1154 / 4;
+        static constexpr std::size_t MeshInitShader = 0x1158 / 4;
+
+        bool IsMeshEnabled() const {
+            return (reg_array[MeshControl] & 1) != 0;
+        }
+
         struct ConstantBuffer {
             u32 size;
             u32 address_high;
@@ -3336,6 +3350,27 @@ public:
     void ClearWritesSinceDraw() { writes_since_draw.clear(); }
     std::vector<std::pair<u32, u32>> writes_since_draw;
     bool record_writes_since_draw{std::getenv("EDEN_NX2_DRAW_DELTA_LOG") != nullptr};
+
+    /// Draws the rasterizer holds back to submit together: the methods those draws may write
+    /// between them, and the flush to run before any other method changes the state they ran
+    /// with.
+    struct BatchedDrawGuard {
+        bool active{};
+        std::bitset<Regs::NUM_REGS> methods;
+        std::function<void()> flush;
+    } batched_draw_guard;
+    void GuardBatchedDraws(u32 method, u32 amount = 1) {
+        if (!batched_draw_guard.active) [[likely]] {
+            return;
+        }
+        for (u32 m = method; m < method + amount; ++m) {
+            if (m >= Regs::NUM_REGS || !batched_draw_guard.methods[m]) {
+                batched_draw_guard.flush();
+                return;
+            }
+        }
+    }
+
 
 private:
     size_t recent_write_index = 0;

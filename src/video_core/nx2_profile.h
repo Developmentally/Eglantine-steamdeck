@@ -84,21 +84,36 @@ inline bool Enabled() {
 // the wall clock's own rate.
 inline u64 Now() {
 #if defined(__x86_64__) || defined(_M_X64)
-    if (Common::g_wall_clock.IsNative()) {
-        static const double ns_per_tick = [] {
+    // The TSC, scaled by the wall clock's rate when it is TSC-based, else by a 2 ms calibration
+    // against steady_clock at first use (the Deck's wall clock is not "native", and the
+    // clock_gettime fallback was 3.5% of the back thread with profiling on).
+    static const double ns_per_tick = [] {
+        if (Common::g_wall_clock.IsNative()) {
             const u64 ticks = Common::g_wall_clock.NsToTicks(std::chrono::nanoseconds{1'000'000'000});
-            return ticks != 0 ? 1e9 / static_cast<double>(ticks) : 1.0;
-        }();
-        return static_cast<u64>(static_cast<double>(__rdtsc()) * ns_per_tick);
-    }
-#endif
+            if (ticks != 0) {
+                return 1e9 / static_cast<double>(ticks);
+            }
+        }
+        const auto start_time = std::chrono::steady_clock::now();
+        const u64 start_tsc = __rdtsc();
+        auto end_time = start_time;
+        while (end_time - start_time < std::chrono::milliseconds{2}) {
+            end_time = std::chrono::steady_clock::now();
+        }
+        const u64 end_tsc = __rdtsc();
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+        return end_tsc != start_tsc ? static_cast<double>(ns) / static_cast<double>(end_tsc - start_tsc) : 1.0;
+    }();
+    return static_cast<u64>(static_cast<double>(__rdtsc()) * ns_per_tick);
+#else
     return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+#endif
 }
 
 struct ThreadData {
     std::array<u64, static_cast<size_t>(Zone::Count)> exclusive_ns{};
     std::array<u64, static_cast<size_t>(Zone::Count)> count{};
-    std::array<u64, 35> counters{}; ///< See Counter
+    std::array<u64, 36> counters{}; ///< See Counter
     u64 child_ns{};    ///< Time of the zones nested in the current one
     u64 window_start{};
 };
@@ -175,6 +190,7 @@ enum class Counter : u32 {
     AliasSyncWalked,    ///< Alias entries walked by them
     SnapshotsUnwritten, ///< Entries read from memory because they were zeros when submitted
     ChannelYields,      ///< A channel handed the GPU thread to one whose wait ended
+    AcquireProbes,      ///< Flushed semaphore reads asked of the back instead of a drain
 };
 
 /// Device pages (4 KiB) the native MME has DMA-read since start (GPU thread only; filled only
@@ -249,11 +265,12 @@ inline void Report(const char* thread_name = "GPU thread") {
                         static_cast<double>(data.counters[13]) * 1e9 / wall,
                         static_cast<double>(data.counters[14]) * 1e9 / wall,
                         static_cast<double>(data.counters[15]) * 1e9 / wall);
-    line += fmt::format(" | alias syncs {:.0f}/s walking {:.0f} aliases/s | unwritten at submit {:.0f}/s | channel yields {:.0f}/s",
+    line += fmt::format(" | alias syncs {:.0f}/s walking {:.0f} aliases/s | unwritten at submit {:.0f}/s | channel yields {:.0f}/s | acquire probes {:.0f}/s",
                         static_cast<double>(data.counters[31]) * 1e9 / wall,
                         static_cast<double>(data.counters[32]) * 1e9 / wall,
                         static_cast<double>(data.counters[33]) * 1e9 / wall,
-                        static_cast<double>(data.counters[34]) * 1e9 / wall);
+                        static_cast<double>(data.counters[34]) * 1e9 / wall,
+                        static_cast<double>(data.counters[35]) * 1e9 / wall);
     line += fmt::format(" | predicted {:.0f} ({:.0f} dropped, {:.0f} expired, {:.0f} behind the back)",
                         static_cast<double>(data.counters[20]) * 1e9 / wall,
                         static_cast<double>(data.counters[21]) * 1e9 / wall,
