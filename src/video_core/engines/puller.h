@@ -7,7 +7,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <memory>
 #include <cstddef>
 #include <optional>
 #include <vector>
@@ -84,6 +86,13 @@ public:
         const char* ended_by{"?"}; ///< How the wait ended (EDEN_NX2_ACQUIRE_LOG)
         s64 latch_age_us{};        ///< For latched ends: landing -> resume (EDEN_NX2_ACQUIRE_LOG)
         bool diagnosed{}; ///< Logged once 30 ms in (EDEN_NX2_ACQUIRE_LOG)
+        /// A flushed read of the word the back answers in order (instead of the front draining
+        /// it): set when asked, answered when `done`.
+        struct Probe {
+            std::atomic<u32> word{};
+            std::atomic<bool> done{};
+        };
+        std::shared_ptr<Probe> probe;
 
         [[nodiscard]] bool Matches(u32 current) const;
     };

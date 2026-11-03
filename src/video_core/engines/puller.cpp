@@ -196,18 +196,54 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
                  device ? Nx2QueuedReleases::Get().Describe(*device) : std::string{"?"},
                  split.SentPosition(), split.ConsumedPosition());
     }
-    DrainBack(Counter::DrainPoll);
-    const u32 current = ReadSemaphoreWordPredicted(dma_pusher, pending_acquire->address);
+    // The flushed read needs the buffer cache, which belongs to the back. Draining it here
+    // held the front for the back's whole queue (Donkey Kong Bananza: 38 drains of ~4 ms a
+    // second, the other channel unparsed meanwhile); instead the back answers a probe in order,
+    // after everything queued before it, and the front looks at the answer on a later poll.
+    // EDEN_NX2_ACQUIRE_PROBE=0 drains as before.
+    static const bool probe_on_back = [] {
+        const char* value = std::getenv("EDEN_NX2_ACQUIRE_PROBE");
+        return value == nullptr || value[0] != '0';
+    }();
+    u32 raw;
+    const char* flushed_by = "drain";
+    if (auto& split = VideoCommon::GpuSplit::Get(); probe_on_back && split.Active()) {
+        auto& probe = pending_acquire->probe;
+        if (!probe) {
+            probe = std::make_shared<PendingAcquire::Probe>();
+            VideoCommon::Nx2Profile::Add(Counter::AcquireProbes, 1);
+            split.DeferFunction([probe, rasterizer = dma_pusher.rasterizer,
+                                 memory = &dma_pusher.memory_manager, address = pending_acquire->address] {
+                if (const auto device = memory->GpuToCpuAddress(address);
+                    device && rasterizer->MustFlushRegion(*device, sizeof(u32), VideoCommon::CacheType::BufferCache)) {
+                    rasterizer->FlushRegion(*device, sizeof(u32), VideoCommon::CacheType::BufferCache);
+                }
+                probe->word.store(memory->Read<u32>(address), std::memory_order_relaxed);
+                probe->done.store(true, std::memory_order_release);
+            });
+            split.Publish();
+            return false;
+        }
+        if (!probe->done.load(std::memory_order_acquire)) {
+            return false;
+        }
+        raw = probe->word.load(std::memory_order_relaxed);
+        probe.reset();
+        flushed_by = "probe";
+    } else {
+        DrainBack(Counter::DrainPoll);
+        raw = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
+    }
+    const u32 current = PredictedSemaphoreWord(dma_pusher, pending_acquire->address, raw);
     if (Nx2SemaphoreWaiters::Get().Latched(this)) {
         return ended_by_latch();
     }
     if (pending_acquire->Matches(current)) {
         VideoCommon::Nx2Profile::Add(Counter::WaitEndedByDrain, 1);
-        pending_acquire->ended_by = "drain";
+        pending_acquire->ended_by = flushed_by;
         return true;
     }
-    if (const u32 raw = ReadSemaphoreWord(dma_pusher, pending_acquire->address);
-        pending_acquire->Matches(raw)) {
+    if (pending_acquire->Matches(raw)) {
         // Memory meets the acquire but a queued release predicts otherwise. Briefly that is a
         // release still landing; for longer it is one the back never made (a mirrored QMD it
         // did not run), and the prediction would hold the channel forever: drop it.
