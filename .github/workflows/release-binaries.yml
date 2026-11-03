@@ -148,6 +148,15 @@ jobs:
           test -s "$LDAI_OUTPUT"
           ls -la "$LDAI_OUTPUT"
 
+      # The launcher script and the settings file the fork is measured with (docs/user/
+      # SteamDeckAppImage.md); unversioned so the guide's download instructions stay the same.
+      - name: Package the Steam Deck kit
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -czf eglantine-steamdeck-kit.tar.gz -C dist/steamdeck eglantine-deck.sh eglantine-deck.ini
+          tar -tzf eglantine-steamdeck-kit.tar.gz
+
       - name: Upload binaries
         uses: actions/upload-artifact@v4
         with:
@@ -155,6 +164,7 @@ jobs:
           path: |
             eglantine-steamdeck-*.tar.gz
             eglantine-steamdeck-*.AppImage
+            eglantine-steamdeck-kit.tar.gz
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -195,7 +205,9 @@ jobs:
           fi
           notes="eden-cli built from ${GITHUB_SHA} for the Steam Deck (SteamOS 3.8). The state of the fork, what runs and how fast, is in [docs/SteamDeck.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/SteamDeck.md). Step-by-step setup, including a Steam shortcut for Game Mode: [docs/user/SteamDeckAppImage.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/docs/user/SteamDeckAppImage.md).
 
-          **AppImage**: \`chmod +x\` it and run it from a terminal or a Steam shortcut; it bundles its libraries and needs glibc 2.39 or newer (SteamOS 3.8, Ubuntu 24.04, Fedora 40, Arch). Launch a loose dump with \`EDEN_NX2_AUTO_STUB=1 ./eglantine-steamdeck-*.AppImage -f -g <title>/exefs/main\`.
+          **AppImage**: \`chmod +x\` it and run it from a terminal or a Steam shortcut; it bundles its libraries and needs glibc 2.39 or newer (SteamOS 3.8, Ubuntu 24.04, Fedora 40, Arch). Launch a loose dump with \`EDEN_NX2_AUTO_STUB=1 ./eglantine-steamdeck-*.AppImage -f -c eglantine-deck.ini -g <title>/exefs/main\`.
+
+          **eglantine-steamdeck-kit.tar.gz**: \`eglantine-deck.sh\` (launcher: settings, environment, per-game switches, Steam shortcut target) and \`eglantine-deck.ini\` (the settings the fork is measured with). Unpack next to the AppImage; the guide above explains both.
 
           **tar.gz**: \`eden-cli\` alone, linked against the system's ffmpeg, boost and opus at Ubuntu 24.04's versions.
 
