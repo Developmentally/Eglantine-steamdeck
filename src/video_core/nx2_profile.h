@@ -84,15 +84,30 @@ inline bool Enabled() {
 // the wall clock's own rate.
 inline u64 Now() {
 #if defined(__x86_64__) || defined(_M_X64)
-    if (Common::g_wall_clock.IsNative()) {
-        static const double ns_per_tick = [] {
+    // The TSC, scaled by the wall clock's rate when it is TSC-based, else by a 2 ms calibration
+    // against steady_clock at first use (the Deck's wall clock is not "native", and the
+    // clock_gettime fallback was 3.5% of the back thread with profiling on).
+    static const double ns_per_tick = [] {
+        if (Common::g_wall_clock.IsNative()) {
             const u64 ticks = Common::g_wall_clock.NsToTicks(std::chrono::nanoseconds{1'000'000'000});
-            return ticks != 0 ? 1e9 / static_cast<double>(ticks) : 1.0;
-        }();
-        return static_cast<u64>(static_cast<double>(__rdtsc()) * ns_per_tick);
-    }
-#endif
+            if (ticks != 0) {
+                return 1e9 / static_cast<double>(ticks);
+            }
+        }
+        const auto start_time = std::chrono::steady_clock::now();
+        const u64 start_tsc = __rdtsc();
+        auto end_time = start_time;
+        while (end_time - start_time < std::chrono::milliseconds{2}) {
+            end_time = std::chrono::steady_clock::now();
+        }
+        const u64 end_tsc = __rdtsc();
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+        return end_tsc != start_tsc ? static_cast<double>(ns) / static_cast<double>(end_tsc - start_tsc) : 1.0;
+    }();
+    return static_cast<u64>(static_cast<double>(__rdtsc()) * ns_per_tick);
+#else
     return static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
+#endif
 }
 
 struct ThreadData {
