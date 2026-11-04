@@ -238,14 +238,16 @@ int main() {
     //     the running sum; the result must equal min(driver, exact sum) in all regions.
     {
         reset_state();
-        constexpr u64 BIG = ~0ULL / 2; // two slots already exceed u64
+        constexpr u64 BIG = ~0ULL / 2; // 2*BIG = u64max-1 (no wrap); 3*BIG wraps u64
         sentenced_image_bytes[0] = BIG;
-        sentenced_image_bytes[1] = BIG; // exact sum 2*BIG wraps u64
+        sentenced_image_bytes[1] = BIG;
+        sentenced_image_bytes[2] = BIG; // exact sum 3*BIG wraps u64 (to BIG-3)
         driver_usage = 1000;            // driver below one slot: full clamp
         assert(effective_total_driver_path() == 0 && "aggregate wrapped past the clamp");
-        driver_usage = BIG + 500;       // driver above one slot, below the (wrapping) sum
+        driver_usage = BIG + 500;       // driver above one slot, below the wrapping sum
         assert(effective_total_driver_path() == 0 && "clamp-at-driver mismatch vs exact min");
-        sentenced_image_bytes[1] = 0;   // single slot, driver above it: partial discount
+        sentenced_image_bytes[1] = 0;   // back below u64: single slot, partial discount
+        sentenced_image_bytes[2] = 0;
         assert(effective_total_driver_path() == 500 && "partial discount wrong");
     }
     std::puts("all lifecycle accounting tests passed");
