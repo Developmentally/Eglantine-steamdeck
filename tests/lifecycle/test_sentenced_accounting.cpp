@@ -31,12 +31,14 @@ std::array<u64, TICKS_TO_DESTROY> sentenced_image_bytes{};
 size_t sentenced_image_index = 0;
 
 // --- mirror of the ported TickFrame driver-path accounting ---
+static u64 driver_used_memory = 0; // mirror of the raw member: telemetry reads this
 static u64 effective_total_driver_path() {
-    u64 total_used_memory = driver_usage;
+    driver_used_memory = driver_usage;
+    u64 sentenced_pending_bytes = 0;
     for (const u64 bytes : sentenced_image_bytes) {
-        total_used_memory -= std::min(total_used_memory, bytes);
+        sentenced_pending_bytes += bytes;
     }
-    return total_used_memory;
+    return driver_used_memory - std::min(driver_used_memory, sentenced_pending_bytes);
 }
 static void tick_frame() {
     // Real order in the ported code: ring tick (destroys wrapped slot,
@@ -47,9 +49,14 @@ static void tick_frame() {
 }
 // --- mirror of the ported DeleteImage tail (non-retained, non-immediate) ---
 static u64 estimate_total = 0; // estimate path: subtracted at delete time
-static void delete_image(u64 freed_bytes) {
-    estimate_total -= std::min(estimate_total, freed_bytes); // estimate path untouched by ring
-    sentenced_images.Push(TrackedImage{freed_bytes});        // temporary nets to zero on usage
+static void delete_image(u64 image_bytes, bool unbacked = false) {
+    estimate_total -= std::min(estimate_total, image_bytes); // estimate path untouched by ring
+    // Physical model: an unbacked image has no device allocation, so the driver never counts
+    // its bytes (modeled as 0 resident bytes). The ported gate keeps its estimate out of the
+    // discount for the same reason; sparse images commit only populated pages, so their
+    // estimate is likewise untrusted and gated out (modeled identically).
+    sentenced_images.Push(TrackedImage{unbacked ? 0 : image_bytes});
+    const u64 freed_bytes = unbacked ? 0 : image_bytes;
     sentenced_image_bytes[sentenced_image_index] += freed_bytes;
 }
 static void reset_state() {
@@ -142,6 +149,36 @@ int main() {
         assert(estimate_total == 600 && "estimate path must subtract at delete");
         tick_frame(); tick_frame();
         assert(estimate_total == 600 && "estimate path must not be re-discounted");
+    }
+    // 7. Unbacked/sparse images stay out of the discount: deleting one changes
+    //    neither the discount nor the effective total, though it stays resident
+    //    in the ring like any other image.
+    {
+        reset_state();
+        driver_usage = 0; live = 0;
+        driver_usage = 700;
+        delete_image(500, true); // unbacked: no discount booked, no driver bytes
+        assert(sentenced_image_bytes[sentenced_image_index] == 0 && "gated bytes booked");
+        assert(driver_usage == 700 && "unbacked image counted by the driver");
+        assert(effective_total_driver_path() == 700 && "gate changed the effective total");
+        tick_frame();
+        delete_image(400);       // normal image in the next slot
+        assert(effective_total_driver_path() == 700 && "normal delete moved effective total");
+        tick_frame();
+        assert(driver_usage == 1100 && "residency wrong");
+        assert(effective_total_driver_path() == 700 && "discount did not stick");
+    }
+    // 8. Raw driver figure stays separate from the collector figure while a
+    //    discount is pending (telemetry honesty split).
+    {
+        reset_state();
+        driver_usage = 0; live = 0;
+        driver_usage = 900;
+        delete_image(300);
+        const u64 collector = effective_total_driver_path();
+        assert(driver_used_memory == 1200 && "raw figure lost");
+        assert(collector == 900 && "discount missing from collector figure");
+        assert(driver_used_memory - collector == 300 && "split mismatch");
     }
     std::puts("all lifecycle accounting tests passed");
     return 0;
