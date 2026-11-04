@@ -49,11 +49,13 @@ size_t sentenced_image_index = 0;
 static u64 driver_used_memory = 0; // mirror of the raw member: telemetry reads this
 static u64 effective_total_driver_path() {
     driver_used_memory = driver_usage;
+    // Mirror of the ported clamp-at-driver aggregation (never wraps; invariant:
+    // pending <= driver_used_memory at every step).
     u64 sentenced_pending_bytes = 0;
     for (const u64 bytes : sentenced_image_bytes) {
-        sentenced_pending_bytes += bytes;
+        sentenced_pending_bytes += std::min(bytes, driver_used_memory - sentenced_pending_bytes);
     }
-    return driver_used_memory - std::min(driver_used_memory, sentenced_pending_bytes);
+    return driver_used_memory - sentenced_pending_bytes;
 }
 static void tick_frame() {
     // Real order in the ported code: ring tick (destroys wrapped slot,
@@ -231,6 +233,20 @@ int main() {
                "overflow wrapped the slot total");
         // The kept total still discounts correctly (clamped at the driver figure).
         assert(effective_total_driver_path() == 0 && "kept total misapplied");
+    }
+    // 10. Aggregate boundary: multiple individually valid near-max slots cannot wrap
+    //     the running sum; the result must equal min(driver, exact sum) in all regions.
+    {
+        reset_state();
+        constexpr u64 BIG = ~0ULL / 2; // two slots already exceed u64
+        sentenced_image_bytes[0] = BIG;
+        sentenced_image_bytes[1] = BIG; // exact sum 2*BIG wraps u64
+        driver_usage = 1000;            // driver below one slot: full clamp
+        assert(effective_total_driver_path() == 0 && "aggregate wrapped past the clamp");
+        driver_usage = BIG + 500;       // driver above one slot, below the (wrapping) sum
+        assert(effective_total_driver_path() == 0 && "clamp-at-driver mismatch vs exact min");
+        sentenced_image_bytes[1] = 0;   // single slot, driver above it: partial discount
+        assert(effective_total_driver_path() == 500 && "partial discount wrong");
     }
     std::puts("all lifecycle accounting tests passed");
     return 0;

@@ -327,11 +327,14 @@ void TextureCache<P>::TickFrame() {
         // DeleteImage) and saturates at the driver total: saturation avoids underflow, it does
         // not prove estimates equal committed bytes. Collector decisions use the discounted
         // figure; the raw driver figure stays in driver_used_memory for honest telemetry.
+        // The aggregate only feeds the clamp against the driver figure, so clamp the running
+        // sum at that figure: multiple individually valid slots can never wrap u64, and the
+        // result is identical to min(driver, exact sum).
         u64 sentenced_pending_bytes = 0;
         for (const u64 bytes : sentenced_image_bytes) {
-            sentenced_pending_bytes += bytes;
+            sentenced_pending_bytes += (std::min)(bytes, driver_used_memory - sentenced_pending_bytes);
         }
-        total_used_memory = driver_used_memory - (std::min)(driver_used_memory, sentenced_pending_bytes);
+        total_used_memory = driver_used_memory - sentenced_pending_bytes;
     }
     // Every 600 frames (every 200 under EDEN_NX2_GPU_PROFILE): device memory in use against the
     // collector's thresholds, and what the images themselves account for (VRAM pressure makes the
@@ -3400,11 +3403,16 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     // never backed by device memory, and sparse images commit only populated pages, so their
     // estimate does not track driver bytes: keep both out of the discount. Under-discounting is
     // the safe direction - it only leaves the collector stricter, never looser.
+    const u64 scaled_bytes = image.HasScaled() ? GetScaledImageSizeBytes(image) : 0;
+    const u64 host_bytes = Common::AlignUp(HostImageSizeBytes(image), 1024);
+    // Checked scaled+host sum: on (physically implausible) overflow drop the discount
+    // entirely, same direction as the slot-accumulation guard below.
     const u64 freed_bytes =
         (True(image.flags & ImageFlagBits::Unbacked) || True(image.flags & ImageFlagBits::Sparse))
             ? 0
-            : (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0) +
-                  Common::AlignUp(HostImageSizeBytes(image), 1024);
+            : scaled_bytes > (std::numeric_limits<u64>::max)() - host_bytes
+                  ? (LOG_ERROR(HW_GPU, "sentenced-image size overflowed; discount dropped"), 0)
+                  : scaled_bytes + host_bytes;
     const GPUVAddr gpu_addr = image.gpu_addr;
     const auto alloc_it = image_allocs_table.find(gpu_addr);
     if (alloc_it == image_allocs_table.end()) {
