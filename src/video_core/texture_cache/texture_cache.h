@@ -28,6 +28,7 @@
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/guest_memory.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
+#include "video_core/texture_cache/collector_accounting.h"
 #include "video_core/texture_cache/image_view_base.h"
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/texture_cache_base.h"
@@ -348,7 +349,7 @@ void TextureCache<P>::TickFrame() {
             LOG_INFO(HW_GPU,
                      "mem trace: device memory {} MiB (collector counts {} MiB, {} MiB pending destruction), {} images, {} unbacked",
                      driver_used_memory >> 20, total_used_memory >> 20,
-                     (driver_used_memory - total_used_memory) >> 20, slot_images.size(),
+                     (driver_used_memory - (std::min)(driver_used_memory, total_used_memory)) >> 20, slot_images.size(),
                      unbacked_image_ids.size());
         } else {
             LOG_INFO(HW_GPU, "mem trace: estimated memory {} MiB, {} images, {} unbacked",
@@ -2645,7 +2646,11 @@ void TextureCache<P>::MakeDormant(ImageId image_id) {
     image.flags &= ~(ImageFlagBits::Alias | ImageFlagBits::BadOverlap);
 
     const u64 bytes = Common::AlignUp(HostImageSizeBytes(image), 1024);
-    total_used_memory -= bytes;
+    // Same policy as DeleteImage (see there): the estimate can exceed the refreshed total.
+    if (CollectorSubtract(total_used_memory, bytes)) [[unlikely]] {
+        LOG_WARNING(HW_GPU, "dormant image's estimate {} MiB exceeds collector total; saturating",
+                    bytes >> 20);
+    }
     dormant_bytes += bytes;
     dormant_images[image.gpu_addr].push_back(DormantImage{image_id, frame_tick});
 }
@@ -3394,10 +3399,24 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
             async_decode->cancelled = true;
         }
     }
-    if (image.HasScaled()) {
-        total_used_memory -= GetScaledImageSizeBytes(image);
+    // total_used_memory is refreshed from the (discounted) driver figure every TickFrame and
+    // adjusted by booked estimates in between (the two are different units: an estimate is not
+    // a driver byte count), so an image's estimate can exceed the current total. Saturate
+    // instead of wrapping: a wrapped total reads as over-critical to every collector threshold
+    // until the next refresh. Saturation is containment, not correction: the absorbed excess
+    // biases the counter toward under-collection for the rest of the frame, the next refresh
+    // re-derives the anchor (it does not recover the absorbed divergence), and every saturating
+    // step is logged so the mismatch stays observable. Additions stay unchecked.
+    const u64 deleted_scaled_bytes = image.HasScaled() ? GetScaledImageSizeBytes(image) : 0;
+    const u64 deleted_host_bytes = Common::AlignUp(HostImageSizeBytes(image), 1024);
+    if (CollectorSubtract(total_used_memory, deleted_scaled_bytes)) [[unlikely]] {
+        LOG_WARNING(HW_GPU, "deleted image's scaled estimate {} MiB exceeds collector total; saturating",
+                    deleted_scaled_bytes >> 20);
     }
-    total_used_memory -= Common::AlignUp(HostImageSizeBytes(image), 1024);
+    if (CollectorSubtract(total_used_memory, deleted_host_bytes)) [[unlikely]] {
+        LOG_WARNING(HW_GPU, "deleted image's host estimate {} MiB exceeds collector total; saturating",
+                    deleted_host_bytes >> 20);
+    }
     // Mirror of the two subtractions above, for the driver-reported path in TickFrame: the
     // driver keeps counting this memory until the ring destroys the image. Unbacked images were
     // never backed by device memory, and sparse images commit only populated pages, so their
@@ -3407,12 +3426,10 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     // entirely, same direction as the slot-accumulation guard below.
     u64 freed_bytes = 0;
     if (False(image.flags & ImageFlagBits::Unbacked) && False(image.flags & ImageFlagBits::Sparse)) {
-        const u64 scaled_bytes = image.HasScaled() ? GetScaledImageSizeBytes(image) : 0;
-        const u64 host_bytes = Common::AlignUp(HostImageSizeBytes(image), 1024);
-        if (scaled_bytes > (std::numeric_limits<u64>::max)() - host_bytes) [[unlikely]] {
+        if (deleted_scaled_bytes > (std::numeric_limits<u64>::max)() - deleted_host_bytes) [[unlikely]] {
             LOG_ERROR(HW_GPU, "sentenced-image size overflowed; discount dropped");
         } else {
-            freed_bytes = scaled_bytes + host_bytes;
+            freed_bytes = deleted_scaled_bytes + deleted_host_bytes;
         }
     }
     const GPUVAddr gpu_addr = image.gpu_addr;
