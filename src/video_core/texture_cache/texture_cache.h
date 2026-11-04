@@ -3470,6 +3470,9 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         LOG_INFO(Render_Vulkan, "Retained image for queued download: id={}", image_id.Value());
     } else if (!immediate_delete) {
         sentenced_images.Push(std::move(slot_images[image_id]));
+        // Slot totals are bounded by the VRAM a title can sentence in an 8-frame window
+        // (< 2^48); a u64 wrap would need ~16M TiB between two ticks. Reviewed bound,
+        // intentionally unguarded.
         sentenced_image_bytes[sentenced_image_index] += freed_bytes;
     }
     slot_images.erase(image_id);
