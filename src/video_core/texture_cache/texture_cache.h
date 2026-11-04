@@ -320,6 +320,12 @@ void TextureCache<P>::TickFrame() {
     // If we can obtain the memory info, use it instead of the estimate.
     if (runtime.CanReportMemoryUsage()) {
         total_used_memory = runtime.GetDeviceMemoryUsage();
+        // Images the collector deleted keep their memory for TICKS_TO_DESTROY frames: counting
+        // it kept the collector in aggressive mode, deleting 40+ images a frame for frames after
+        // it had freed enough (title 1: frames over 100 ms for seconds at a time).
+        for (const u64 bytes : sentenced_image_bytes) {
+            total_used_memory -= (std::min)(total_used_memory, bytes);
+        }
     }
     // Every 600 frames (every 200 under EDEN_NX2_GPU_PROFILE): device memory in use against the
     // collector's thresholds, and what the images themselves account for (VRAM pressure makes the
@@ -438,6 +444,8 @@ void TextureCache<P>::TickFrame() {
     EvictDormantImages();
     RetryUnbackedImages();
     sentenced_images.Tick();
+    sentenced_image_index = (sentenced_image_index + 1) % TICKS_TO_DESTROY;
+    sentenced_image_bytes[sentenced_image_index] = 0;
     sentenced_framebuffers.Tick();
     sentenced_image_view.Tick();
     TickAsyncDecode();
@@ -3359,6 +3367,10 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         total_used_memory -= GetScaledImageSizeBytes(image);
     }
     total_used_memory -= Common::AlignUp(HostImageSizeBytes(image), 1024);
+    // Mirror of the two subtractions above, for the driver-reported path in TickFrame: the
+    // driver keeps counting this memory until the ring destroys the image.
+    const u64 freed_bytes = (image.HasScaled() ? GetScaledImageSizeBytes(image) : 0) +
+                            Common::AlignUp(HostImageSizeBytes(image), 1024);
     const GPUVAddr gpu_addr = image.gpu_addr;
     const auto alloc_it = image_allocs_table.find(gpu_addr);
     if (alloc_it == image_allocs_table.end()) {
@@ -3424,6 +3436,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         LOG_INFO(Render_Vulkan, "Retained image for queued download: id={}", image_id.Value());
     } else if (!immediate_delete) {
         sentenced_images.Push(std::move(slot_images[image_id]));
+        sentenced_image_bytes[sentenced_image_index] += freed_bytes;
     }
     slot_images.erase(image_id);
 
