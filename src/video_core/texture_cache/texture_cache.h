@@ -3470,10 +3470,16 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
         LOG_INFO(Render_Vulkan, "Retained image for queued download: id={}", image_id.Value());
     } else if (!immediate_delete) {
         sentenced_images.Push(std::move(slot_images[image_id]));
-        // Slot totals are bounded by the VRAM a title can sentence in an 8-frame window
-        // (< 2^48); a u64 wrap would need ~16M TiB between two ticks. Reviewed bound,
-        // intentionally unguarded.
-        sentenced_image_bytes[sentenced_image_index] += freed_bytes;
+        // The slot accumulates booked estimates, which can legitimately exceed physical
+        // VRAM, so no physical bound applies. On (physically implausible) u64 overflow,
+        // keep the previous total: this delete's discount is dropped and the collector
+        // behaves as if it had not been discounted - the unported behavior.
+        u64& slot_bytes = sentenced_image_bytes[sentenced_image_index];
+        if (freed_bytes > (std::numeric_limits<u64>::max)() - slot_bytes) [[unlikely]] {
+            LOG_ERROR(HW_GPU, "sentenced-image byte accounting overflowed; discount dropped");
+        } else {
+            slot_bytes += freed_bytes;
+        }
     }
     slot_images.erase(image_id);
 

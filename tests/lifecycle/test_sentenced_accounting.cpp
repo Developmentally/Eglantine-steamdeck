@@ -77,7 +77,12 @@ static void delete_image(size_t idx) {
     // pages. Neither estimate tracks driver bytes, so both stay out of the discount.
     const u64 freed_bytes = img.gated ? 0 : img.estimate;
     sentenced_images.Push(std::move(img)); // transfer residency into the ring
-    sentenced_image_bytes[sentenced_image_index] += freed_bytes;
+    // Mirror of the ported checked add: on u64 overflow keep the previous total
+    // (that delete's discount is dropped), never wrap.
+    u64& slot_bytes = sentenced_image_bytes[sentenced_image_index];
+    if (freed_bytes <= ~0ULL - slot_bytes) {
+        slot_bytes += freed_bytes;
+    }
 }
 static void reset_state() {
     registry.clear(); // destroy husks (all own 0 by then)
@@ -138,10 +143,8 @@ int main() {
         for (size_t i = 0; i < TICKS_TO_DESTROY; ++i) tick_frame();
         assert(driver_usage == 0 && "ring must free exactly what it owns");
     }
-    // 4. Accumulation exactness at physical extremes + clamp. (u64 slot
-    //    accumulation cannot wrap in practice: values are VRAM bytes sentenced
-    //    within one 8-frame window, < 2^48; a wrap would need ~16M TiB.
-    //    Reviewed bound, intentionally unguarded - documented in DeleteImage.)
+    // 4. Accumulation exactness at physical extremes + clamp. Overflow itself is
+    //    boundary-tested in case 9.
     {
         reset_state();
         constexpr u64 TiB = 1ULL << 40;
@@ -166,7 +169,7 @@ int main() {
         for (int i = 0; i < 8; ++i) { imgs.push_back(register_image(100, 100)); delete_image(imgs.back()); tick_frame(); }
         assert(driver_usage == 8000 + 700 && "only the first push may be destroyed");
         assert(effective_total_driver_path() == 8000 && "wrong pending total after rollover");
-        // Core invariant: a fresh delete raises physical residency AND the
+        // Core invariant: a register+delete pair raises physical residency AND the
         // discount by the same amount, so the collector's effective total must
         // not move on the deleting frame.
         const u64 before = effective_total_driver_path();
@@ -214,6 +217,20 @@ int main() {
         assert(driver_used_memory == 1200 && "raw figure lost");
         assert(collector == 900 && "discount missing from collector figure");
         assert(driver_used_memory - collector == 300 && "split mismatch");
+    }
+    // 9. Checked accumulation boundary: when the slot total would overflow u64,
+    //    the add is dropped (slot keeps its prior total) instead of wrapping.
+    {
+        reset_state();
+        const size_t a = register_image(100, 100);
+        delete_image(a);
+        sentenced_image_bytes[sentenced_image_index] = ~0ULL - 10; // force near-overflow
+        const size_t b = register_image(100, 100);
+        delete_image(b); // 100 > 10 headroom: add must be dropped, not wrapped
+        assert(sentenced_image_bytes[sentenced_image_index] == ~0ULL - 10 &&
+               "overflow wrapped the slot total");
+        // The kept total still discounts correctly (clamped at the driver figure).
+        assert(effective_total_driver_path() == 0 && "kept total misapplied");
     }
     std::puts("all lifecycle accounting tests passed");
     return 0;
