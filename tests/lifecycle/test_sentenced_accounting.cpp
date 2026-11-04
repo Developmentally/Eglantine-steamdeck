@@ -25,15 +25,18 @@ using u64 = unsigned long long;
 static u64 driver_usage = 0; // simulated runtime.GetDeviceMemoryUsage()
 
 struct TrackedImage {
-    u64 resident; // driver-visible bytes (0 while unbacked)
-    u64 estimate; // booked estimate (RegisterImage/DeleteImage accounting)
-    bool gated;   // unbacked or sparse: estimate excluded from the discount
-    TrackedImage(u64 r, u64 e, bool g) : resident(r), estimate(e), gated(g) {
+    u64 resident;   // driver-visible bytes (0 while unbacked)
+    u64 estimate;   // booked host estimate (RegisterImage/DeleteImage accounting)
+    u64 scaled_est; // booked scaled estimate, booked in ADDITION to host when scaled
+    bool gated;     // unbacked or sparse: estimates excluded from the discount
+    TrackedImage(u64 r, u64 e, bool g, u64 sc = 0)
+        : resident(r), estimate(e), scaled_est(sc), gated(g) {
         driver_usage += resident; // registration: the allocation becomes visible
     }
     // Move transfers residency: no new driver bytes, and the husk owns none.
     TrackedImage(TrackedImage&& o) noexcept
-        : resident(std::exchange(o.resident, 0)), estimate(o.estimate), gated(o.gated) {}
+        : resident(std::exchange(o.resident, 0)), estimate(o.estimate),
+          scaled_est(o.scaled_est), gated(o.gated) {}
     TrackedImage(const TrackedImage&) = delete;
     TrackedImage& operator=(const TrackedImage&) = delete;
     ~TrackedImage() { driver_usage -= resident; } // destruction frees what it still owns
@@ -67,9 +70,9 @@ static void tick_frame() {
 // --- mirror of RegisterImage/DeleteImage (non-retained, non-immediate) ---
 static u64 estimate_total = 0;   // estimate path: added at register, subtracted at delete
 static std::vector<TrackedImage> registry; // live images; deleted ones stay as empty husks
-static size_t register_image(u64 resident, u64 estimate, bool gated = false) {
+static size_t register_image(u64 resident, u64 estimate, bool gated = false, u64 scaled = 0) {
     estimate_total += estimate;
-    registry.emplace_back(resident, estimate, gated);
+    registry.emplace_back(resident, estimate, gated, scaled);
     return registry.size() - 1;
 }
 static void delete_image(size_t idx) {
@@ -77,7 +80,11 @@ static void delete_image(size_t idx) {
     estimate_total -= std::min(estimate_total, img.estimate); // estimate path untouched by ring
     // Ported gate: unbacked images were never backed; sparse images commit only populated
     // pages. Neither estimate tracks driver bytes, so both stay out of the discount.
-    const u64 freed_bytes = img.gated ? 0 : img.estimate;
+    // Mirror of the ported checked scaled+host sum: overflow drops the discount entirely.
+    const u64 freed_bytes =
+        img.gated ? 0
+        : img.scaled_est > ~0ULL - img.estimate ? 0
+                                                : img.scaled_est + img.estimate;
     sentenced_images.Push(std::move(img)); // transfer residency into the ring
     // Mirror of the ported checked add: on u64 overflow keep the previous total
     // (that delete's discount is dropped), never wrap.
@@ -241,7 +248,7 @@ int main() {
         constexpr u64 BIG = ~0ULL / 2; // 2*BIG = u64max-1 (no wrap); 3*BIG wraps u64
         sentenced_image_bytes[0] = BIG;
         sentenced_image_bytes[1] = BIG;
-        sentenced_image_bytes[2] = BIG; // exact sum 3*BIG wraps u64 (to BIG-3)
+        sentenced_image_bytes[2] = BIG; // exact sum 3*BIG wraps u64 (to BIG-2)
         driver_usage = 1000;            // driver below one slot: full clamp
         assert(effective_total_driver_path() == 0 && "aggregate wrapped past the clamp");
         driver_usage = BIG + 500;       // driver above one slot, below the wrapping sum
@@ -249,6 +256,20 @@ int main() {
         sentenced_image_bytes[1] = 0;   // back below u64: single slot, partial discount
         sentenced_image_bytes[2] = 0;
         assert(effective_total_driver_path() == 500 && "partial discount wrong");
+    }
+    // 11. Prebooking boundary: the scaled+host sum is checked BEFORE booking; on
+    //     overflow the whole discount for that image is dropped (slot unchanged).
+    {
+        reset_state();
+        register_image(700, 700); // unrelated
+        const size_t o = register_image(0, 100, false, ~0ULL - 10); // scaled + host overflows
+        delete_image(o);
+        assert(sentenced_image_bytes[sentenced_image_index] == 0 && "overflowed sum booked");
+        tick_frame();
+        const size_t n = register_image(400, 300, false, 100); // scaled 100 + host 300 = 400
+        delete_image(n);
+        assert(sentenced_image_bytes[sentenced_image_index] == 400 && "split sum wrong");
+        assert(effective_total_driver_path() == 700 && "split discount misapplied");
     }
     std::puts("all lifecycle accounting tests passed");
     return 0;

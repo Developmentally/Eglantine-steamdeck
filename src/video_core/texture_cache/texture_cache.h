@@ -3403,16 +3403,18 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     // never backed by device memory, and sparse images commit only populated pages, so their
     // estimate does not track driver bytes: keep both out of the discount. Under-discounting is
     // the safe direction - it only leaves the collector stricter, never looser.
-    const u64 scaled_bytes = image.HasScaled() ? GetScaledImageSizeBytes(image) : 0;
-    const u64 host_bytes = Common::AlignUp(HostImageSizeBytes(image), 1024);
     // Checked scaled+host sum: on (physically implausible) overflow drop the discount
     // entirely, same direction as the slot-accumulation guard below.
-    const u64 freed_bytes =
-        (True(image.flags & ImageFlagBits::Unbacked) || True(image.flags & ImageFlagBits::Sparse))
-            ? 0
-            : scaled_bytes > (std::numeric_limits<u64>::max)() - host_bytes
-                  ? (LOG_ERROR(HW_GPU, "sentenced-image size overflowed; discount dropped"), 0)
-                  : scaled_bytes + host_bytes;
+    u64 freed_bytes = 0;
+    if (False(image.flags & ImageFlagBits::Unbacked) && False(image.flags & ImageFlagBits::Sparse)) {
+        const u64 scaled_bytes = image.HasScaled() ? GetScaledImageSizeBytes(image) : 0;
+        const u64 host_bytes = Common::AlignUp(HostImageSizeBytes(image), 1024);
+        if (scaled_bytes > (std::numeric_limits<u64>::max)() - host_bytes) [[unlikely]] {
+            LOG_ERROR(HW_GPU, "sentenced-image size overflowed; discount dropped");
+        } else {
+            freed_bytes = scaled_bytes + host_bytes;
+        }
+    }
     const GPUVAddr gpu_addr = image.gpu_addr;
     const auto alloc_it = image_allocs_table.find(gpu_addr);
     if (alloc_it == image_allocs_table.end()) {
